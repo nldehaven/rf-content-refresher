@@ -30,7 +30,10 @@ from werkzeug.utils import secure_filename
 # USER CONFIGURATION
 # ============================================================
 BYNDER_BASE_URL = "https://www.bynder.raymourflanigan.com"
-BYNDER_TOKEN_PATH = r"C:\bynderAPI\byndercredentials_permanenttoken.json"
+BYNDER_TOKEN_PATH = os.environ.get(
+    "CONTENT_REFRESHER_CREDENTIALS_PATH",
+    r"C:\bynderAPI\byndercredentials_permanenttoken.json",
+)
 
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
