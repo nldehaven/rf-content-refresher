@@ -35,6 +35,8 @@ BYNDER_TOKEN_PATH = os.environ.get(
     r"C:\bynderAPI\byndercredentials_permanenttoken.json",
 )
 
+APP_VERSION = "1.0.1"
+
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
 MARKED_FOR_DELETION_METAPROPERTY_ID = "92E8A7DD-281C-4361-82A5F23AEB965FAD"
