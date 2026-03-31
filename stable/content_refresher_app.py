@@ -128,6 +128,7 @@ STATE = {
 }
 
 METAPROPERTY_DBNAME_CACHE: Dict[str, str] = {}
+METAPROPERTY_OPTION_VALUE_CACHE: Dict[str, Dict[str, str]] = {}
 PROPERTY_DB_NAMES: Dict[str, str] = {
     "Product_SKU": "Product_SKU",
     "Product_SKU_Position": "Product_SKU_Position",
@@ -595,6 +596,27 @@ def fetch_metaproperty_options(session: requests.Session, metaproperty_id: str) 
     raise RuntimeError(f"Unable to retrieve options for metaproperty {metaproperty_id}")
 
 
+def get_metaproperty_option_value(session: requests.Session, metaproperty_id: str, label_or_dbname: str) -> str:
+    target = normalize_uuid(metaproperty_id)
+    cache = METAPROPERTY_OPTION_VALUE_CACHE.get(target)
+    if cache is None:
+        cache = {}
+        for item in fetch_metaproperty_options(session, metaproperty_id):
+            item_id = string_value(item.get("id"))
+            if not item_id:
+                continue
+            label = string_value(item.get("label")).strip().lower()
+            db_name = string_value(item.get("databaseName")).strip().lower()
+            if label:
+                cache[label] = item_id
+            if db_name:
+                cache[db_name] = item_id
+        METAPROPERTY_OPTION_VALUE_CACHE[target] = cache
+
+    key = string_value(label_or_dbname).strip().lower()
+    return cache.get(key, "")
+
+
 def fetch_assets_for_product_sku(session: requests.Session, product_sku_db_name: str, sku_value: str) -> List[Dict[str, Any]]:
     url = f"{BYNDER_BASE_URL}/api/v4/media/"
     params = {f"property_{product_sku_db_name}": sku_value, "limit": 1000, "page": 1}
@@ -938,6 +960,58 @@ def image_to_jpg_bytes(image: Image.Image) -> bytes:
     return bio.getvalue()
 
 
+def reformat_silo_like_image(image: Image.Image, canvas_size: tuple[int, int] = (3000, 1688), margin: int = 10) -> Image.Image:
+    """Apply the same core logic as reformat1688_silo.py to a PIL image."""
+    im = image.convert("RGBA")
+    width, height = im.size
+    pixels = im.load()
+
+    min_x, min_y = width, height
+    max_x, max_y = 0, 0
+    found_content = False
+
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = pixels[x, y]
+            if a != 0 and not (r == 255 and g == 255 and b == 255):
+                found_content = True
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+
+    if not found_content or min_x > max_x or min_y > max_y:
+        raise RuntimeError("Could not find discernible non-white content to reformat.")
+
+    cropped = im.crop((min_x, min_y, max_x + 1, max_y + 1))
+    crop_w, crop_h = cropped.size
+    if crop_w <= 0 or crop_h <= 0:
+        raise RuntimeError("Image content area collapsed to zero size during reformat.")
+
+    canvas_w, canvas_h = canvas_size
+    content_area_w = canvas_w - (2 * margin)
+    content_area_h = canvas_h - (2 * margin)
+    scale = min(content_area_w / crop_w, content_area_h / crop_h)
+
+    new_w = max(1, int(crop_w * scale))
+    new_h = max(1, int(crop_h * scale))
+    resized = cropped.resize((new_w, new_h), Image.LANCZOS)
+
+    canvas = Image.new("RGB", canvas_size, (255, 255, 255))
+    paste_x = (canvas_w - new_w) // 2
+    paste_y = (canvas_h - new_h) // 2
+    canvas.paste(resized, (paste_x, paste_y), mask=resized)
+    return canvas
+
+
+def save_processed_image_for_upload(image: Image.Image, path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix == '.png':
+        image.convert('RGBA').save(path, format='PNG')
+    else:
+        image.convert('RGB').save(path, format='JPEG', quality=92, optimize=True)
+
+
 def guess_mime_type(path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(path))
     return mime or "application/octet-stream"
@@ -1015,9 +1089,11 @@ def upload_new_asset_group_upload(session: requests.Session, file_path: Path, as
     return new_media_id
 
 
-def build_metadata_copy_fields(source_media: Dict[str, Any], metaprops_by_dbname: Dict[str, Dict[str, Any]], target_sku: str, target_position: str, target_name: str) -> List[Tuple[str, Any]]:
+def build_metadata_copy_fields(session: requests.Session, source_media: Dict[str, Any], metaprops_by_dbname: Dict[str, Dict[str, Any]], target_sku: str, target_position: str, target_name: str, deliverable_override_label: str = "") -> List[Tuple[str, Any]]:
     fields: List[Tuple[str, Any]] = []
     skip_db_names = {"Product_SKU", "Product_SKU_Position"}
+    if deliverable_override_label:
+        skip_db_names.add("Deliverable")
     for key, value in source_media.items():
         if not key.startswith("property_"):
             continue
@@ -1051,6 +1127,12 @@ def build_metadata_copy_fields(source_media: Dict[str, Any], metaprops_by_dbname
                 fields.append((form_key, str(value)))
     fields.append((f"metaproperty.{PRODUCT_SKU_METAPROPERTY_ID}", target_sku))
     fields.append((f"metaproperty.{PRODUCT_SKU_POSITION_METAPROPERTY_ID}", target_position))
+    if deliverable_override_label:
+        deliverable_mp = metaprops_by_dbname.get("Deliverable")
+        if deliverable_mp:
+            deliverable_mp_id = string_value(deliverable_mp.get("id"))
+            option_value = get_metaproperty_option_value(session, deliverable_mp_id, deliverable_override_label) if deliverable_mp_id else ""
+            fields.append((f"metaproperty.{deliverable_mp_id}", option_value or deliverable_override_label))
     fields.append(("name", target_name))
     fields.append(("tags", target_sku))
     return fields
@@ -1064,11 +1146,25 @@ def renamed_copy_filename(original_filename: str, source_sku: str, target_sku: s
     return f"{target_sku}_{stem}{ext or '.jpg'}"
 
 
-def create_copied_asset_for_target(session: requests.Session, source_media_id: str, source_sku: str, target_sku: str, target_position: str) -> Dict[str, Any]:
+def create_copied_asset_for_target(
+    session: requests.Session,
+    source_media_id: str,
+    source_sku: str,
+    target_sku: str,
+    target_position: str,
+    asset_name: str = "",
+    deliverable_override_label: str = "",
+) -> Dict[str, Any]:
     source_media = fetch_media_by_id(session, source_media_id)
     fallback_name = string_value(source_media.get("name")) or f"{source_media_id}.jpg"
     original_name = filename_from_original(string_value(source_media.get("original")), fallback_name)
-    new_filename = renamed_copy_filename(original_name, source_sku, target_sku)
+    forced_name = string_value(asset_name)
+    if forced_name:
+        forced_path = Path(forced_name)
+        ext = forced_path.suffix or Path(original_name).suffix or ".jpg"
+        new_filename = f"{forced_path.stem}{ext}"
+    else:
+        new_filename = renamed_copy_filename(original_name, source_sku, target_sku)
     temp_path, td = download_source_media_to_tempfile(session, source_media_id, new_filename)
     try:
         target_name = os.path.splitext(Path(new_filename).name)[0]
@@ -1079,7 +1175,7 @@ def create_copied_asset_for_target(session: requests.Session, source_media_id: s
         except Exception:
             pass
     metaprops_by_dbname = fetch_metaproperties_map(session)
-    fields = build_metadata_copy_fields(source_media, metaprops_by_dbname, target_sku, target_position, target_name)
+    fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, target_sku, target_position, target_name, deliverable_override_label)
     post_media_fields(session, new_media_id, fields)
     return {"new_media_id": new_media_id, "new_filename": temp_path.name, "target_name": target_name}
 
@@ -1148,12 +1244,13 @@ def apply_prepared_file_to_slot(
             mark_asset_uploaded_notice(target_asset, 'new_version', 'New version uploaded to this slot. Reload to view.')
             return {"message": "Prepared image was updated. Reload to see it!", "kind": "updated"}
 
-        exemplar = pick_left_exemplar_asset(row, target_lane, target_slot) or pick_lane_exemplar_asset(row, target_lane)
+        profile = resolve_new_asset_profile(row, target_lane, target_slot, prepared_name)
+        exemplar = profile.get("exemplar")
         if not exemplar:
             raise RuntimeError("Could not find a source asset in this row to borrow metadata from for the upload.")
 
-        derived_name = derive_cru_filename(row, target_lane, exemplar, prepared_name)
-        target_name = force_jpg_filename(derived_name, Path(prepared_name).stem or "prepared_image")
+        target_name = force_jpg_filename(profile.get("target_name") or prepared_name, Path(prepared_name).stem or "prepared_image")
+        target_slot = string_value(profile.get("target_slot") or target_slot)
         target_path = temp_path
         if temp_path.name != target_name:
             target_path = Path(td) / target_name
@@ -1167,9 +1264,9 @@ def apply_prepared_file_to_slot(
             raise RuntimeError("Could not determine source media for metadata copy.")
         source_media = fetch_media_by_id(session, source_media_id)
         metaprops_by_dbname = fetch_metaproperties_map(session)
-        fields = build_metadata_copy_fields(source_media, metaprops_by_dbname, sku, target_position, target_stem)
+        fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, sku, target_position, target_stem, profile.get("deliverable_override", ""))
         post_media_fields(session, new_media_id, fields)
-        placeholder = build_uploaded_new_asset_placeholder(exemplar, sku, target_position, target_name, target_lane, target_slot, new_media_id)
+        placeholder = build_uploaded_new_asset_placeholder(exemplar, sku, target_position, target_name, target_lane, target_slot, new_media_id, profile.get("deliverable_override", ""))
         row.setdefault('assets', []).append(placeholder)
         return {"message": "Prepared image was added. Reload to see it!", "kind": "added"}
 
@@ -1338,6 +1435,93 @@ def derive_cru_filename(row: Dict[str, Any], target_lane: str, exemplar_asset: D
         i += 1
 
 
+def pick_any_asset_for_sku(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = [a for a in row.get("assets", []) if not a.get("pending_upload") and not a.get("is_marked_for_deletion")]
+    if not candidates:
+        return None
+    uploaded_candidates = [a for a in candidates if a.get("asset_mode_uploaded") and (a.get("copy_source_media_id") or a.get("id"))]
+    pool = uploaded_candidates or candidates
+    return sorted(pool, key=lambda a: a.get("dateCreated") or "", reverse=True)[0]
+
+
+def pick_last_carousel_lane_asset(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    buckets = bucket_assets(row)
+    for slot in reversed(CORE_SLOTS):
+        items = buckets["core"].get(slot, [])
+        candidates = [a for a in items if not a.get("pending_upload") and not a.get("is_marked_for_deletion")]
+        uploaded_candidates = [a for a in candidates if a.get("asset_mode_uploaded") and (a.get("copy_source_media_id") or a.get("id"))]
+        pool = uploaded_candidates or candidates
+        if pool:
+            return pool[0]
+    return None
+
+
+def lane_has_non_deleted_assets(row: Dict[str, Any], lane: str) -> bool:
+    buckets = bucket_assets(row)
+    if lane == "core":
+        return any(buckets["core"].get(slot) for slot in CORE_SLOTS)
+    if lane == "swatch_detail":
+        return any(buckets["swatch_detail"].get(slot) for slot in SWATCH_DETAIL_SLOTS)
+    return False
+
+
+def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot: str, uploaded_original_name: str) -> Dict[str, Any]:
+    sku = string_value(row.get("sku") or "").strip()
+    if target_lane == "grid":
+        exemplar = pick_last_carousel_lane_asset(row) or pick_any_asset_for_sku(row)
+        forced_stem = f"{sku}_grid_CRU" if sku else "SKU_grid_CRU"
+        return {
+            "exemplar": exemplar,
+            "target_slot": GRID_SLOT,
+            "deliverable_override": "Product_Grid_Image",
+            "target_name": force_jpg_filename(forced_stem, forced_stem),
+        }
+
+    if target_lane == "special" and target_slot in {"SKU_dimension", "SKU_swatch", "SKU_square"}:
+        exemplar = pick_last_carousel_lane_asset(row) or pick_any_asset_for_sku(row)
+        special_map = {
+            "SKU_dimension": ("DimensionsDiagram", f"{sku}_dimension_CRU" if sku else "SKU_dimension_CRU"),
+            "SKU_swatch": ("Product_Swatch_Image", f"{sku}_swatch_CRU" if sku else "SKU_swatch_CRU"),
+            "SKU_square": ("MetaCarouselSquare", f"{sku}_square_CRU" if sku else "SKU_square_CRU"),
+        }
+        deliverable_override, forced_stem = special_map[target_slot]
+        return {
+            "exemplar": exemplar,
+            "target_slot": target_slot,
+            "deliverable_override": deliverable_override,
+            "target_name": force_jpg_filename(forced_stem, forced_stem),
+        }
+
+    if target_lane == "core" and not lane_has_non_deleted_assets(row, "core"):
+        exemplar = pick_any_asset_for_sku(row)
+        forced_stem = f"{sku}_carousel_CRU" if sku else "SKU_carousel_CRU"
+        return {
+            "exemplar": exemplar,
+            "target_slot": "SKU_100",
+            "deliverable_override": "Product_Image_Carousel",
+            "target_name": force_jpg_filename(forced_stem, forced_stem),
+        }
+
+    if target_lane == "swatch_detail" and not lane_has_non_deleted_assets(row, "swatch_detail"):
+        exemplar = pick_any_asset_for_sku(row)
+        forced_stem = f"{sku}_swatchDetail_CRU" if sku else "SKU_swatchDetail_CRU"
+        return {
+            "exemplar": exemplar,
+            "target_slot": "SKU_5000",
+            "deliverable_override": "Product_Swatch_Detail_Image",
+            "target_name": force_jpg_filename(forced_stem, forced_stem),
+        }
+
+    exemplar = pick_left_exemplar_asset(row, target_lane, target_slot) or pick_lane_exemplar_asset(row, target_lane) or pick_any_asset_for_sku(row)
+    target_name = derive_cru_filename(row, target_lane, exemplar, uploaded_original_name) if exemplar else force_jpg_filename(uploaded_original_name or "prepared_image", "prepared_image")
+    return {
+        "exemplar": exemplar,
+        "target_slot": target_slot,
+        "deliverable_override": "",
+        "target_name": target_name,
+    }
+
+
 def stage_uploaded_file(uploaded_file_storage) -> Path:
     original_name = secure_filename(uploaded_file_storage.filename or 'upload.bin') or 'upload.bin'
     staged_name = f"{uuid.uuid4().hex}__{original_name}"
@@ -1354,7 +1538,7 @@ def cleanup_staged_file(path_text: str) -> None:
         pass
 
 
-def build_pending_new_asset(source_asset: Dict[str, Any], target_sku: str, target_position: str, staged_path: Path, target_name: str) -> Dict[str, Any]:
+def build_pending_new_asset(source_asset: Dict[str, Any], target_sku: str, target_position: str, staged_path: Path, target_name: str, deliverable_override: str = "") -> Dict[str, Any]:
     clone = deepcopy(source_asset)
     clone["id"] = f"pending-file::{uuid.uuid4()}"
     clone["sku"] = target_sku
@@ -1373,6 +1557,7 @@ def build_pending_new_asset(source_asset: Dict[str, Any], target_sku: str, targe
     clone["pending_message"] = "Pending new asset upload"
     clone["size_warning"] = ""
     clone["pending_file_local_name"] = Path(staged_path).name.split('__',1)[-1]
+    clone["deliverable_override"] = string_value(deliverable_override)
     return clone
 
 
@@ -1390,7 +1575,7 @@ def mark_asset_uploaded_notice(asset: Dict[str, Any], kind: str, message: str) -
     asset["asset_mode_message"] = message
 
 
-def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sku: str, target_position: str, target_name: str, target_lane: str, target_slot: str, new_media_id: str = '') -> Dict[str, Any]:
+def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sku: str, target_position: str, target_name: str, target_lane: str, target_slot: str, new_media_id: str = '', deliverable_override: str = '') -> Dict[str, Any]:
     clone = deepcopy(source_asset)
     clone["id"] = new_media_id or f"uploaded-placeholder::{uuid.uuid4()}"
     clone["copy_source_media_id"] = new_media_id or source_asset.get("copy_source_media_id") or source_asset.get("id") or ''
@@ -1409,6 +1594,7 @@ def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sk
     clone["transformBaseUrl"] = ""
     clone["original"] = ""
     clone["size_warning"] = ""
+    clone["deliverable_override"] = string_value(deliverable_override)
     clone.pop("pending_upload", None)
     clone.pop("pending_upload_kind", None)
     clone.pop("pending_message", None)
@@ -1458,11 +1644,13 @@ def apply_uploaded_file_to_slot(session: requests.Session, board: Dict[str, Any]
             mark_asset_uploaded_notice(target_asset, 'new_version', 'New version uploaded to this slot. Reload to view.')
             return {"message": "Asset was updated. Reload to see it!", "kind": "updated"}
 
-        exemplar = pick_left_exemplar_asset(row, target_lane, target_slot) or pick_lane_exemplar_asset(row, target_lane)
+        profile = resolve_new_asset_profile(row, target_lane, target_slot, original_name)
+        exemplar = profile.get("exemplar")
         if not exemplar:
             raise RuntimeError("Could not find a source asset in this row to borrow metadata from for the upload.")
 
-        target_name = derive_cru_filename(row, target_lane, exemplar, original_name)
+        target_name = force_jpg_filename(profile.get("target_name") or original_name, Path(original_name).stem or "upload")
+        target_slot = string_value(profile.get("target_slot") or target_slot)
         target_path = temp_path
         if temp_path.name != target_name:
             target_path = Path(td) / target_name
@@ -1476,9 +1664,9 @@ def apply_uploaded_file_to_slot(session: requests.Session, board: Dict[str, Any]
             raise RuntimeError("Could not determine source media for metadata copy.")
         source_media = fetch_media_by_id(session, source_media_id)
         metaprops_by_dbname = fetch_metaproperties_map(session)
-        fields = build_metadata_copy_fields(source_media, metaprops_by_dbname, sku, target_position, target_stem)
+        fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, sku, target_position, target_stem, profile.get("deliverable_override", ""))
         post_media_fields(session, new_media_id, fields)
-        placeholder = build_uploaded_new_asset_placeholder(exemplar, sku, target_position, target_name, target_lane, target_slot, new_media_id)
+        placeholder = build_uploaded_new_asset_placeholder(exemplar, sku, target_position, target_name, target_lane, target_slot, new_media_id, profile.get("deliverable_override", ""))
         row.setdefault('assets', []).append(placeholder)
         return {"message": "Asset was added. Reload to see it!", "kind": "added"}
 
@@ -2223,8 +2411,46 @@ def sanitize_copy_warning(target_lane: str) -> bool:
     return target_lane != "swatch_detail"
 
 
-def make_pending_copy_asset(source_asset: Dict[str, Any], target_sku: str) -> Dict[str, Any]:
+def remove_pending_copy_from_board(board: Dict[str, Any], asset_id: str, target_pos: str = "", source_media_id: str = "", target_sku: str = "") -> bool:
+    removed = False
+    for section in board.get("color_sections", []):
+        for row in section.get("rows", []):
+            pending_before = len([a for a in (row.get("assets") or []) if a.get("pending_upload") and string_value(a.get("pending_upload_kind") or "") == "copy"])
+            row["assets"] = [
+                a for a in (row.get("assets") or [])
+                if not (
+                    a.get("pending_upload")
+                    and string_value(a.get("pending_upload_kind") or "") == "copy"
+                    and (
+                        (asset_id and string_value(a.get("id")) == string_value(asset_id))
+                        or (
+                            source_media_id
+                            and target_sku
+                            and target_pos
+                            and string_value(a.get("copy_source_media_id")) == string_value(source_media_id)
+                            and string_value(a.get("sku")) == string_value(target_sku)
+                            and string_value(a.get("current_position")) == string_value(target_pos)
+                        )
+                        or (
+                            source_media_id
+                            and target_sku
+                            and string_value(a.get("copy_source_media_id")) == string_value(source_media_id)
+                            and string_value(a.get("sku")) == string_value(target_sku)
+                        )
+                    )
+                )
+            ]
+            pending_after = len([a for a in (row.get("assets") or []) if a.get("pending_upload") and string_value(a.get("pending_upload_kind") or "") == "copy"])
+            if pending_after != pending_before:
+                row["overflow_warnings"] = []
+                refresh_row_asset_flags(row)
+                removed = True
+    return removed
+
+
+def make_pending_copy_asset(source_asset: Dict[str, Any], target_sku: str, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     clone = deepcopy(source_asset)
+    profile = profile or {}
     clone["id"] = f"pending-copy::{uuid.uuid4()}"
     clone["sku"] = target_sku
     clone["source_sku"] = source_asset.get("copy_source_sku") or source_asset.get("source_sku") or source_asset.get("sku") or ""
@@ -2233,6 +2459,11 @@ def make_pending_copy_asset(source_asset: Dict[str, Any], target_sku: str) -> Di
     clone["pending_message"] = "Pending copy upload"
     clone["copy_source_media_id"] = source_asset.get("copy_source_media_id") or source_asset.get("id")
     clone["copy_source_sku"] = source_asset.get("copy_source_sku") or source_asset.get("sku") or source_asset.get("source_sku") or ""
+    clone["deliverable_override"] = string_value(profile.get("deliverable_override") or "")
+    target_name = string_value(profile.get("target_name") or source_asset.get("file_name") or source_asset.get("name") or "")
+    if target_name:
+        clone["file_name"] = target_name
+        clone["name"] = os.path.splitext(target_name)[0]
     clone["is_marked_for_deletion"] = False
     clone["original_state"] = {"position": "", "is_marked_for_deletion": False}
     clone["lane"] = "off_pattern"
@@ -2445,7 +2676,10 @@ def apply_move(board: Dict[str, Any], row_id: str, asset_id: str, target_lane: s
         source_asset = next((a for a in source_row.get("assets", []) if a.get("id") == asset_id), None)
         if not source_asset:
             raise ValueError(f"Asset {asset_id} not found in source row")
-        asset = make_pending_copy_asset(source_asset, target_row.get("sku", ""))
+        original_name = string_value(source_asset.get("file_name") or source_asset.get("name") or "copied_asset.jpg")
+        profile = resolve_new_asset_profile(target_row, target_lane, target_slot or "", original_name)
+        asset = make_pending_copy_asset(source_asset, target_row.get("sku", ""), profile)
+        target_slot = string_value(profile.get("target_slot") or target_slot)
         if sanitize_copy_warning(target_lane):
             target_row.setdefault("overflow_warnings", []).append(
                 f"{source_asset.get('file_name') or source_asset.get('name') or source_asset.get('id')} will be copied from SKU {source_asset.get('copy_source_sku') or source_asset.get('source_sku') or source_row.get('sku')} to SKU {target_row.get('sku')}."
@@ -2577,6 +2811,7 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                                 "asset_name": asset["file_name"],
                                 "source_media_id": asset.get("copy_source_media_id") or asset.get("id"),
                                 "source_sku": asset.get("copy_source_sku") or asset.get("source_sku") or "",
+                                "deliverable_override": asset.get("deliverable_override") or "",
                             }
                         )
                     else:
@@ -2619,7 +2854,15 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
 
     for job in copy_jobs:
         try:
-            response = create_copied_asset_for_target(session, job["source_media_id"], job["source_sku"], job["target_sku"], job["target_position"])
+            response = create_copied_asset_for_target(
+                session,
+                job["source_media_id"],
+                job["source_sku"],
+                job["target_sku"],
+                job["target_position"],
+                job.get("asset_name") or "",
+                job.get("deliverable_override") or "",
+            )
             results.append({**job, "success": True, "response": response, "job_type": "copy"})
             success_count += 1
             log_message(f"Created copied asset from {job['source_media_id']} for SKU {job['target_sku']} in position {job['target_position']}.")
@@ -2650,7 +2893,7 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                 target_name = os.path.splitext(job["asset_name"])[0]
                 new_media_id = upload_new_asset_group_upload(session, staged_path, target_name)
                 metaprops_by_dbname = fetch_metaproperties_map(session)
-                fields = build_metadata_copy_fields(source_media, metaprops_by_dbname, job["sku"], job["target_position"], target_name)
+                fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, job["sku"], job["target_position"], target_name, job.get("deliverable_override") or "")
                 post_media_fields(session, new_media_id, fields)
                 cleanup_staged_file(str(staged_path))
                 response = {"new_media_id": new_media_id}
@@ -2971,6 +3214,91 @@ def api_move() -> Response:
         return jsonify({"board": STATE["board"], "summary": compute_change_summary(STATE["board"])})
     except Exception as exc:
         log_message(f"Move failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/remove_pending_copy", methods=["POST"])
+def api_remove_pending_copy() -> Response:
+    try:
+        if STATE["board"] is None:
+            return jsonify({"error": "No collection is currently loaded."}), 400
+        payload = request.get_json(force=True)
+        asset_id = string_value(payload.get("asset_id"))
+        target_pos = string_value(payload.get("target_pos"))
+        source_media_id = string_value(payload.get("source_media_id"))
+        target_sku = string_value(payload.get("target_sku"))
+        removed = remove_pending_copy_from_board(STATE["board"], asset_id, target_pos, source_media_id, target_sku)
+        if not removed:
+            return jsonify({"error": "Pending copy not found.", "board": STATE["board"], "summary": compute_change_summary(STATE["board"])}), 404
+        return jsonify({"board": STATE["board"], "summary": compute_change_summary(STATE["board"])})
+    except Exception as exc:
+        log_message(f"Remove pending copy failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/fix_asset_version", methods=["POST"])
+def api_fix_asset_version() -> Response:
+    try:
+        board = STATE.get("board")
+        if board is None:
+            return jsonify({"error": "No collection is currently loaded."}), 400
+
+        payload = request.get_json(force=True)
+        mode = string_value(payload.get("mode"))
+        if mode != "assets":
+            return jsonify({"error": "Asset fixes are only available in Update assets mode."}), 400
+
+        media_id = string_value(payload.get("media_id"))
+        fix_type = string_value(payload.get("fix_type"))
+        if not media_id or not fix_type:
+            return jsonify({"error": "media_id and fix_type are required."}), 400
+
+        asset = get_asset_by_id(board, media_id)
+        if not asset:
+            return jsonify({"error": "Asset not found on the current board."}), 404
+        if asset.get("pending_upload"):
+            return jsonify({"error": "Pending assets cannot be auto-fixed."}), 400
+
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        image = open_image_from_media(session, media_id)
+        target_name = force_jpg_filename(string_value(asset.get("file_name") or asset.get("name") or "asset"), "asset")
+
+        if fix_type == "swatch":
+            if image.width != image.height:
+                return jsonify({"error": "Swatch auto-fix only works when the current image is already square."}), 400
+            processed = image.resize((163, 163), Image.LANCZOS).convert('RGB')
+            success_text = "Swatch was resized to 163x163 and uploaded as a new version."
+        elif fix_type in {"dim", "silo"}:
+            processed = reformat_silo_like_image(image)
+            success_text = "Asset was reformatted to 3000x1688 and uploaded as a new version."
+        elif fix_type == "grid":
+            processed = reformat_silo_like_image(image, canvas_size=(3000, 2200))
+            success_text = "Grid asset was reformatted to 3000x2200 and uploaded as a new version."
+        else:
+            return jsonify({"error": f"Unsupported fix_type: {fix_type}"}), 400
+
+        with tempfile.TemporaryDirectory(prefix="content_refresher_fix_asset_") as td:
+            temp_path = Path(td) / target_name
+            save_processed_image_for_upload(processed, temp_path)
+            upload_new_version_to_media(session, media_id, temp_path, target_name)
+
+        mark_asset_uploaded_notice(asset, "new_version", "New version uploaded to this slot. Reload to view.")
+        dirty_row_ids: List[str] = []
+        target_row = get_row_containing_asset(board, media_id)
+        if target_row:
+            dirty_row_ids.append(string_value(target_row.get("row_id") or target_row.get("sku")))
+
+        notice_html = f'{success_text} <button type="button" class="inline-link" data-reload-board>Reload</button> to see it!'
+        return jsonify({
+            "board": board,
+            "summary": compute_change_summary(board),
+            "notice": {"kind": "success", "text": success_text, "html": notice_html},
+            "asset_mode_refresh_pending": True,
+            "dirty_row_ids": dirty_row_ids,
+        })
+    except Exception as exc:
+        log_message(f"Fix asset version failed: {exc}")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -3832,12 +4160,12 @@ INDEX_HTML = r'''
     padding: 3px;
   }
   .slot.trash .asset-card img {
-    height: calc(var(--thumb-height, 84px) * 0.72);
+    height: calc(var(--thumb-height, 84px) * 0.54);
   }
   .slot.trash .asset-card {
-    transform: scale(0.92);
+    transform: scale(0.75);
     transform-origin: top left;
-    margin-bottom: -8px;
+    margin-bottom: -20px;
   }
   .asset-meta {
     padding: 1px 4px 3px 4px;
@@ -3855,8 +4183,45 @@ INDEX_HTML = r'''
     color: #6b7785;
     line-height: 1.05;
   }
+  .asset-date-row {
+    display:flex;
+    align-items:center;
+    justify-content:flex-start;
+    gap:8px;
+  }
+  .asset-date-left {
+    min-width:0;
+    flex:1 1 auto;
+  }
+  .asset-fix-pill-row {
+    margin-top: 4px;
+  }
+  .asset-fix-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: #e7f6ea;
+    color: #1f7a34;
+    font-size: 10px;
+    font-weight: 800;
+    line-height: 1.1;
+    text-decoration: none;
+    border: 1px solid #b9e2c1;
+    white-space: nowrap;
+  }
+  .asset-size-warning {
+    margin-top: 4px;
+    font-size: 10px;
+    line-height: 1.15;
+    color:#a93d36;
+    font-weight:700;
+    white-space: normal;
+  }
   .asset-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
     margin-top: 0;
     line-height: 1.1;
@@ -3865,6 +4230,8 @@ INDEX_HTML = r'''
     font-size: 10px;
     color: var(--rf-blue);
     text-decoration: none;
+    display: inline-flex;
+    max-width: 100%;
   }
   .warning-chip {
     margin-top: 8px;
@@ -3881,6 +4248,17 @@ INDEX_HTML = r'''
   .warning-chip button {
     border: 0; background: transparent; cursor: pointer; color: inherit; font-weight: 800;
   }
+  .asset-fix-action {
+    display:inline-block;
+    margin-left:8px;
+    color:#2f8f45;
+    font-weight:800;
+    cursor:pointer;
+    text-decoration:none;
+    white-space:nowrap;
+    flex:0 0 auto;
+  }
+  .asset-fix-action:hover { text-decoration:underline; }
   .summary-header {
     padding: 2px 8px;
     border-bottom: 1px solid var(--rf-border);
@@ -4490,7 +4868,7 @@ function renderModeUI() {
   const hideInactiveToggle = document.getElementById('hideInactiveToggle');
   if (hideInactiveToggle) hideInactiveToggle.checked = !!state.hideInactive;
   if (state.mode === 'assets') {
-    help.textContent = 'Update assets disables reordering and lets you drop files onto slots to create new assets or upload new versions. Asset uploads happen immediately in this mode.';
+    help.innerHTML = 'Update assets disables reordering and lets you drop files onto slots to create new assets or upload new versions. Asset uploads happen <strong>immediately</strong> in this mode.';
   } else {
     help.textContent = 'Update positions stages reorder, trash, restore, and cross-SKU copy changes. File uploads are disabled in this mode.';
   }
@@ -4521,6 +4899,21 @@ async function refreshDirtyAssetRows() {
   return true;
 }
 
+
+function scrollBoardToFirstColorTop(behavior='auto') {
+  const boardMain = document.getElementById('boardMain');
+  if (!boardMain) return;
+  const firstSection = boardMain.querySelector('.color-section');
+  const collectionBar = boardMain.querySelector('.collection-header');
+  if (firstSection) {
+    const offset = (collectionBar ? collectionBar.offsetHeight : 0) + 8;
+    const y = Math.max(0, firstSection.offsetTop - offset);
+    boardMain.scrollTo({ top: y, behavior });
+    return;
+  }
+  boardMain.scrollTo({ top: 0, behavior });
+}
+
 async function switchMode(newMode) {
   if (newMode === state.mode) return;
   if (newMode === 'assets') {
@@ -4548,14 +4941,15 @@ async function switchMode(newMode) {
     try {
       const refreshed = await refreshDirtyAssetRows();
       if (!refreshed) {
-        await launchCollection(state.loadedCollectionOptionId, {forceRefresh:true});
+        await launchCollection(state.loadedCollectionOptionId, {forceRefresh:true, scrollTopAfter:true});
       }
     } catch (err) {
       console.warn(err);
-      await launchCollection(state.loadedCollectionOptionId, {forceRefresh:true});
+      await launchCollection(state.loadedCollectionOptionId, {forceRefresh:true, scrollTopAfter:true});
     }
   }
   renderBoard();
+  scrollBoardToFirstColorTop('auto');
 }
 
 function getLaneMax(laneType) {
@@ -4666,6 +5060,17 @@ async function downloadAsset(event, assetId, sourceMediaId, fileName) {
   }
 }
 
+
+function formatAssetSizeWarning(asset) {
+  const text = String(asset.size_warning || '').trim();
+  if (!text) return '';
+  const m = text.match(/Size\s*:?\s*(\d+x\d+)\s*[;,-]?\s*expected\s*:?\s*(\d+x\d+)/i);
+  if (m) {
+    return `<div class="asset-size-warning">Size: ${escapeHtml(m[1])}<br>Expected: ${escapeHtml(m[2])}</div>`;
+  }
+  return `<div class="asset-size-warning">${escapeHtml(text)}</div>`;
+}
+
 function renderAssetCard(asset, changed) {
   const thumb = assetThumbUrl(asset);
   const classes = ['asset-card'];
@@ -4679,14 +5084,31 @@ function renderAssetCard(asset, changed) {
   if (asset.size_warning) classes.push('bad-dimensions');
   const openLink = asset.original || asset.transformBaseUrl || '#';
   const downloadLink = asset.pending_upload ? `/api/download/${encodeURIComponent(asset.copy_source_media_id || asset.id || '')}` : `/api/download/${encodeURIComponent(asset.id || '')}`;
+  let fixHtml = '';
+  let sizeWarningHtml = '';
+  if (asset.size_warning) {
+    if (state.mode === 'assets' && !asset.pending_upload) {
+      if (asset.slot_key === 'SKU_swatch' && Number(asset.width || 0) > 0 && Number(asset.width || 0) === Number(asset.height || 0)) {
+        fixHtml = `<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'swatch')">Fix swatch</a>`;
+      } else if (asset.slot_key === 'SKU_dimension') {
+        fixHtml = `<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'dim')">Fix dim</a>`;
+      } else if (asset.slot_key === 'SKU_grid') {
+        fixHtml = `<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'grid')">Fix silo</a>`;
+      } else if (asset.lane === 'core') {
+        fixHtml = `<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'silo')">Fix silo</a>`;
+      }
+    }
+    sizeWarningHtml = formatAssetSizeWarning(asset);
+  }
   return `
     <div class="${classes.join(' ')}" draggable="${state.mode === 'positions' ? 'true' : 'false'}" data-asset-id="${escapeHtml(asset.id)}" title="${escapeHtml(asset.size_warning || '')}">
       ${thumb ? `<img src="${escapeHtml(thumb)}" alt="" />` : `<div style="height:var(--thumb-height,84px);"></div>`}
       <div class="asset-meta">
-        <div class="asset-date">${escapeHtml(shortDate(asset.dateCreated || ''))}</div>
+        <div class="asset-date asset-date-row"><span class="asset-date-left">${escapeHtml(shortDate(asset.dateCreated || ''))}</span></div>
         ${asset.pending_upload ? `<div class="asset-date" style="color:#1976d2;font-weight:700;">${escapeHtml(asset.pending_message || (asset.pending_upload_kind === 'new_version' ? 'Pending new version upload' : asset.pending_upload_kind === 'new_asset' ? 'Pending new asset upload' : 'Pending copy upload'))}</div>` : ''}
         ${asset.asset_mode_uploaded ? `<div class="asset-date" style="color:#348c4b;font-weight:700;">${escapeHtml(asset.asset_mode_message || (asset.asset_mode_uploaded === 'new_version' ? 'New version uploaded to this slot. Reload to view.' : 'New asset uploaded to this slot. Reload to view.'))}</div>` : ''}
-        ${asset.size_warning ? `<div class="asset-date" style="color:#a93d36;font-weight:700;">${escapeHtml(asset.size_warning)}</div>` : ''}
+        ${sizeWarningHtml}
+        ${fixHtml ? `<div class="asset-fix-pill-row">${fixHtml}</div>` : ''}
         ${asset.is_marked_for_deletion ? '<div class="asset-date" style="color:#a93d36;font-weight:700;">Marked for deletion</div>' : ''}
         ${asset.lane === 'off_pattern' ? `<div class="asset-date" style="color:#8b6b00;font-weight:700;">Off-pattern: ${escapeHtml(asset.current_position || '')}</div>` : ''}
         ${asset.pending_upload && asset.pending_upload_kind === 'copy' ? `<button type="button" class="asset-undo-copy" onclick="undoPendingCopyClick(event, '${escapeHtml(asset.id || '')}', '${escapeHtml(asset.current_position || '')}', '${escapeHtml(asset.copy_source_media_id || '')}', '${escapeHtml(asset.sku || '')}')">No longer copy</button>` : ''}
@@ -5613,10 +6035,16 @@ function jumpToRow(rowId, colorKey='', slotKey='') {
 
     const boardMain = document.getElementById('boardMain');
     const collectionBar = boardMain ? boardMain.querySelector('.collection-header') : document.querySelector('.collection-header');
-    const offset = (collectionBar ? collectionBar.offsetHeight : 0) + 8;
-    const y = rowEl.offsetTop - offset;
-    if (boardMain) boardMain.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
-    else window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
+    const offset = (collectionBar ? collectionBar.offsetHeight : 0) + 12;
+    if (boardMain) {
+      const boardRect = boardMain.getBoundingClientRect();
+      const rowRect = rowEl.getBoundingClientRect();
+      const targetTop = boardMain.scrollTop + (rowRect.top - boardRect.top) - offset;
+      boardMain.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+    } else {
+      const rowTop = rowEl.getBoundingClientRect().top + window.scrollY - offset;
+      window.scrollTo({ top: Math.max(0, rowTop), behavior: 'smooth' });
+    }
 
     rowEl.classList.add('row-highlight');
     setTimeout(() => rowEl.classList.remove('row-highlight'), 5000);
@@ -5624,6 +6052,12 @@ function jumpToRow(rowId, colorKey='', slotKey='') {
     if (slotKey) {
       const slotEl = document.getElementById(`slot-${rowId}-${slotKey}`) || rowEl.querySelector(`.slot[data-slot="${slotKey}"]`);
       if (!slotEl) return false;
+      if (boardMain) {
+        const boardRect2 = boardMain.getBoundingClientRect();
+        const slotRect = slotEl.getBoundingClientRect();
+        const slotTargetTop = boardMain.scrollTop + (slotRect.top - boardRect2.top) - offset;
+        boardMain.scrollTo({ top: Math.max(0, slotTargetTop), behavior: 'smooth' });
+      }
       slotEl.classList.remove('slot-highlight');
       void slotEl.offsetWidth;
       slotEl.classList.add('slot-highlight');
@@ -5691,29 +6125,30 @@ function jumpToComponentSku(event, sku) {
   jumpToRow(targetRowId, colorKey, '');
 }
 
-function undoPendingCopy(event, assetId, targetPos, sourceMediaId='', targetSku='') {
+async function undoPendingCopy(event, assetId, targetPos, sourceMediaId='', targetSku='') {
   event.preventDefault();
   event.stopPropagation();
   if (!confirm(`No longer copy this to ${targetPos}?`)) return;
   if (!state.board) return;
-  let removed = false;
-  for (const section of state.board.color_sections || []) {
-    for (const row of section.rows || []) {
-      row.assets = (row.assets || []).filter(a => {
-        const sameId = String(a.id || '') === String(assetId || '');
-        const samePendingCopy = Boolean(a.pending_upload) && String(a.pending_upload_kind || '') === 'copy';
-        const samePos = String(a.current_position || '') === String(targetPos || '');
-        const sameSku = !targetSku || String(a.sku || '') === String(targetSku || '');
-        const sameSource = !sourceMediaId || String(a.copy_source_media_id || '') === String(sourceMediaId || '');
-        const match = sameId || (samePendingCopy && samePos && sameSku && sameSource);
-        if (match) removed = true;
-        return !match;
-      });
-    }
-  }
-  if (removed) {
-    state.summary = computeClientSummary();
+  try {
+    const resp = await fetch('/api/remove_pending_copy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        asset_id: assetId || '',
+        target_pos: targetPos || '',
+        source_media_id: sourceMediaId || '',
+        target_sku: targetSku || ''
+      })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not remove pending copy');
+    state.board = data.board;
+    state.summary = data.summary || computeClientSummary();
     renderBoard();
+    addAppNotice('Pending copy removed.', 'success');
+  } catch (err) {
+    addAppNotice(err.message || 'Could not find that pending copy to remove.', 'warning');
   }
 }
 
@@ -5752,7 +6187,7 @@ function renderSummary() {
       const assetId = el.getAttribute('data-jump-asset');
       const card = document.querySelector(`[data-asset-id="${CSS.escape(assetId)}"]`);
       if (card) {
-        card.scrollIntoView({behavior: 'smooth', block: 'center'});
+        card.scrollIntoView({behavior: 'smooth', block: 'start'});
         card.animate([{transform:'scale(1)'},{transform:'scale(1.04)'},{transform:'scale(1)'}], {duration: 500});
       }
     });
@@ -5763,6 +6198,28 @@ function addAppNotice(text, kind='success', html='') {
   const id = `notice-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
   state.appNotices = [{id, kind, text, html, dismissible:true}, ...(state.appNotices || [])].slice(0, 12);
   renderNotifications();
+}
+
+async function fixAssetVersion(event, assetId, fixType) {
+  event.preventDefault();
+  event.stopPropagation();
+  try {
+    const resp = await fetch('/api/fix_asset_version', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ media_id: assetId, fix_type: fixType, mode: state.mode })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Asset fix failed');
+    state.board = data.board;
+    state.summary = data.summary;
+    if (data.asset_mode_refresh_pending) state.assetModeDirty = true;
+    markAssetModeDirtyRows(data.dirty_row_ids || []);
+    renderBoard();
+    if (data.notice && (data.notice.text || data.notice.html)) addAppNotice(data.notice.text || '', data.notice.kind || 'success', data.notice.html || '');
+  } catch (err) {
+    alert(err.message || String(err));
+  }
 }
 
 function updateQueuedStatus() {
@@ -6000,7 +6457,34 @@ const launchLoadingMessages = [
   'This is a big one...',
   'Gathering the good stuff...',
   'Still stitching the board together...',
-  'Almost there...'
+  'Almost there...',
+  'Patience. Something good is coming...',
+  'The board is gathering its strength...',
+  'A worthy collection takes a moment...',
+  'Hope is loading...',
+  'The force is strong with this load...',
+  'The board is awakening...',
+  'A great house is assembling...',
+  'Even the smallest load can take its time...',
+  'The next chapter is arriving...',
+  'A fellowship of assets is forming...',
+  'Stand fast. The board is on its way...',
+  'A long wait, but a rich reward...',
+  'The banners are rising...',
+  'This one has a larger destiny...',
+  'The path is winding, but we are getting there...',
+  'Second breakfast for the board is taking a minute...',
+  'These assets are coming in hot like a pod race...',
+  'The board is making itself at home in the Shire...',
+  'Winter is loading, but so is your collection...',
+  'This load has more layers than an onion knight...',
+  'Not all those who wander are lost. Some are just loading...',
+  'The board is doing a little lightsaber stretching...',
+  'A wizard is never late. This load will arrive precisely when it means to...',
+  'The board is forging ahead. One asset to rule them all was a bit much...',
+  'This collection brought friends. We are welcoming them politely...',
+  'Loading like a champion, one tile at a time...',
+  'A cute little board reveal is on the way...'
 ];
 
 function startLaunchLoadingTicker() {
@@ -6066,8 +6550,9 @@ async function launchCollection(optionIdOverride=null, options={}) {
     updateStickyOffsets();
     closeIdleModal();
     if (scrollTopAfter) {
-      const boardMain = document.getElementById('boardMain');
-      if (boardMain) boardMain.scrollTop = 0;
+      requestAnimationFrame(() => {
+        scrollBoardToFirstColorTop('auto');
+      });
     }
     return data;
   } catch (err) {
@@ -6121,6 +6606,9 @@ async function discardChanges() {
   if (!state.board) return;
   if (!confirm('Discard all staged changes and go back to the last loaded version from Bynder?')) return;
   const btn = document.getElementById('discardBtn');
+  const boardMain = document.getElementById('boardMain');
+  const priorScrollTop = boardMain ? boardMain.scrollTop : 0;
+  const priorCollapsed = {...(state.collapsedColors || {})};
   btn.disabled = true;
   btn.textContent = 'Discarding...';
   try {
@@ -6129,8 +6617,12 @@ async function discardChanges() {
     if (!resp.ok) throw new Error(data.error || 'Discard failed');
     state.board = data.board;
     state.summary = data.summary;
-    state.collapsedColors = {};
+    state.collapsedColors = priorCollapsed;
     renderBoard();
+    requestAnimationFrame(() => {
+      const boardMainNow = document.getElementById('boardMain');
+      if (boardMainNow) boardMainNow.scrollTop = priorScrollTop;
+    });
     closeIdleModal();
     addAppNotice('Staged changes were discarded.', 'success');
   } catch (err) {
