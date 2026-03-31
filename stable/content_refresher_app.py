@@ -35,7 +35,7 @@ BYNDER_TOKEN_PATH = os.environ.get(
     r"C:\bynderAPI\byndercredentials_permanenttoken.json",
 )
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "dev2"
 
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
@@ -82,6 +82,9 @@ DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 COLLECTION_OPTIONS_CACHE_PATH = Path.home() / ".content_refresher_collection_options_cache.json"
 COLLECTION_OPTIONS_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+COLLECTION_ASSET_CACHE_MAX_AGE_SECONDS = 10 * 60
+COLLECTION_DERIVED_CACHE_MAX_AGE_SECONDS = 10 * 60
+COLLECTION_BOARD_CACHE_MAX_AGE_SECONDS = 5 * 60
 
 PHOTO_WATERMARK_ALPHA = 0.46
 PHOTO_WATERMARK_TEXT = ("NOT", "FINAL")
@@ -174,6 +177,49 @@ def boolish(value: Any) -> bool:
 
 def parse_datetime(value: Any) -> Optional[datetime]:
     text = string_value(value)
+    if not text:
+        return None
+    for candidate in [text.replace("Z", "+00:00"), text]:
+        try:
+            return datetime.fromisoformat(candidate)
+        except Exception:
+            pass
+    for fmt in ["%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"]:
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            pass
+    return None
+
+
+def get_fresh_cached_value(cache: Dict[str, Any], key: str, max_age_seconds: int, cache_label: str = "") -> Any:
+    entry = cache.get(key)
+    if entry is None:
+        return None
+
+    if isinstance(entry, dict) and "saved_at" in entry and "value" in entry:
+        try:
+            age_seconds = time.time() - float(entry.get("saved_at") or 0)
+        except Exception:
+            age_seconds = max_age_seconds + 1
+        if age_seconds <= max_age_seconds:
+            return deepcopy(entry.get("value"))
+        cache.pop(key, None)
+        if cache_label:
+            log_message(f"Expired {cache_label} cache for {key} after {int(age_seconds)}s; fetching fresh data.")
+        return None
+
+    cache.pop(key, None)
+    if cache_label:
+        log_message(f"Discarded legacy {cache_label} cache for {key}; fetching fresh data.")
+    return None
+
+
+def set_timed_cached_value(cache: Dict[str, Any], key: str, value: Any) -> None:
+    cache[key] = {
+        "saved_at": time.time(),
+        "value": deepcopy(value),
+    }
 
 
 def load_collection_options_from_disk_cache() -> Optional[List[Dict[str, str]]]:
@@ -212,19 +258,6 @@ def save_collection_options_to_disk_cache(items: List[Dict[str, str]]) -> None:
         )
     except Exception as exc:
         log_message(f"Could not write collection options cache: {exc}")
-
-    if not text:
-        return None
-    for candidate in [text.replace("Z", "+00:00"), text]:
-        try:
-            return datetime.fromisoformat(candidate)
-        except Exception:
-            pass
-    for fmt in ["%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"]:
-        try:
-            return datetime.strptime(text, fmt)
-        except Exception:
-            pass
     return None
 
 
@@ -1745,10 +1778,17 @@ def fetch_collection_assets_cached(session: requests.Session, option_id: str, fo
     cache = STATE.setdefault("collection_asset_cache", {})
     if force_refresh:
         cache.pop(option_id, None)
-    if option_id in cache:
-        return deepcopy(cache[option_id])
+    else:
+        cached = get_fresh_cached_value(
+            cache,
+            option_id,
+            COLLECTION_ASSET_CACHE_MAX_AGE_SECONDS,
+            cache_label="collection asset",
+        )
+        if cached is not None:
+            return cached
     items = fetch_all_media_for_option(session, option_id)
-    cache[option_id] = deepcopy(items)
+    set_timed_cached_value(cache, option_id, items)
     return items
 
 
@@ -2039,15 +2079,30 @@ def build_board_for_collection(session: requests.Session, product_collection_opt
     board_cache = STATE.setdefault("collection_board_cache", {})
     if force_refresh:
         board_cache.pop(collection_option_id, None)
-    elif collection_option_id in board_cache:
-        return deepcopy(board_cache[collection_option_id])
+    else:
+        cached_board = get_fresh_cached_value(
+            board_cache,
+            collection_option_id,
+            COLLECTION_BOARD_CACHE_MAX_AGE_SECONDS,
+            cache_label="collection board",
+        )
+        if cached_board is not None:
+            log_message(f"Using cached board for {collection_label}.")
+            return cached_board
 
     raw_collection_assets = fetch_collection_assets_cached(session, collection_option_id, force_refresh=force_refresh)
 
     derived_cache = STATE.setdefault("collection_derived_cache", {})
     if force_refresh:
         derived_cache.pop(collection_option_id, None)
-    derived = derived_cache.get(collection_option_id)
+        derived = None
+    else:
+        derived = get_fresh_cached_value(
+            derived_cache,
+            collection_option_id,
+            COLLECTION_DERIVED_CACHE_MAX_AGE_SECONDS,
+            cache_label="derived collection",
+        )
 
     if derived is None:
         photo_counts_by_color = count_available_product_photography_by_color(raw_collection_assets)
@@ -2104,7 +2159,7 @@ def build_board_for_collection(session: requests.Session, product_collection_opt
             "rows_by_sku": deepcopy(rows_by_sku),
             "rows_by_color": deepcopy(rows_by_color),
         }
-        derived_cache[collection_option_id] = deepcopy(derived)
+        set_timed_cached_value(derived_cache, collection_option_id, derived)
     else:
         photo_counts_by_color = deepcopy(derived.get("photo_counts_by_color", {}))
         unique_skus = list(derived.get("unique_skus", []))
@@ -2129,7 +2184,7 @@ def build_board_for_collection(session: requests.Session, product_collection_opt
     }
     total_rows = sum(len(section.get("rows", [])) for section in color_sections)
     log_message(f"Built board for {collection_label}: {total_rows} rows across {len(color_sections)} color sections.")
-    board_cache[collection_option_id] = deepcopy(board)
+    set_timed_cached_value(board_cache, collection_option_id, board)
     return board
 
 
@@ -3128,7 +3183,7 @@ def api_refresh_rows() -> Response:
                 refreshed.append(string_value(new_row.get("row_id") or new_row.get("sku") or row_id))
         collection_id = string_value(board.get("collection", {}).get("id"))
         if collection_id:
-            STATE.setdefault("collection_board_cache", {})[collection_id] = deepcopy(board)
+            set_timed_cached_value(STATE.setdefault("collection_board_cache", {}), collection_id, board)
         return jsonify({"board": board, "summary": compute_change_summary(board), "refreshed_row_ids": refreshed})
     except Exception as exc:
         log_message(f"Row refresh failed: {exc}")
