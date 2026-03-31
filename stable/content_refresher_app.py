@@ -35,7 +35,7 @@ BYNDER_TOKEN_PATH = os.environ.get(
     r"C:\bynderAPI\byndercredentials_permanenttoken.json",
 )
 
-APP_VERSION = "dev2"
+APP_VERSION = "dev12"
 
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
@@ -67,11 +67,15 @@ ALLOWED_DELIVERABLES = {
 }
 PHOTO_ASSET_SUBTYPE = "Product_Photography"
 PHOTO_EXCLUDED_IMAGE_TYPES = {"Silo", "Styled_Silo", "Swatch", "Video_Shoot_Still"}
+REVIEWED_FOR_SITE_DBNAME = "ReviewedforSite"
+REVIEWED_FOR_SITE_LABEL = "Reviewedforsite"
 
 ASSET_SUBTYPE_REQUIRED = "Product_Site_Asset"
 MARKED_FOR_DELETION_VALUE_NAME = "Marked_for_Deletion"
 
-CORE_SLOTS = [f"SKU_{n}" for n in range(100, 5000, 100)]
+STANDARD_CORE_SLOTS = [f"SKU_{n}" for n in range(100, 5000, 100)]
+SPECIAL_CAROUSEL_SLOT = "SKU_8000"
+CORE_SLOTS = STANDARD_CORE_SLOTS + [SPECIAL_CAROUSEL_SLOT]
 SWATCH_DETAIL_SLOTS = [f"SKU_{n}" for n in range(5000, 6000, 100)]
 GRID_SLOT = "SKU_grid"
 SPECIAL_SLOTS = ["SKU_dimension", "SKU_swatch", "SKU_square"]
@@ -1743,6 +1747,8 @@ def normalize_position_for_row(position: str, row_sku: str) -> str:
             return f"SKU_{suffix}"
         if suffix.isdigit():
             num = int(suffix)
+            if num == 8000:
+                return SPECIAL_CAROUSEL_SLOT
             if 100 <= num <= 4900 and num % 100 == 0:
                 return f"SKU_{num}"
             if 5000 <= num <= 5900 and num % 100 == 0:
@@ -2024,6 +2030,40 @@ def parse_photo_tags(asset: Dict[str, Any]) -> List[str]:
             out.append(m)
     return out
 
+def get_reviewed_for_site_values(asset: Dict[str, Any]) -> List[str]:
+    raw = asset.get(f"property_{REVIEWED_FOR_SITE_DBNAME}")
+    values: List[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                label = string_value(item.get("label") or item.get("name") or item.get("value") or item.get("databaseName"))
+                if label:
+                    values.append(label)
+            else:
+                label = string_value(item)
+                if label:
+                    values.append(label)
+    elif isinstance(raw, dict):
+        label = string_value(raw.get("label") or raw.get("name") or raw.get("value") or raw.get("databaseName"))
+        if label:
+            values.append(label)
+    else:
+        label = string_value(raw)
+        if label:
+            values.extend([x.strip() for x in re.split(r"[,;|]", label) if x.strip()])
+    seen = set()
+    out: List[str] = []
+    for value in values:
+        key = value.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(value.strip())
+    return out
+
+
+def photo_asset_is_reviewed_for_site(asset: Dict[str, Any]) -> bool:
+    return any(string_value(v).strip().lower() == REVIEWED_FOR_SITE_LABEL.lower() for v in get_reviewed_for_site_values(asset))
+
 def photo_asset_to_client_model(asset: Dict[str, Any], matching_skus: List[str]) -> Dict[str, Any]:
     original = string_value(asset.get("original"))
     name = string_value(asset.get("name"))
@@ -2031,6 +2071,7 @@ def photo_asset_to_client_model(asset: Dict[str, Any], matching_skus: List[str])
     tags = parse_photo_tags(asset)
     matching = [t for t in tags if t in set(matching_skus)]
     fp = asset.get("activeOriginalFocusPoint") or {}
+    reviewed_values = get_reviewed_for_site_values(asset)
     return {
         "id": string_value(asset.get("id")),
         "name": name,
@@ -2043,6 +2084,8 @@ def photo_asset_to_client_model(asset: Dict[str, Any], matching_skus: List[str])
         "source": prop(asset, "Source", "Source"),
         "asset_status": get_photography_asset_status(asset),
         "is_final": photography_asset_is_final(asset),
+        "reviewed_for_site": photo_asset_is_reviewed_for_site(asset),
+        "reviewed_for_site_values": reviewed_values,
         "tags": tags,
         "matching_skus": matching,
         "focus_x": int(fp.get("x") or 0) if fp else 0,
@@ -3046,6 +3089,40 @@ def api_load_photography() -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/mark_photo_reviewed", methods=["POST"])
+def api_mark_photo_reviewed() -> Response:
+    try:
+        payload = request.get_json(force=True)
+        media_id = string_value(payload.get("media_id"))
+        if not media_id:
+            return jsonify({"error": "media_id is required"}), 400
+
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        metaprops_by_dbname = fetch_metaproperties_map(session)
+        reviewed_mp = metaprops_by_dbname.get(REVIEWED_FOR_SITE_DBNAME)
+        if not reviewed_mp:
+            return jsonify({"error": f"Could not find metaproperty {REVIEWED_FOR_SITE_DBNAME}."}), 404
+
+        reviewed_mp_id = string_value(reviewed_mp.get("id"))
+        reviewed_option_value = get_metaproperty_option_value(session, reviewed_mp_id, REVIEWED_FOR_SITE_LABEL)
+        if not reviewed_option_value:
+            return jsonify({"error": f"Could not resolve option {REVIEWED_FOR_SITE_LABEL}."}), 404
+
+        post_media_fields(session, media_id, [(f"metaproperty.{reviewed_mp_id}", reviewed_option_value)])
+        log_message(f"Marked photography asset {media_id} as reviewed for site.")
+        return jsonify({
+            "ok": True,
+            "media_id": media_id,
+            "reviewed_for_site": True,
+            "reviewed_for_site_values": [REVIEWED_FOR_SITE_LABEL],
+            "notice": {"kind": "success", "text": "Photography asset marked as reviewed for site."},
+        })
+    except Exception as exc:
+        log_message(f"Mark photo reviewed failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/pull_additional_photography_for_sku", methods=["POST"])
 def api_pull_additional_photography_for_sku() -> Response:
     try:
@@ -3329,7 +3406,7 @@ def api_download(asset_id: str) -> Response:
 
         if upstream is None:
             download_url = get_media_download_url(session, source_media_id)
-            upstream = request_with_retries(session, "GET", download_url, timeout=120)
+            upstream = request_with_retries(session, "GET", download_url)
 
         mime = upstream.headers.get("Content-Type") or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
         content = upstream.content
@@ -3877,6 +3954,7 @@ INDEX_HTML = r'''
   .photo-sub { font-size: 12px; color: #55705a; line-height: 1.35; max-width: 250px; }
   .photo-header-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .photo-mini-btn { padding: 8px 10px; }
+  .photo-review-btn { padding: 5px 7px; font-size: 10px; line-height: 1.04; border-radius: 9px; }
   .photo-prep-actions .photo-mini-btn { padding: 6px 8px; font-size: 11px; line-height: 1.08; border-radius: 10px; }
   .photo-pull-btn { padding: 6px 8px; font-size: 12px; line-height: 1.15; }
   .photo-pull-btn-checking { animation: photoPullCheckingPulse 1.2s ease-in-out infinite; }
@@ -3945,8 +4023,10 @@ INDEX_HTML = r'''
   .photo-name a { color: inherit; text-decoration: underline; text-decoration-color: rgba(30, 64, 175, 0.28); }
   .photo-name a:hover { text-decoration-color: rgba(30, 64, 175, 0.62); }
   .photo-line { font-size:11px; color:#5b6a5e; }
-  .photo-actions { display:flex; gap:8px; }
+  .photo-actions { display:flex; gap:8px; flex-wrap:wrap; }
   .photo-actions a { font-size:11px; color: var(--rf-blue); text-decoration:none; }
+  .photo-review-row { display:flex; justify-content:flex-start; margin-top:6px; }
+  .photo-review-status { font-size:12px; color:#2d6a3f; font-weight:700; }
   .photo-skus { border-top:1px solid #e2ece3; background:#fafdfa; }
   .photo-skus-toggle { width:100%; border:0; background:transparent; padding:8px 10px; cursor:pointer; text-align:left; font-weight:700; color:#3d6b49; }
   .photo-skus-body { display:none; padding:0 10px 10px; }
@@ -4127,6 +4207,15 @@ INDEX_HTML = r'''
     border-color: var(--rf-blue);
     background: #f1f7fd;
   }
+  .slot.slot-missing-critical {
+    background: #6f1d1b;
+    border-color: #4d0f0d;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08);
+  }
+  .slot.slot-missing-critical .slot-label,
+  .slot.slot-missing-critical .empty {
+    color: #fff1ef;
+  }
   .slot-label {
     font-size: 11px;
     font-weight: 800;
@@ -4195,6 +4284,9 @@ INDEX_HTML = r'''
   }
   .asset-fix-pill-row {
     margin-top: 4px;
+    display: flex;
+    justify-content: flex-start;
+    margin-bottom: 8px;
   }
   .asset-fix-action {
     display: inline-flex;
@@ -4225,6 +4317,7 @@ INDEX_HTML = r'''
     gap: 6px;
     margin-top: 0;
     line-height: 1.1;
+    justify-content: flex-start;
   }
   .asset-actions a {
     font-size: 10px;
@@ -4249,14 +4342,15 @@ INDEX_HTML = r'''
     border: 0; background: transparent; cursor: pointer; color: inherit; font-weight: 800;
   }
   .asset-fix-action {
-    display:inline-block;
-    margin-left:8px;
+    display:inline-flex;
+    margin-left:0;
     color:#2f8f45;
     font-weight:800;
     cursor:pointer;
     text-decoration:none;
     white-space:nowrap;
     flex:0 0 auto;
+    align-self:flex-start;
   }
   .asset-fix-action:hover { text-decoration:underline; }
   .summary-header {
@@ -4543,6 +4637,10 @@ INDEX_HTML = r'''
             <input type="checkbox" id="hideFpoToggle" onchange="setHideFpo(this.checked)" />
             Hide FPO
           </label>
+          <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
+            <input type="checkbox" id="hideReviewedToggle" onchange="setHideReviewed(this.checked)" />
+            Hide reviewed
+          </label>
         </div>
         <div class="photo-body" id="photoBody">
           <div class="photo-empty">Pull available product photography from a color header to load this panel.</div>
@@ -4620,6 +4718,8 @@ const state = {
     prep: { flip: false, mode: 'crop_1688', offsetYOverrides: {} },
     previewUrl: '',
     hideFpo: false,
+    hideReviewed: false,
+    reviewingIds: {},
   },
   photoSkuOpen: {},
   photoDragId: null,
@@ -4661,6 +4761,16 @@ function boardHasSku(sku) {
     }
   }
   return false;
+}
+
+function getRowById(rowId) {
+  if (!state.board || !rowId) return null;
+  for (const section of state.board.color_sections || []) {
+    for (const row of section.rows || []) {
+      if (String(row.row_id || '') === String(rowId) || String(row.sku || '') === String(rowId)) return row;
+    }
+  }
+  return null;
 }
 
 function sectionRowsByColor(color) {
@@ -4962,23 +5072,45 @@ function getLaneMax(laneType) {
         const match = /^SKU_(\d+)$/.exec(asset.slot_key || '');
         if (!match) continue;
         const num = Number(match[1]);
-        if (Number.isFinite(num) && num > maxVal) maxVal = num;
+        if (!Number.isFinite(num)) continue;
+        if (laneType === 'core' && num === 8000) continue;
+        if (num > maxVal) maxVal = num;
       }
     }
   }
   return maxVal;
 }
 
+function rowHasCore8000(row) {
+  return (row.assets || []).some(asset => String(asset.lane || '') === 'core' && String(asset.slot_key || '') === 'SKU_8000' && !asset.is_marked_for_deletion);
+}
+
 function laneInfo(row, laneType) {
   if (laneType === 'core') {
     const slots = [];
-    const maxVal = getLaneMax('core');
+    let maxVal = 100;
+    for (const asset of row.assets || []) {
+      if (String(asset.lane || '') !== 'core') continue;
+      const match = /^SKU_(\d+)$/.exec(asset.slot_key || '');
+      if (!match) continue;
+      const num = Number(match[1]);
+      if (!Number.isFinite(num) || num === 8000) continue;
+      if (num > maxVal) maxVal = num;
+    }
     for (let n = 100; n <= maxVal; n += 100) slots.push(`SKU_${n}`);
+    if (rowHasCore8000(row)) slots.push('SKU_8000');
     return slots;
   }
   if (laneType === 'swatch_detail') {
     const slots = [];
-    const maxVal = getLaneMax('swatch_detail');
+    let maxVal = 5000;
+    for (const asset of row.assets || []) {
+      if (String(asset.lane || '') !== 'swatch_detail') continue;
+      const match = /^SKU_(\d+)$/.exec(asset.slot_key || '');
+      if (!match) continue;
+      const num = Number(match[1]);
+      if (Number.isFinite(num) && num > maxVal) maxVal = num;
+    }
     for (let n = 5000; n <= maxVal; n += 100) slots.push(`SKU_${n}`);
     return slots;
   }
@@ -5122,10 +5254,18 @@ function renderAssetCard(asset, changed) {
   `;
 }
 
+function slotNeedsCriticalHighlight(row, slotName, items) {
+  if (!row || (row.product_status || '').toLowerCase() !== 'active') return false;
+  if (items && items.length) return false;
+  return slotName === 'SKU_grid' || slotName === 'SKU_100';
+}
+
 function renderSlot(rowId, lane, slotName, items, label, changedSet, extraClass='') {
-  const cards = items.length ? items.map(a => renderAssetCard(a, changedSet.has(a.id))).join('') : '<div class="empty">Drop here</div>';
+  const row = getRowById(rowId);
+  const isCriticalMissing = slotNeedsCriticalHighlight(row, slotName, items);
+  const cards = items.length ? items.map(a => renderAssetCard(a, changedSet.has(a.id))).join('') : `<div class="empty">${isCriticalMissing ? 'Missing required image' : 'Drop here'}</div>`;
   return `
-    <div class="slot ${extraClass}" data-row-id="${escapeHtml(rowId)}" data-lane="${escapeHtml(lane)}" data-slot="${escapeHtml(slotName)}">
+    <div class="slot ${extraClass} ${isCriticalMissing ? 'slot-missing-critical' : ''}" data-row-id="${escapeHtml(rowId)}" data-lane="${escapeHtml(lane)}" data-slot="${escapeHtml(slotName)}">
       <div class="slot-label">${escapeHtml(label)}</div>
       ${cards}
     </div>
@@ -5223,6 +5363,7 @@ function renderPhotoTile(asset) {
   const thumb = panelThumbUrl(asset);
   const isOpen = !!state.photoSkuOpen[asset.id];
   const isSelected = (state.photography.selectedIds || []).includes(asset.id);
+  const isReviewing = !!((state.photography.reviewingIds || {})[asset.id]);
   return `
     <div class="photo-tile ${isSelected ? 'selected' : ''}" draggable="true" data-photo-id="${escapeHtml(asset.id)}">
       <div class="photo-image-wrap">
@@ -5238,6 +5379,9 @@ function renderPhotoTile(asset) {
         <div class="photo-actions">
           <a href="${escapeHtml(asset.original || asset.transformBaseUrl || '#')}" target="_blank" rel="noopener">Open</a>
           <a href="#" onclick="downloadAsset(event, '${escapeHtml(asset.id || '')}', '${escapeHtml(asset.id || '')}', '${escapeHtml(asset.file_name || asset.name || 'asset')}')">Download</a>
+        </div>
+        <div class="photo-review-row">
+          ${asset.reviewed_for_site ? `<div class="photo-review-status">Reviewed</div>` : `<button type="button" class="btn btn-secondary photo-mini-btn photo-review-btn" ${isReviewing ? 'disabled' : ''} onclick="markPhotoReviewed(event, '${escapeHtml(asset.id)}')">${isReviewing ? 'Saving...' : 'Mark reviewed'}</button>`}
         </div>
       </div>
       <div class="photo-skus">
@@ -5255,13 +5399,13 @@ function getPhotoById(photoId) {
 }
 
 function getVisiblePhotographyItems() {
-  const all = state.photography.items || [];
-  if (!state.photography.hideFpo) return all;
-  return all.filter(x => !!x.is_final);
+  let all = state.photography.items || [];
+  if (state.photography.hideFpo) all = all.filter(x => !!x.is_final);
+  if (state.photography.hideReviewed) all = all.filter(x => !x.reviewed_for_site);
+  return all;
 }
 
-function setHideFpo(checked) {
-  state.photography.hideFpo = !!checked;
+function refreshActivePhotoSelectionAfterFilter() {
   const visible = getVisiblePhotographyItems();
   if (state.photography.activeId && !visible.some(x => String(x.id) === String(state.photography.activeId))) {
     state.photography.activeId = '';
@@ -5269,7 +5413,53 @@ function setHideFpo(checked) {
     if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl);
     state.photography.previewUrl = '';
   }
+}
+
+function setHideFpo(checked) {
+  state.photography.hideFpo = !!checked;
+  refreshActivePhotoSelectionAfterFilter();
   renderPhotographyPanel();
+}
+
+function setHideReviewed(checked) {
+  state.photography.hideReviewed = !!checked;
+  refreshActivePhotoSelectionAfterFilter();
+  renderPhotographyPanel();
+}
+
+async function markPhotoReviewed(event, photoId) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  const asset = getPhotoById(photoId);
+  if (!asset || asset.reviewed_for_site) return;
+  const ok = confirm(
+    "Before you mark this image as reviewed, please make sure you checked every product shown in it, including smaller pieces like lamps, artwork, and end tables. If everything in the image has been reviewed, go ahead. If not, give it one more pass first."
+  );
+  if (!ok) return;
+  state.photography.reviewingIds = state.photography.reviewingIds || {};
+  state.photography.reviewingIds[photoId] = true;
+  renderPhotographyPanel();
+  try {
+    const resp = await fetch('/api/mark_photo_reviewed', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({media_id: photoId})
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not mark photo as reviewed');
+    asset.reviewed_for_site = true;
+    asset.reviewed_for_site_values = data.reviewed_for_site_values || ['Reviewedforsite'];
+    addAppNotice('Photography asset marked as reviewed for site.', 'success');
+    refreshActivePhotoSelectionAfterFilter();
+    renderPhotographyPanel();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    delete state.photography.reviewingIds[photoId];
+    renderPhotographyPanel();
+  }
 }
 
 function currentActivePhoto() {
@@ -5708,6 +5898,7 @@ function renderPhotographyPanel() {
   const sub = document.getElementById('photoSub');
   const toggleBtn = document.getElementById('photoToggleBtn');
   const hideFpoToggle = document.getElementById('hideFpoToggle');
+  const hideReviewedToggle = document.getElementById('hideReviewedToggle');
   if (!shell || !body || !sub || !toggleBtn) return;
 
   const photo = state.photography;
@@ -5727,6 +5918,7 @@ function renderPhotographyPanel() {
   }
 
   if (hideFpoToggle) hideFpoToggle.checked = !!photo.hideFpo;
+  if (hideReviewedToggle) hideReviewedToggle.checked = !!photo.hideReviewed;
 
   if (!photo.items.length) {
     sub.textContent = 'Reference panel for available product photography in the selected collection/color.';
@@ -5737,12 +5929,15 @@ function renderPhotographyPanel() {
   const visibleItems = getVisiblePhotographyItems();
   if (!visibleItems.length) {
     sub.textContent = `${photo.items.length} photography asset(s) for ${photo.color}.`;
-    body.innerHTML = `<div class="photo-empty">All loaded photography is currently hidden by Hide FPO.</div>`;
+    body.innerHTML = `<div class="photo-empty">All loaded photography is currently hidden by the active Photography filters.</div>`;
     return;
   }
 
   const hiddenCount = Math.max(0, (photo.items || []).length - visibleItems.length);
-  sub.textContent = hiddenCount ? `${visibleItems.length} photography asset(s) shown for ${photo.color}. ${hiddenCount} hidden by Hide FPO.` : `${visibleItems.length} photography asset(s) for ${photo.color}.`;
+  const activeFilters = [];
+  if (photo.hideFpo) activeFilters.push('Hide FPO');
+  if (photo.hideReviewed) activeFilters.push('Hide reviewed');
+  sub.textContent = hiddenCount ? `${visibleItems.length} photography asset(s) shown for ${photo.color}. ${hiddenCount} hidden by ${activeFilters.join(' and ')}.` : `${visibleItems.length} photography asset(s) for ${photo.color}.`;
   const prepDrawer = renderPhotoPrepDrawer();
   body.innerHTML = `${prepDrawer || ''}<div class="photo-grid">${visibleItems.map(renderPhotoTile).join('')}</div>`;
   bindPhotographyDnD();
@@ -5779,6 +5974,8 @@ async function pullPhotographyForColor(event, color) {
     state.photography.previewUrl = '';
     state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
     state.photography.hideFpo = false;
+    state.photography.hideReviewed = false;
+    state.photography.reviewingIds = {};
     state.additionalPhotoAvailabilityBySku = {};
     state.additionalPhotoCheckInFlight = {};
     for (const section of state.board.color_sections || []) {
@@ -5804,6 +6001,9 @@ function clearPhotographyPanel() {
   if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl);
   state.photography.previewUrl='';
   state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
+  state.photography.hideFpo = false;
+  state.photography.hideReviewed = false;
+  state.photography.reviewingIds = {};
   state.additionalPhotoAvailabilityBySku = {};
   state.additionalPhotoCheckInFlight = {};
   renderPhotographyPanel();
@@ -6020,6 +6220,30 @@ function bindNotificationActions() {
       }
     });
   });
+}
+
+function findFirstMissingCriticalSlot(slotKey) {
+  if (!state.board) return null;
+  for (const section of state.board.color_sections || []) {
+    for (const row of section.rows || []) {
+      if ((row.product_status || '').toLowerCase() !== 'active') continue;
+      const liveAssets = (row.assets || []).filter(a => !a.is_marked_for_deletion);
+      const hasSlot = slotKey === 'SKU_grid'
+        ? liveAssets.some(a => a.slot_key === 'SKU_grid' || (a.current_position || '').endsWith('_grid'))
+        : liveAssets.some(a => a.slot_key === slotKey || (a.current_position || '').endsWith(`_${slotKey.replace('SKU_', '')}`));
+      if (!hasSlot) return {rowId: row.row_id, color: section.color, slot: slotKey};
+    }
+  }
+  return null;
+}
+
+function jumpToFirstMissingSlot(slotKey) {
+  const found = findFirstMissingCriticalSlot(slotKey);
+  if (!found) {
+    addAppNotice(slotKey === 'SKU_grid' ? 'No active SKUs are missing grid images.' : 'No active SKUs are missing SKU_100 images.', 'success');
+    return;
+  }
+  jumpToRow(found.rowId, found.color, found.slot);
 }
 
 function jumpToRow(rowId, colorKey='', slotKey='') {
