@@ -36,7 +36,7 @@ BYNDER_TOKEN_PATH = os.environ.get(
     r"C:\bynderAPI\byndercredentials_permanenttoken.json",
 )
 
-APP_VERSION = "dev12"
+APP_VERSION = "dev13"
 
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
@@ -81,6 +81,9 @@ PHOTO_TO_PSA_IMAGE_TYPE_MAP = {
 }
 PSA_IMAGE_TYPE_PROMPT_CHOICES = ["Detail", "Room_shot", "Silo", "Swatch_detail"]
 SWATCH_OPTIONAL_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
+WALL_ART_SIZING_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
+WALL_ART_SIZING_GUIDE_MEDIA_ID = "ed5aad96-4b05-4f8b-8a60-621b9f955fac"
+WALL_ART_SIZING_GUIDE_FILENAME = "Image_Carousel_Wall_Art_Sizing_Guide_3000x1688.jpg"
 
 ASSET_SUBTYPE_REQUIRED = "Product_Site_Asset"
 MARKED_FOR_DELETION_VALUE_NAME = "Marked_for_Deletion"
@@ -935,15 +938,24 @@ def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offs
         return scaled.crop((0, off, out_w, off + out_h))
 
     if mode == "crop_remove_sides_1688":
-        scaled_w = int(round(src_w * (out_h / src_h))) if src_h else out_w
-        scaled = im.resize((max(1, scaled_w), out_h), Image.LANCZOS)
-        if scaled.size[0] <= out_w:
-            canvas = Image.new("RGB", (out_w, out_h), (255, 255, 255))
-            x = (out_w - scaled.size[0]) // 2
-            canvas.paste(scaled, (x, 0))
-            return canvas
-        left = (scaled.size[0] - out_w) // 2
-        return scaled.crop((left, 0, left + out_w, out_h))
+        if not src_w or not src_h:
+            return im.resize((out_w, out_h), Image.LANCZOS)
+        # This mode should never introduce letterboxing. Prefer a height-first
+        # resize and crop equal amounts from the sides. If the source is not
+        # wide enough after scaling to 1688 tall, fall back to a cover resize so
+        # the output still fills 3000x1688 completely.
+        scaled_w = int(round(src_w * (out_h / src_h)))
+        if scaled_w >= out_w:
+            scaled = im.resize((max(1, scaled_w), out_h), Image.LANCZOS)
+            left = max(0, (scaled.size[0] - out_w) // 2)
+            return scaled.crop((left, 0, left + out_w, out_h))
+        cover_scale = max(out_w / src_w, out_h / src_h)
+        cover_w = max(1, int(round(src_w * cover_scale)))
+        cover_h = max(1, int(round(src_h * cover_scale)))
+        covered = im.resize((cover_w, cover_h), Image.LANCZOS)
+        left = max(0, (cover_w - out_w) // 2)
+        top = max(0, (cover_h - out_h) // 2)
+        return covered.crop((left, top, left + out_w, top + out_h))
 
     if mode == "pad_lr_1688":
         canvas = Image.new("RGB", (3000, 1688), (255, 255, 255))
@@ -1016,11 +1028,16 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
         return preview.convert("RGB")
 
     if mode == "crop_remove_sides_1688":
-        scaled_w = int(round(src_w * (out_h / src_h))) if src_h else out_w
-        scaled = im.resize((max(1, scaled_w), out_h), Image.LANCZOS).convert("RGBA")
-        overlay = scaled.copy()
-        if scaled.size[0] > out_w:
-            left = (scaled.size[0] - out_w) // 2
+        if not src_w or not src_h:
+            fallback = im.resize((out_w, out_h), Image.LANCZOS)
+            scale = min(preview_max_w / fallback.size[0], preview_max_h / fallback.size[1], 1.0)
+            prev_size = (max(1, int(round(fallback.size[0] * scale))), max(1, int(round(fallback.size[1] * scale))))
+            return fallback.resize(prev_size, Image.LANCZOS).convert("RGB")
+        scaled_w = int(round(src_w * (out_h / src_h)))
+        if scaled_w >= out_w:
+            scaled = im.resize((max(1, scaled_w), out_h), Image.LANCZOS).convert("RGBA")
+            overlay = scaled.copy()
+            left = max(0, (scaled.size[0] - out_w) // 2)
             right = left + out_w
             haze = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
             haze_draw = ImageDraw.Draw(haze, "RGBA")
@@ -1031,6 +1048,32 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
             overlay = Image.alpha_composite(overlay, haze)
             draw = ImageDraw.Draw(overlay, "RGBA")
             draw.rectangle((left + 2, 2, right - 3, out_h - 3), outline=(255,255,255,235), width=4)
+            scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
+            prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
+            preview = overlay.resize(prev_size, Image.LANCZOS)
+            return preview.convert("RGB")
+        cover_scale = max(out_w / src_w, out_h / src_h)
+        cover_w = max(1, int(round(src_w * cover_scale)))
+        cover_h = max(1, int(round(src_h * cover_scale)))
+        covered = im.resize((cover_w, cover_h), Image.LANCZOS).convert("RGBA")
+        overlay = covered.copy()
+        left = max(0, (cover_w - out_w) // 2)
+        top = max(0, (cover_h - out_h) // 2)
+        right = left + out_w
+        bottom = top + out_h
+        haze = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+        haze_draw = ImageDraw.Draw(haze, "RGBA")
+        if left > 0:
+            haze_draw.rectangle((0, 0, left, cover_h), fill=(115, 115, 115, 125))
+        if right < cover_w:
+            haze_draw.rectangle((right, 0, cover_w, cover_h), fill=(115, 115, 115, 125))
+        if top > 0:
+            haze_draw.rectangle((left, 0, right, top), fill=(115, 115, 115, 95))
+        if bottom < cover_h:
+            haze_draw.rectangle((left, bottom, right, cover_h), fill=(115, 115, 115, 95))
+        overlay = Image.alpha_composite(overlay, haze)
+        draw = ImageDraw.Draw(overlay, "RGBA")
+        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=(255,255,255,235), width=4)
         scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
         prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
         preview = overlay.resize(prev_size, Image.LANCZOS)
@@ -1464,89 +1507,24 @@ def compose_set_dim_canvas(
     ordered_images = [pair[0] for pair in ordered_pairs]
     ordered_raw_scales = [pair[2] for pair in ordered_pairs]
 
-    # Pack the actual trimmed content footprints against the 10px outer guide and 30px inner gaps.
-    # The user scale values act directly and intuitively: higher percent -> bigger content footprint.
-    edge = 10
-    gap = 30
-    usable_w = 3000 - (2 * edge)
-    usable_h = 1688 - (2 * edge)
-
-    if count == 1:
-        multipliers = [ordered_raw_scales[0] / 100.0]
-        iw, ih = ordered_images[0].size
-        scale = min(usable_w / max(1.0, iw * multipliers[0]), usable_h / max(1.0, ih * multipliers[0]))
-        new_w = max(1, int(round(iw * multipliers[0] * scale)))
-        new_h = max(1, int(round(ih * multipliers[0] * scale)))
-        resized = ordered_images[0].resize((new_w, new_h), Image.LANCZOS)
-        canvas.paste(resized, (edge + (usable_w - new_w) // 2, edge + (usable_h - new_h) // 2))
-        return canvas
-
-    def row_groups_for(n: int) -> List[List[int]]:
-        if n == 2:
-            w0, h0 = ordered_images[0].size
-            w1, h1 = ordered_images[1].size
-            a0 = w0 / max(1, h0)
-            a1 = w1 / max(1, h1)
-            both_wide = a0 > 1.0 and a1 > 1.0
-            both_tall = a0 <= 1.0 and a1 <= 1.0
-            row_h = (usable_h - gap) // 2
-            col_w = (usable_w - gap) // 2
-            area_rows = math.prod(_fit_size(w0, h0, usable_w, row_h)) + math.prod(_fit_size(w1, h1, usable_w, row_h))
-            area_cols = math.prod(_fit_size(w0, h0, col_w, usable_h)) + math.prod(_fit_size(w1, h1, col_w, usable_h))
-            if both_wide or (not both_tall and area_rows >= area_cols):
-                return [[0], [1]]
-            return [[0, 1]]
-        if n == 3:
-            return [[0, 1], [2]]
-        if n == 4:
-            return [[0, 1], [2, 3]]
-        if n == 5:
-            return [[0, 1, 2], [3, 4]]
-        return [[0, 1, 2], [3, 4, 5]]
-
-    groups = row_groups_for(count)
-    multipliers = [max(0.60, min(1.60, val / 100.0)) for val in ordered_raw_scales]
-
-    row_width_coeffs = []
-    row_height_coeffs = []
-    for row in groups:
-        width_coeff = sum(ordered_images[i].size[0] * multipliers[i] for i in row)
-        height_coeff = max(ordered_images[i].size[1] * multipliers[i] for i in row)
-        row_width_coeffs.append(width_coeff)
-        row_height_coeffs.append(height_coeff)
-
-    width_limits = []
-    for row, width_coeff in zip(groups, row_width_coeffs):
-        row_usable_w = usable_w - gap * max(0, len(row) - 1)
-        width_limits.append(row_usable_w / max(1.0, width_coeff))
-    height_limit = (usable_h - gap * max(0, len(groups) - 1)) / max(1.0, sum(row_height_coeffs))
-    global_scale = min(width_limits + [height_limit])
-    global_scale = max(global_scale, 0.01)
-
-    scaled_sizes: List[tuple[int, int]] = []
+    # Distribute the dims evenly across the full usable canvas while preserving
+    # the 10px outer guide and 30px between-dim gap. The scale percentages bias
+    # how much space each dim claims inside that evenly distributed layout.
+    boxes = get_set_dim_layout_boxes_weighted(ordered_images, ordered_raw_scales)
     for idx, im in enumerate(ordered_images):
-        factor = multipliers[idx] * global_scale
+        if idx >= len(boxes):
+            break
+        bx0, by0, bx1, by1 = boxes[idx]
+        bw = max(1, bx1 - bx0)
+        bh = max(1, by1 - by0)
         iw, ih = im.size
-        scaled_sizes.append((max(1, int(round(iw * factor))), max(1, int(round(ih * factor)))))
-
-    row_heights = []
-    for row in groups:
-        row_heights.append(max(scaled_sizes[i][1] for i in row))
-
-    total_content_h = sum(row_heights) + gap * max(0, len(groups) - 1)
-    y = edge + max(0, (usable_h - total_content_h) // 2)
-
-    for row_idx, row in enumerate(groups):
-        row_h = row_heights[row_idx]
-        row_content_w = sum(scaled_sizes[i][0] for i in row) + gap * max(0, len(row) - 1)
-        x = edge + max(0, (usable_w - row_content_w) // 2)
-        for i in row:
-            new_w, new_h = scaled_sizes[i]
-            resized = ordered_images[i].resize((new_w, new_h), Image.LANCZOS)
-            paste_y = y + (row_h - new_h) // 2
-            canvas.paste(resized, (x, paste_y))
-            x += new_w + gap
-        y += row_h + gap
+        scale = min(bw / max(1, iw), bh / max(1, ih))
+        new_w = max(1, int(round(iw * scale)))
+        new_h = max(1, int(round(ih * scale)))
+        resized = im.resize((new_w, new_h), Image.LANCZOS)
+        paste_x = bx0 + max(0, (bw - new_w) // 2)
+        paste_y = by0 + max(0, (bh - new_h) // 2)
+        canvas.paste(resized, (paste_x, paste_y))
 
     return canvas
 
@@ -3689,6 +3667,11 @@ def row_requires_swatch(row: Dict[str, Any]) -> bool:
     return step_path not in SWATCH_OPTIONAL_STEP_PATHS
 
 
+def row_requires_wall_art_sizing(row: Dict[str, Any]) -> bool:
+    step_path = string_value(row.get("step_path") or row.get("property_STEP_Path") or "")
+    return step_path in WALL_ART_SIZING_STEP_PATHS
+
+
 def candidate_sort_key(candidate: Dict[str, Any]) -> Tuple[int, float]:
     return (
         -int(candidate.get("issue_total") or 0),
@@ -3713,12 +3696,14 @@ def compute_row_issue_summary(row: Dict[str, Any], include_missing_dims: bool = 
     has_100 = any(a.get("slot_key") == "SKU_100" or string_value(a.get("current_position")).endswith("_100") for a in live_assets)
     has_swatch = any(a.get("slot_key") == "SKU_swatch" or string_value(a.get("current_position")).endswith("_swatch") for a in live_assets)
     has_dim = any(a.get("slot_key") == "SKU_dimension" or string_value(a.get("current_position")).endswith("_dimension") for a in live_assets)
+    has_8000 = any(a.get("slot_key") == "SKU_8000" or string_value(a.get("current_position")).endswith("_8000") for a in live_assets)
     off_pattern = sum(1 for a in live_assets if string_value(a.get("lane")) == "off_pattern")
     issues = {
         "missing_grid": 0 if has_grid else 1,
         "missing_100": 0 if has_100 else 1,
         "missing_swatch": 0 if (has_swatch or not row_requires_swatch(row)) else 1,
         "missing_dimension": 0 if has_dim else 1,
+        "missing_wall_art_sizing": 0 if (has_8000 or not row_requires_wall_art_sizing(row)) else 1,
         "compilable_set_dim": 1 if (not has_dim and bool(row.get("set_dim_compile_ready"))) else 0,
         "off_pattern": off_pattern,
         "duplicate_slot": sum(1 for v in dup_counts.values() if v > 1),
@@ -3733,7 +3718,7 @@ def compute_row_issue_summary(row: Dict[str, Any], include_missing_dims: bool = 
 def compute_board_issue_summary(board: Dict[str, Any], include_missing_dims: bool = True) -> Dict[str, Any]:
     summary = {
         "missing_grid": 0, "missing_100": 0, "missing_swatch": 0, "missing_dimension": 0,
-        "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "size_warnings": 0, "total": 0,
+        "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "size_warnings": 0, "total": 0,
         "rows": {},
     }
     for section in board.get("color_sections", []):
@@ -3743,38 +3728,83 @@ def compute_board_issue_summary(board: Dict[str, Any], include_missing_dims: boo
             row_summary = compute_row_issue_summary(row, include_missing_dims=include_missing_dims)
             if row_summary["total"]:
                 summary["rows"][string_value(row.get("row_id") or row.get("sku"))] = row_summary
-            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "compilable_set_dim", "off_pattern", "duplicate_slot", "size_warnings"]:
+            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "size_warnings"]:
                 summary[key] += int(row_summary.get(key) or 0)
-    summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "compilable_set_dim", "off_pattern", "duplicate_slot", "size_warnings"])
+    summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "size_warnings"])
     return summary
 
 
-def build_game_candidate_from_board(board: Dict[str, Any], color_name: str, issue_summary: Dict[str, Any]) -> Dict[str, Any]:
-    candidate_board = filter_board_to_colors(board, [color_name])
-    rows = []
-    for section in candidate_board.get("color_sections", []):
-        rows.extend(section.get("rows") or [])
+def build_game_candidate_from_color(collection_option: Dict[str, str], color_name: str, issue_summary: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "key": f"{string_value(board.get('collection', {}).get('id'))}::{color_name}",
-        "collection": deepcopy(board.get("collection") or {}),
+        "key": f"{string_value(collection_option.get('id'))}::{color_name}",
+        "collection": deepcopy(collection_option or {}),
         "color": color_name,
-        "board": candidate_board,
-        "issues": issue_summary,
+        "issues": deepcopy(issue_summary),
         "issue_total": int(issue_summary.get("total") or 0),
         "random_rank": random.random(),
     }
 
 
+def _lane_presence_from_assets_for_sku(assets: List[Dict[str, Any]], sku: str) -> Dict[str, bool]:
+    live_assets = [a for a in (assets or []) if not is_marked_for_deletion(a)]
+    positions = {normalize_position_for_row(get_asset_position(a), sku) for a in live_assets}
+    return {
+        "has_grid": GRID_SLOT in positions,
+        "has_100": f"{sku}_100" in positions,
+        "has_swatch": f"{sku}_swatch" in positions,
+        "has_dim": f"{sku}_dimension" in positions,
+        "has_8000": f"{sku}_8000" in positions,
+    }
+
+
 def scan_collection_for_game_candidates(session: requests.Session, collection_option: Dict[str, str]) -> List[Dict[str, Any]]:
-    board = build_board_for_collection(session, collection_option, force_refresh=False)
+    collection_option_id = string_value(collection_option.get("id"))
+    collection_label = string_value(collection_option.get("label"))
+    raw_collection_assets = fetch_collection_assets_cached(session, collection_option_id, force_refresh=False)
+    psa_assets = [a for a in raw_collection_assets if is_product_site_asset(a)]
+    by_color_sku: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    for asset in psa_assets:
+        sku = prop(asset, "Product_SKU", "Product_SKU")
+        if not sku:
+            continue
+        color = get_color_label(asset)
+        by_color_sku[color][sku].append(asset)
+
     candidates: List[Dict[str, Any]] = []
-    for section in board.get("color_sections", []):
-        color_name = string_value(section.get("color"))
-        section_board = filter_board_to_colors(board, [color_name])
-        issues = compute_board_issue_summary(section_board, include_missing_dims=False)
-        if int(issues.get("total") or 0) > 0:
-            candidates.append(build_game_candidate_from_board(board, color_name, issues))
+    for color_name, sku_map in by_color_sku.items():
+        summary = {
+            "missing_grid": 0, "missing_100": 0, "missing_swatch": 0, "missing_dimension": 0,
+            "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "size_warnings": 0, "total": 0,
+            "rows": {},
+        }
+        for sku, sku_assets in sku_map.items():
+            grid_assets = [a for a in sku_assets if normalize_position_for_row(get_asset_position(a), sku) == GRID_SLOT]
+            anchor = max(grid_assets or sku_assets, key=lambda a: parse_datetime(a.get("dateCreated")) or datetime.min)
+            if string_value(get_status_from_grid_asset(anchor)).lower() != "active":
+                continue
+            step_path = prop(anchor, "STEP_Path", "STEP_Path")
+            lane = _lane_presence_from_assets_for_sku(sku_assets, sku)
+            row_summary = {
+                "missing_grid": 0 if lane["has_grid"] else 1,
+                "missing_100": 0 if lane["has_100"] else 1,
+                "missing_swatch": 0 if (lane["has_swatch"] or step_path in SWATCH_OPTIONAL_STEP_PATHS) else 1,
+                "missing_dimension": 0,
+                "missing_wall_art_sizing": 0 if (lane["has_8000"] or step_path not in WALL_ART_SIZING_STEP_PATHS) else 1,
+                "compilable_set_dim": 0,
+                "off_pattern": 0,
+                "duplicate_slot": 0,
+                "size_warnings": 0,
+            }
+            row_summary["total"] = sum(int(v or 0) for k, v in row_summary.items() if k != "total")
+            if row_summary["total"]:
+                summary["rows"][sku] = row_summary
+            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing"]:
+                summary[key] += int(row_summary.get(key) or 0)
+        summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "size_warnings"])
+        if int(summary.get("total") or 0) > 0:
+            candidates.append(build_game_candidate_from_color(collection_option, color_name, summary))
     candidates.sort(key=candidate_sort_key)
+    log_message(f"Scanned lightweight game candidates for {collection_label}: {len(candidates)} candidate colorways")
     return candidates
 
 
@@ -3825,6 +3855,27 @@ def maybe_start_game_queue_fill(force: bool = False) -> None:
                 game["scanner_running"] = False
 
     threading.Thread(target=_worker, daemon=True).start()
+
+
+def hydrate_game_candidate(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    collection = deepcopy(candidate.get("collection") or {})
+    color_name = string_value(candidate.get("color"))
+    if not string_value(collection.get("id")) or not color_name:
+        return None
+    token = load_bynder_token(BYNDER_TOKEN_PATH)
+    session = make_session(token)
+    board = build_board_for_collection(session, collection, force_refresh=False)
+    board = filter_board_to_colors(board, [color_name])
+    issues = compute_board_issue_summary(board, include_missing_dims=False)
+    if int(issues.get("total") or 0) <= 0:
+        log_message(f"Skipped stale Cleanup Challenge candidate: {collection.get('label')} / {color_name}")
+        return None
+    hydrated = deepcopy(candidate)
+    hydrated["board"] = board
+    hydrated["issues"] = deepcopy(issues)
+    hydrated["issue_total"] = int(issues.get("total") or 0)
+    STATE["game"]["current"] = hydrated
+    return board
 
 
 def pop_next_game_candidate(force_fill: bool = True) -> Optional[Dict[str, Any]]:
@@ -3963,14 +4014,26 @@ def api_game_ensure_queue() -> Response:
 @app.route("/api/game/launch", methods=["POST"])
 def api_game_launch() -> Response:
     try:
-        maybe_start_game_queue_fill(force=True)
-        candidate = pop_next_game_candidate(force_fill=True)
-        if candidate is None:
-            return jsonify({"error": "Could not find a Cleanup Challenge board yet. Try again in a moment."}), 503
+        game = STATE["game"]
+        with game["lock"]:
+            has_ready_candidate = bool(game.get("queue"))
+        if not has_ready_candidate:
+            maybe_start_game_queue_fill(force=True)
+        board = None
+        for _ in range(6):
+            candidate = pop_next_game_candidate(force_fill=not has_ready_candidate)
+            has_ready_candidate = True
+            if candidate is None:
+                break
+            board = hydrate_game_candidate(candidate)
+            if board is not None:
+                break
+        if board is None:
+            maybe_start_game_queue_fill(force=True)
+            return jsonify({"error": "No Cleanup Challenge board is ready yet. Please try again in a moment."}), 503
         STATE["game"]["active"] = True
-        STATE["game"]["current"] = candidate
-        STATE["board"] = deepcopy(candidate["board"])
-        STATE["baseline_board"] = deepcopy(candidate["board"])
+        STATE["board"] = deepcopy(board)
+        STATE["baseline_board"] = deepcopy(board)
         STATE["last_load"] = datetime.now().isoformat()
         maybe_start_game_queue_fill(force=False)
         return jsonify({"board": STATE["board"], "summary": compute_change_summary(STATE["board"]), "game": game_status_payload()})
@@ -3989,13 +4052,19 @@ def api_game_next() -> Response:
             STATE["game"]["current"] = None
             return jsonify({"ok": True, "game": game_status_payload()})
         maybe_start_game_queue_fill(force=False)
-        candidate = pop_next_game_candidate(force_fill=True)
-        if candidate is None:
+        board = None
+        for _ in range(4):
+            candidate = pop_next_game_candidate(force_fill=True)
+            if candidate is None:
+                break
+            board = hydrate_game_candidate(candidate)
+            if board is not None:
+                break
+        if board is None:
             return jsonify({"error": "No Cleanup Challenge board is ready yet."}), 503
         STATE["game"]["active"] = True
-        STATE["game"]["current"] = candidate
-        STATE["board"] = deepcopy(candidate["board"])
-        STATE["baseline_board"] = deepcopy(candidate["board"])
+        STATE["board"] = deepcopy(board)
+        STATE["baseline_board"] = deepcopy(board)
         STATE["last_load"] = datetime.now().isoformat()
         maybe_start_game_queue_fill(force=False)
         return jsonify({"board": STATE["board"], "summary": compute_change_summary(STATE["board"]), "game": game_status_payload(), "action": action})
@@ -4410,6 +4479,66 @@ def api_remove_pending_copy() -> Response:
         return jsonify({"board": STATE["board"], "summary": compute_change_summary(STATE["board"])})
     except Exception as exc:
         log_message(f"Remove pending copy failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/apply_wall_art_sizing_guide", methods=["POST"])
+def api_apply_wall_art_sizing_guide() -> Response:
+    try:
+        payload = request.get_json(force=True)
+        row_id = string_value(payload.get("row_id"))
+        if not row_id:
+            return jsonify({"error": "row_id is required."}), 400
+        board = STATE.get("board")
+        row = get_row_by_id(board, row_id) if board else None
+        if not row:
+            return jsonify({"error": "Target row not found."}), 404
+        if not row_requires_wall_art_sizing(row):
+            return jsonify({"error": "This SKU does not require the wall art sizing guide."}), 400
+        live_assets = [a for a in (row.get("assets") or []) if not a.get("is_marked_for_deletion")]
+        has_8000 = any(string_value(a.get("slot_key")) == "SKU_8000" or string_value(a.get("current_position")).endswith("_8000") for a in live_assets)
+        if has_8000:
+            return jsonify({"error": "This SKU already has a wall art sizing guide in SKU_8000."}), 400
+
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        sku = string_value(row.get("sku"))
+        target_position = exact_position_for_row(sku, SPECIAL_CAROUSEL_SLOT)
+        target_filename = f"{sku}_wall_art_sizing_guide_3000x1688.jpg" if sku else WALL_ART_SIZING_GUIDE_FILENAME
+        result = create_copied_asset_for_target(
+            session,
+            WALL_ART_SIZING_GUIDE_MEDIA_ID,
+            "",
+            sku,
+            target_position,
+            asset_name=target_filename,
+        )
+        source_asset = fetch_media_by_id(session, WALL_ART_SIZING_GUIDE_MEDIA_ID)
+        placeholder = build_uploaded_new_asset_placeholder(
+            source_asset,
+            sku,
+            target_position,
+            target_filename,
+            "core",
+            SPECIAL_CAROUSEL_SLOT,
+            result.get("new_media_id") or "",
+            "",
+            string_value(source_asset.get(f"property_{PSA_IMAGE_TYPE_DBNAME}"))
+        )
+        row.setdefault("assets", []).append(placeholder)
+        STATE["summary"] = build_commit_summary(STATE["board"])
+        return jsonify({
+            "board": STATE["board"],
+            "summary": STATE["summary"],
+            "asset_mode_refresh_pending": True,
+            "dirty_row_ids": [row_id],
+            "notice": {
+                "kind": "success",
+                "text": "Wall art sizing guide was added to SKU_8000. Reload to see it."
+            }
+        })
+    except Exception as exc:
+        log_message(f"Wall art sizing guide apply failed: {exc}")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -6314,7 +6443,7 @@ function renderBrandPanel() {
         <div class="brand-mini-pill wide"><div class="k">Current challenge</div><div class="v">${currentLabel || 'Loading...'}</div><div class="s">${currentColor || 'Finding a colorway with work to tackle'}</div></div>
       </div>
       <div class="brand-mini-actions">
-        <button type="button" class="game-mini-btn primary" onclick="launchCleanupChallenge()">Load next challenge</button>
+        <button type="button" class="game-mini-btn primary" onclick="launchCleanupChallenge()">Show next board</button>
         <button type="button" class="game-mini-btn pass" onclick="passCleanupChallenge()">Pass</button>
         <button type="button" class="game-mini-btn exit" onclick="exitCleanupChallenge()">Leave mode</button>
       </div>
@@ -6386,10 +6515,10 @@ function showGameCelebration(title, text) {
 
 async function launchCleanupChallenge() {
   const g = state.game || {};
-  const okay = confirm(g.active
-    ? 'Load the next Cleanup Challenge? You will leave the current challenge board and jump to a fresh collection/color with real cleanup work ready to tackle.'
-    : 'Launch Cleanup Challenge? You will leave the regular workspace and jump into a workshop-style board with real content issues to fix, live scoring, and fresh challenge boards queued in the background.');
-  if (!okay) return;
+  if (!g.active) {
+    const okay = confirm('Launch Cleanup Challenge? You will leave the regular workspace and jump into a workshop-style board with real content issues to fix, live scoring, and fresh challenge boards queued in the background.');
+    if (!okay) return;
+  }
   try {
     const url = g.active ? '/api/game/next' : '/api/game/launch';
     const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'launch'})});
@@ -6409,7 +6538,7 @@ async function passCleanupChallenge() {
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Could not load the next challenge');
     applyBoardResponse(data);
-    showGameCelebration('Passed', 'Fresh challenge coming right up.');
+    showGameCelebration('Passed', 'Showing the next board.');
     scheduleGameQueueEnsure();
   } catch (err) { alert(err.message || String(err)); }
 }
@@ -6570,7 +6699,7 @@ function laneInfo(row, laneType) {
       const displayMax = Math.min(maxVal + 100, 4900);
       for (let n = 100; n <= displayMax; n += 100) slots.push(`SKU_${n}`);
     }
-    if (rowHasCore8000(row)) slots.push('SKU_8000');
+    if (rowHasCore8000(row) || rowRequiresWallArtSizing(row)) slots.push('SKU_8000');
     return slots;
   }
   if (laneType === 'swatch_detail') {
@@ -6951,6 +7080,9 @@ function renderEmptySlotActions(row, lane, slotName, items) {
   if (state.mode === 'assets' && lane === 'special' && slotName === 'SKU_dimension' && row.set_dim_compile_ready) {
     return `<div class="empty-slot-actions"><a href="#" class="asset-fix-action" onclick="openCompileSetDim('${escapeHtml(row.row_id || '')}'); return false;">Compile set dim</a></div>`;
   }
+  if (state.mode === 'assets' && lane === 'core' && slotName === 'SKU_8000' && rowRequiresWallArtSizing(row)) {
+    return `<div class="empty-slot-actions"><a href="#" class="asset-fix-action" onclick="applyWallArtSizingGuide(event, '${escapeHtml(row.row_id || '')}'); return false;">Fix wall art sizing guide</a></div>`;
+  }
   return '';
 }
 
@@ -6989,14 +7121,14 @@ function renderRow(row, changedSet) {
           <div class="top-slot-layout">
             <div class="lane-block compact">
               <div class="lane-title">Grid</div>
-              <div class="slot-row tight">
+              <div class="slot-row tight" data-scroll-key="${escapeHtml(row.row_id)}::grid">
                 ${renderSlot(row.row_id, 'grid', 'SKU_grid', buckets.grid['SKU_grid'], 'SKU_grid', changedSet)}
               </div>
             </div>
 
             <div class="lane-block compact">
               <div class="lane-title">Special Slots</div>
-              <div class="slot-row tight">
+              <div class="slot-row tight" data-scroll-key="${escapeHtml(row.row_id)}::special">
                 ${renderSlot(row.row_id, 'special', 'SKU_dimension', buckets.special['SKU_dimension'], 'SKU_dimension', changedSet, 'special')}
                 ${renderSlot(row.row_id, 'special', 'SKU_swatch', buckets.special['SKU_swatch'], 'SKU_swatch', changedSet, 'special')}
                 ${renderSlot(row.row_id, 'special', 'SKU_square', buckets.special['SKU_square'], 'SKU_SQUARE', changedSet, 'special')}
@@ -7007,7 +7139,7 @@ function renderRow(row, changedSet) {
 
             <div class="lane-block compact">
               <div class="lane-title">Swatch Detail Images</div>
-              <div class="slot-row tight swatch-detail-inline">
+              <div class="slot-row tight swatch-detail-inline" data-scroll-key="${escapeHtml(row.row_id)}::swatch_detail">
                 ${swatchDetailSlots.map(slot => renderSlot(row.row_id, 'swatch_detail', slot, buckets.swatch_detail[slot] || [], slot, changedSet)).join('')}
               </div>
             </div>
@@ -7015,7 +7147,7 @@ function renderRow(row, changedSet) {
 
           <div class="lane-block">
             <div class="lane-title">Product Carousel Images</div>
-            <div class="slot-row">
+            <div class="slot-row" data-scroll-key="${escapeHtml(row.row_id)}::core">
               ${coreSlots.map(slot => renderSlot(row.row_id, 'core', slot, buckets.core[slot] || [], slot, changedSet)).join('')}
             </div>
           </div>
@@ -7770,8 +7902,49 @@ function bindPhotographyDnD() {
   });
 }
 
+function snapshotLaneScrolls() {
+  const out = {};
+  document.querySelectorAll('.slot-row[data-scroll-key]').forEach(el => {
+    out[el.getAttribute('data-scroll-key')] = el.scrollLeft || 0;
+  });
+  return out;
+}
+
+function restoreLaneScrolls(scrolls) {
+  if (!scrolls) return;
+  document.querySelectorAll('.slot-row[data-scroll-key]').forEach(el => {
+    const key = el.getAttribute('data-scroll-key');
+    if (Object.prototype.hasOwnProperty.call(scrolls, key)) el.scrollLeft = Number(scrolls[key] || 0);
+  });
+}
+
+async function applyWallArtSizingGuide(event, rowId) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  try {
+    const resp = await fetch('/api/apply_wall_art_sizing_guide', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({row_id: rowId})
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not apply wall art sizing guide');
+    state.board = data.board;
+    state.summary = data.summary;
+    if (data.asset_mode_refresh_pending) state.assetModeDirty = true;
+    markAssetModeDirtyRows(data.dirty_row_ids || [rowId]);
+    renderBoard();
+    if (data.notice && (data.notice.text || data.notice.html)) addAppNotice(data.notice.text || '', data.notice.kind || 'success', data.notice.html || '');
+  } catch (err) {
+    alert(err.message || String(err));
+  }
+}
+
 function renderBoard() {
   const host = document.getElementById('boardHost');
+  const laneScrolls = snapshotLaneScrolls();
   const changedSet = changedAssetIds();
   const thumbValue = Number(document.getElementById('thumbSize').value || 84);
   document.documentElement.style.setProperty('--thumb-height', thumbValue + 'px');
@@ -7823,6 +7996,7 @@ function renderBoard() {
   bindColorToggles();
   bindComponentJumps();
   bindUndoCopyButtons();
+  restoreLaneScrolls(laneScrolls);
   renderSummary();
   updateQueuedStatus();
 }
@@ -7832,10 +8006,19 @@ const SWATCH_OPTIONAL_STEP_PATHS = new Set([
   'RF_Root___Home_Decor___Wall_Art',
   'RF_Root___Home_Decor___Wall_Decor'
 ]);
+const WALL_ART_SIZING_STEP_PATHS = new Set([
+  'RF_Root___Home_Decor___Wall_Art',
+  'RF_Root___Home_Decor___Wall_Decor'
+]);
 
 function rowRequiresSwatch(row) {
   const stepPath = String((row && (row.step_path || row.property_STEP_Path)) || '').trim();
   return !SWATCH_OPTIONAL_STEP_PATHS.has(stepPath);
+}
+
+function rowRequiresWallArtSizing(row) {
+  const stepPath = String((row && (row.step_path || row.property_STEP_Path)) || '').trim();
+  return WALL_ART_SIZING_STEP_PATHS.has(stepPath);
 }
 
 function computeClientChallengeIssueCount() {
@@ -7849,6 +8032,7 @@ function computeClientChallengeIssueCount() {
       const has100 = liveAssets.some(a => a.slot_key === 'SKU_100' || String(a.current_position || '').endsWith('_100'));
       const hasSwatch = liveAssets.some(a => a.slot_key === 'SKU_swatch' || String(a.current_position || '').endsWith('_swatch'));
       const hasDimension = liveAssets.some(a => a.slot_key === 'SKU_dimension' || String(a.current_position || '').endsWith('_dimension'));
+      const has8000 = liveAssets.some(a => a.slot_key === 'SKU_8000' || String(a.current_position || '').endsWith('_8000'));
       const offPatternAssets = liveAssets.filter(a => String(a.lane || '') === 'off_pattern');
       const dupCounts = {};
       for (const asset of liveAssets) {
@@ -7862,6 +8046,7 @@ function computeClientChallengeIssueCount() {
       if (!hasGrid) total += 1;
       if (!has100) total += 1;
       if (rowRequiresSwatch(row) && !hasSwatch) total += 1;
+      if (rowRequiresWallArtSizing(row) && !has8000) total += 1;
       if (!hasDimension && row.set_dim_compile_ready) total += 1;
       if (offPatternAssets.length) total += 1;
       if (hasDuplicate) total += 1;
@@ -7897,6 +8082,7 @@ function computeMissingNotices() {
   let firstMissing100 = null;
   let firstMissingSwatch = null;
   let firstMissingDimension = null;
+  let firstMissingWallArtSizing = null;
   let firstCompilableSetDim = null;
   let firstOffPattern = null;
   let firstDuplicateSlot = null;
@@ -7910,6 +8096,7 @@ function computeMissingNotices() {
       const has100 = liveAssets.some(a => a.slot_key === 'SKU_100' || (a.current_position || '').endsWith('_100'));
       const hasSwatch = liveAssets.some(a => a.slot_key === 'SKU_swatch' || (a.current_position || '').endsWith('_swatch'));
       const hasDimension = liveAssets.some(a => a.slot_key === 'SKU_dimension' || (a.current_position || '').endsWith('_dimension'));
+      const has8000 = liveAssets.some(a => a.slot_key === 'SKU_8000' || (a.current_position || '').endsWith('_8000'));
       const offPatternAssets = liveAssets.filter(a => (a.lane || '') === 'off_pattern');
 
       const dupCounts = {};
@@ -7926,6 +8113,7 @@ function computeMissingNotices() {
       if (!has100 && !firstMissing100) firstMissing100 = {rowId: row.row_id, color: section.color, slot: 'SKU_100'};
       if (rowRequiresSwatch(row) && !hasSwatch && !firstMissingSwatch) firstMissingSwatch = {rowId: row.row_id, color: section.color, slot: 'SKU_swatch'};
       if (!hasDimension && !firstMissingDimension) firstMissingDimension = {rowId: row.row_id, color: section.color, slot: 'SKU_dimension'};
+      if (rowRequiresWallArtSizing(row) && !has8000 && !firstMissingWallArtSizing) firstMissingWallArtSizing = {rowId: row.row_id, color: section.color, slot: 'SKU_8000'};
       if (!hasDimension && row.set_dim_compile_ready && !firstCompilableSetDim) firstCompilableSetDim = {rowId: row.row_id, color: section.color, slot: 'SKU_dimension'};
       if (offPatternAssets.length && !firstOffPattern) {
         firstOffPattern = {
@@ -7944,6 +8132,7 @@ function computeMissingNotices() {
   if (firstMissingGrid) notices.push({id:'missing-grid', kind:'error', text:'Missing grid: Jump to the first active SKU missing a grid image.', rowId:firstMissingGrid.rowId, color:firstMissingGrid.color, slot:firstMissingGrid.slot});
   if (firstMissing100) notices.push({id:'missing-100', kind:'error', text:'Missing SKU_100: Jump to the first active SKU missing its SKU_100 image.', rowId:firstMissing100.rowId, color:firstMissing100.color, slot:firstMissing100.slot});
   if (firstMissingSwatch) notices.push({id:'missing-swatch', kind:'notice', text:'Missing swatch: Jump to the first active SKU missing a swatch asset.', rowId:firstMissingSwatch.rowId, color:firstMissingSwatch.color, slot:firstMissingSwatch.slot});
+  if (firstMissingWallArtSizing) notices.push({id:'missing-wall-art-sizing', kind:'notice', text:'Missing wall art sizing guide: Jump to the first active SKU missing its SKU_8000 wall art sizing guide.', rowId:firstMissingWallArtSizing.rowId, color:firstMissingWallArtSizing.color, slot:firstMissingWallArtSizing.slot});
   if (firstMissingDimension && !state.game.active) notices.push({id:'missing-dimension', kind:'notice', text:'Missing dimensions: Jump to the first active SKU missing a dimensions asset.', rowId:firstMissingDimension.rowId, color:firstMissingDimension.color, slot:firstMissingDimension.slot});
   if (firstCompilableSetDim) notices.push({id:'missing-set-dim', kind:'notice', text:'Missing set dim: Jump to the first active SKU where a set dim could be compiled.', rowId:firstCompilableSetDim.rowId, color:firstCompilableSetDim.color, slot:firstCompilableSetDim.slot});
   if (firstOffPattern) notices.push({id:'off-pattern', kind:'notice', text:'Off-pattern assets found: Jump to the first active SKU with off-pattern assets.', rowId:firstOffPattern.rowId, color:firstOffPattern.color, slot:firstOffPattern.slot});
