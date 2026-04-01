@@ -1165,6 +1165,14 @@ def normalize_set_dim_order(images: List[Image.Image], component_subcats: Option
 
 
 def _normalized_set_dim_weights(raw_weights: Optional[List[Any]], count: int) -> List[float]:
+    """
+    Turn the UI scale percentages into layout weights.
+
+    We intentionally bias this curve harder than a simple linear/square mapping so
+    user changes are visually obvious in the compiled preview. A small nudge should
+    reclaim or surrender real canvas area, not just create a mathematically tiny box
+    delta that is hard to see.
+    """
     weights: List[float] = []
     for idx in range(count):
         try:
@@ -1172,7 +1180,10 @@ def _normalized_set_dim_weights(raw_weights: Optional[List[Any]], count: int) ->
         except Exception:
             val = 100.0
         val = max(60.0, min(160.0, val))
-        weights.append(val / 100.0)
+        ratio = val / 100.0
+        # Stronger response curve so 70/80/130/140 style adjustments are visible.
+        weight = ratio ** 4.0
+        weights.append(max(0.08, weight))
     return weights
 
 
@@ -1303,21 +1314,33 @@ def compose_set_dim_canvas(
     boxes = get_set_dim_layout_boxes_weighted(ordered_images, ordered_weights)
     canvas = Image.new("RGB", (3000, 1688), (255, 255, 255))
 
-    def paste_fit(im: Image.Image, box: tuple[int, int, int, int]) -> None:
+    def paste_fit(im: Image.Image, box: tuple[int, int, int, int], scale_percent: float = 100.0) -> None:
         bx0, by0, bx1, by1 = box
         bw = bx1 - bx0
         bh = by1 - by0
         iw, ih = im.size
-        scale = min(bw / max(1, iw), bh / max(1, ih))
-        new_w = max(1, int(iw * scale))
-        new_h = max(1, int(ih * scale))
+        base_scale = min(bw / max(1, iw), bh / max(1, ih))
+        # Apply a secondary within-box scale so reductions are obvious even before
+        # users compare the whole layout, while enlargement still stays bounded by
+        # the redistributed box size.
+        visual_scale = max(0.60, min(1.60, float(scale_percent) / 100.0))
+        if visual_scale < 1.0:
+            base_scale *= visual_scale
+        new_w = max(1, int(iw * base_scale))
+        new_h = max(1, int(ih * base_scale))
         resized = im.resize((new_w, new_h), Image.LANCZOS)
         x = bx0 + (bw - new_w) // 2
         y = by0 + (bh - new_h) // 2
         canvas.paste(resized, (x, y))
 
     for idx, im in enumerate(ordered_images):
-        paste_fit(im, boxes[idx])
+        scale_percent = 100.0
+        if scale_percents and idx < len(scale_percents):
+            try:
+                scale_percent = float(scale_percents[idx])
+            except Exception:
+                scale_percent = 100.0
+        paste_fit(im, boxes[idx], scale_percent)
     return canvas
 
 
@@ -3752,6 +3775,21 @@ def api_set_dim_compile_preview() -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+
+@app.route("/api/set_dim_component_thumb/<media_id>", methods=["GET"])
+def api_set_dim_component_thumb(media_id: str) -> Response:
+    try:
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        img = open_image_from_media(session, string_value(media_id))
+        img = trim_whitespace(img, 10).convert("RGB")
+        img.thumbnail((220, 160), Image.LANCZOS)
+        return send_file(BytesIO(image_to_png_bytes(img)), mimetype="image/png")
+    except Exception as exc:
+        log_message(f"Set dim component thumb failed for {media_id}: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/set_dim_compile_apply", methods=["POST"])
 def api_set_dim_compile_apply() -> Response:
     try:
@@ -4493,28 +4531,30 @@ INDEX_HTML = r'''
   .photo-prep-drawer h4 { margin:0 0 4px; font-size:14px; color:#2f5134; }
 
   .set-dim-drawer {
-    position: sticky;
-    top: 0;
-    z-index: 30;
-    isolation:isolate;
-    border:1px solid #cfd8ea;
-    background: linear-gradient(180deg,#f8fbff,#edf4ff);
+    background:linear-gradient(180deg,#f4f8f1 0%,#eef6ea 100%);
+    border:1px solid #d7e6cf;
     border-radius:16px;
     padding:10px;
-    margin-bottom:12px;
-    box-shadow:0 8px 18px rgba(72,97,156,.10);
+    margin:10px 0 0;
+    position:relative;
+    z-index:3;
   }
   .set-dim-drawer h4 { margin:0 0 4px; font-size:14px; color:#27498f; }
   .set-dim-drawer .set-dim-preview-wrap { margin-top:10px; border-radius:14px; padding:10px; background:#fff; border:1px solid #d7e3fb; }
   .set-dim-drawer img { width:100%; height:auto; display:block; border-radius:10px; }
-  .set-dim-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px; margin-top:10px; }
-  .set-dim-item { background:#fff; border:1px solid #d7e3fb; border-radius:12px; padding:8px; font-size:12px; }
-  .set-dim-item label { display:block; font-weight:700; color:#3559a8; margin-bottom:4px; }
+  .set-dim-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(175px,1fr)); gap:10px; margin-top:10px; }
+  .set-dim-item { background:#fff !important; border:1px solid #d7e3fb; border-radius:12px; padding:8px; font-size:12px; opacity:1; filter:none; }
+  .set-dim-item.dragging { opacity:.55; }
+  .set-dim-slot-title { display:block; font-weight:700; color:#3559a8; margin-bottom:6px; }
+  .set-dim-slot-thumb { height:78px; border:1px solid #d7e3fb; border-radius:10px; background:#ffffff !important; display:flex; align-items:center; justify-content:center; overflow:hidden; margin-bottom:8px; box-shadow:none; }
+  .set-dim-slot-thumb img { width:auto; height:auto; max-width:100%; max-height:100%; border-radius:0; background:#ffffff !important; opacity:1; filter:none; mix-blend-mode:normal; }
   .set-dim-item select { width:100%; border:1px solid #c9d7f3; border-radius:8px; padding:6px 8px; font:inherit; background:#fff; }
   .set-dim-control-label { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; color:#5f76aa; margin-bottom:4px; }
   .set-dim-scale-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto; gap:6px; align-items:center; }
   .set-dim-scale-row input[type=range] { width:100%; }
   .set-dim-scale-value { min-width:44px; text-align:right; font-weight:700; color:#3559a8; }
+  .set-dim-rerender-row { display:flex; justify-content:flex-end; margin-top:10px; }
+  .set-dim-rerender-btn { min-width:160px; }
   .empty-slot-actions { margin-top:6px; display:flex; justify-content:flex-start; }
   .photo-prep-top { display:flex; justify-content:space-between; align-items:center; gap:12px; }
   .photo-prep-sub { font-size:12px; color:#55705a; line-height:1.35; }
@@ -5288,6 +5328,8 @@ const state = {
     previewUrl: '',
     loading: false,
     applying: false,
+    dirty: false,
+    dragSlotIdx: null,
   },
   additionalPhotoAvailabilityBySku: {},
   additionalPhotoCheckInFlight: {},
@@ -5836,9 +5878,15 @@ function currentSetDimRow() {
 }
 
 function clearSetDimSelection() {
-  if (state.setDim.previewUrl && String(state.setDim.previewUrl).startsWith('blob:')) URL.revokeObjectURL(state.setDim.previewUrl);
-  state.setDim = {activeRowId:'', slotAssignments:[], scalePercents:[], previewUrl:'', loading:false, applying:false};
+  if (state.setDim.previewUrl && String(state.setDim.previewUrl).startsWith('blob:')) {
+    URL.revokeObjectURL(state.setDim.previewUrl);
+  }
+  state.setDim = {activeRowId:'', slotAssignments:[], scalePercents:[], previewUrl:'', loading:false, applying:false, dirty:false, dragSlotIdx:null};
   renderPhotographyPanel();
+}
+
+function currentSetDimRow() {
+  return getRowById(state.setDim.activeRowId || '');
 }
 
 async function openCompileSetDim(rowId) {
@@ -5848,6 +5896,8 @@ async function openCompileSetDim(rowId) {
   state.setDim.activeRowId = String(rowId || '');
   state.setDim.slotAssignments = (row.set_dim_components || []).map((_, idx) => idx);
   state.setDim.scalePercents = (row.set_dim_components || []).map(() => 100);
+  state.setDim.dirty = false;
+  state.setDim.dragSlotIdx = null;
   state.setDim.loading = true;
   renderPhotographyPanel();
   await refreshSetDimPreview();
@@ -5875,6 +5925,7 @@ async function refreshSetDimPreview() {
     }
     if (state.setDim.previewUrl && String(state.setDim.previewUrl).startsWith('blob:')) URL.revokeObjectURL(state.setDim.previewUrl);
     state.setDim.previewUrl = URL.createObjectURL(blob);
+    state.setDim.dirty = false;
   } catch (err) {
     alert(err.message || String(err));
   } finally {
@@ -5884,13 +5935,72 @@ async function refreshSetDimPreview() {
 }
 
 function setDimSlotLabel(index, total) {
-  const labels = ['Top left', 'Top middle', 'Top right', 'Bottom left', 'Bottom middle', 'Bottom right'];
   if (total === 1) return 'Full canvas';
-  if (total === 2) return index === 0 ? 'First slot' : 'Second slot';
-  if (total === 3) return ['Top left', 'Top right', 'Bottom'][index] || `Slot ${index + 1}`;
-  if (total === 4) return ['Top left', 'Top right', 'Bottom left', 'Bottom right'][index] || `Slot ${index + 1}`;
-  if (total === 5) return ['Top left', 'Top middle', 'Top right', 'Bottom left', 'Bottom right'][index] || `Slot ${index + 1}`;
-  return labels[index] || `Slot ${index + 1}`;
+  if (total === 2) return index === 0 ? 'Upper slot' : 'Lower slot';
+  if (total === 3) return ['Upper left', 'Upper right', 'Lower center'][index] || `Slot ${index + 1}`;
+  if (total === 4) return ['Upper left', 'Upper right', 'Lower left', 'Lower right'][index] || `Slot ${index + 1}`;
+  if (total === 5) return ['Upper left', 'Upper center', 'Upper right', 'Lower left', 'Lower right'][index] || `Slot ${index + 1}`;
+  return ['Upper left', 'Upper center', 'Upper right', 'Lower left', 'Lower center', 'Lower right'][index] || `Slot ${index + 1}`;
+}
+
+function setDimComponentIndexForSlot(slotIdx) {
+  const assignments = state.setDim.slotAssignments || [];
+  return assignments.findIndex(val => Number(val) === Number(slotIdx));
+}
+
+function swapSetDimSlots(fromSlotIdx, toSlotIdx) {
+  if (fromSlotIdx === toSlotIdx) return;
+  const assignments = [...(state.setDim.slotAssignments || [])];
+  const fromComponentIdx = assignments.findIndex(val => Number(val) === Number(fromSlotIdx));
+  const toComponentIdx = assignments.findIndex(val => Number(val) === Number(toSlotIdx));
+  if (fromComponentIdx < 0 || toComponentIdx < 0) return;
+  assignments[fromComponentIdx] = Number(toSlotIdx);
+  assignments[toComponentIdx] = Number(fromSlotIdx);
+  state.setDim.slotAssignments = assignments;
+  state.setDim.dirty = true;
+  state.setDim.dragSlotIdx = null;
+  renderPhotographyPanel();
+}
+
+function beginSetDimDrag(slotIdx, event) {
+  state.setDim.dragSlotIdx = Number(slotIdx);
+  try { event.dataTransfer.setData('text/plain', String(slotIdx)); } catch (e) {}
+  try { event.dataTransfer.effectAllowed = 'move'; } catch (e) {}
+}
+
+function allowSetDimDrop(event) {
+  event.preventDefault();
+  try { event.dataTransfer.dropEffect = 'move'; } catch (e) {}
+}
+
+function dropSetDimSlot(slotIdx, event) {
+  event.preventDefault();
+  let fromSlotIdx = state.setDim.dragSlotIdx;
+  try {
+    const raw = event.dataTransfer.getData('text/plain');
+    if (raw !== '') fromSlotIdx = Number(raw);
+  } catch (e) {}
+  if (fromSlotIdx === null || fromSlotIdx === undefined || Number.isNaN(Number(fromSlotIdx))) return;
+  swapSetDimSlots(Number(fromSlotIdx), Number(slotIdx));
+}
+
+function endSetDimDrag() {
+  state.setDim.dragSlotIdx = null;
+  renderPhotographyPanel();
+}
+
+function changeSetDimScale(componentIdx, nextValue) {
+  const pct = Math.max(60, Math.min(160, Number(nextValue) || 100));
+  const next = [...(state.setDim.scalePercents || [])];
+  next[componentIdx] = pct;
+  state.setDim.scalePercents = next;
+  state.setDim.dirty = true;
+  renderPhotographyPanel();
+}
+
+function nudgeSetDimScale(componentIdx, delta) {
+  const current = Number((state.setDim.scalePercents || [])[componentIdx] || 100);
+  changeSetDimScale(componentIdx, current + delta);
 }
 
 function renderSetDimDrawer() {
@@ -5910,54 +6020,33 @@ function renderSetDimDrawer() {
           <button type="button" class="btn btn-primary photo-mini-btn ${state.setDim.applying ? 'btn-reload-flashing' : ''}" ${state.setDim.applying ? 'disabled' : ''} onclick="applyCompiledSetDim()">${state.setDim.applying ? 'Applying...' : 'Apply as dimensions asset'}</button>
         </div>
       </div>
-      <div class="photo-prep-note">We built a 3000x1688 set-dim canvas from the component dimensions. You can move a component to a different slot and nudge its visual scale so the overall composition feels more true to size before applying it.</div>
+      <div class="photo-prep-note">Arrange the placed dims by dragging these canvas slot tiles. You can nudge each one larger or smaller, then click Re-render preview when you want to see the updated composition.</div>
       <div class="set-dim-grid">
-        ${components.map((comp, idx) => `
-          <div class="set-dim-item">
-            <label>${escapeHtml(comp.sku || `Component ${idx + 1}`)}</label>
-            <div style="margin-bottom:6px;color:#4d628a;">${escapeHtml(comp.component_subcat || '')}</div>
-            <div class="set-dim-control-label">Canvas slot</div>
-            <select onchange="changeSetDimSlot(${idx}, this.value)">
-              ${Array.from({length: total}).map((_, slotIdx) => `<option value="${slotIdx}" ${(Number((state.setDim.slotAssignments || [])[idx]) === slotIdx) ? 'selected' : ''}>${escapeHtml(setDimSlotLabel(slotIdx, total))}</option>`).join('')}
-            </select>
-            <div class="set-dim-control-label" style="margin-top:8px;">Visual scale</div>
-            <div class="set-dim-scale-row">
-              <button type="button" class="btn btn-secondary photo-mini-btn" onclick="nudgeSetDimScale(${idx}, -10)">-</button>
-              <input type="range" min="60" max="160" step="5" value="${Number((state.setDim.scalePercents || [])[idx] || 100)}" onchange="changeSetDimScale(${idx}, this.value)" />
-              <button type="button" class="btn btn-secondary photo-mini-btn" onclick="nudgeSetDimScale(${idx}, 10)">+</button>
-              <div class="set-dim-scale-value">${Number((state.setDim.scalePercents || [])[idx] || 100)}%</div>
-            </div>
-          </div>
-        `).join('')}
+        ${Array.from({length: total}).map((_, slotIdx) => {
+          const componentIdx = setDimComponentIndexForSlot(slotIdx);
+          const comp = componentIdx >= 0 ? components[componentIdx] : null;
+          const scalePct = componentIdx >= 0 ? Number((state.setDim.scalePercents || [])[componentIdx] || 100) : 100;
+          const thumbSrc = comp ? `/api/set_dim_component_thumb/${encodeURIComponent(comp.dim_media_id || '')}` : '';
+          return `
+            <div class="set-dim-item ${Number(state.setDim.dragSlotIdx) === slotIdx ? 'dragging' : ''}" draggable="true" ondragstart="beginSetDimDrag(${slotIdx}, event)" ondragover="allowSetDimDrop(event)" ondrop="dropSetDimSlot(${slotIdx}, event)" ondragend="endSetDimDrag()">
+              <div class="set-dim-slot-title">Canvas slot - ${escapeHtml(setDimSlotLabel(slotIdx, total))}</div>
+              <div class="set-dim-slot-thumb">${comp ? `<img src="${thumbSrc}" alt="Canvas slot preview" />` : `<div class="photo-empty">Empty slot</div>`}</div>
+              ${comp ? `<div class="set-dim-control-label">Visual scale</div>
+              <div class="set-dim-scale-row">
+                <button type="button" class="btn btn-secondary photo-mini-btn" onclick="nudgeSetDimScale(${componentIdx}, -10)">-</button>
+                <input type="range" min="60" max="160" step="5" value="${scalePct}" oninput="changeSetDimScale(${componentIdx}, this.value)" />
+                <button type="button" class="btn btn-secondary photo-mini-btn" onclick="nudgeSetDimScale(${componentIdx}, 10)">+</button>
+                <div class="set-dim-scale-value">${scalePct}%</div>
+              </div>` : ''}
+            </div>`;
+        }).join('')}
+      </div>
+      <div class="set-dim-rerender-row">
+        <button type="button" class="btn btn-secondary set-dim-rerender-btn ${state.setDim.loading ? 'btn-reload-flashing' : ''}" ${state.setDim.loading ? 'disabled' : ''} onclick="refreshSetDimPreview()">${state.setDim.loading ? 'Re-rendering...' : (state.setDim.dirty ? 'Re-render preview' : 'Preview is up to date')}</button>
       </div>
       <div class="set-dim-preview-wrap">${preview}</div>
     </div>
   `;
-}
-
-async function changeSetDimSlot(componentIdx, slotValue) {
-  const next = [...(state.setDim.slotAssignments || [])];
-  const desired = Number(slotValue);
-  const currentIdx = next.findIndex((val, idx) => idx !== componentIdx && Number(val) === desired);
-  const oldValue = Number(next[componentIdx]);
-  next[componentIdx] = desired;
-  if (currentIdx >= 0) next[currentIdx] = oldValue;
-  state.setDim.slotAssignments = next;
-  await refreshSetDimPreview();
-}
-
-async function changeSetDimScale(componentIdx, nextValue) {
-  const pct = Math.max(60, Math.min(160, Number(nextValue) || 100));
-  const next = [...(state.setDim.scalePercents || [])];
-  next[componentIdx] = pct;
-  state.setDim.scalePercents = next;
-  renderPhotographyPanel();
-  await refreshSetDimPreview();
-}
-
-function nudgeSetDimScale(componentIdx, delta) {
-  const current = Number((state.setDim.scalePercents || [])[componentIdx] || 100);
-  return changeSetDimScale(componentIdx, current + delta);
 }
 
 async function applyCompiledSetDim() {
