@@ -69,6 +69,16 @@ PHOTO_ASSET_SUBTYPE = "Product_Photography"
 PHOTO_EXCLUDED_IMAGE_TYPES = {"Silo", "Styled_Silo", "Swatch", "Video_Shoot_Still"}
 REVIEWED_FOR_SITE_DBNAME = "ReviewedforSite"
 REVIEWED_FOR_SITE_LABEL = "Reviewedforsite"
+PSA_IMAGE_TYPE_DBNAME = "PSA_Image_Type"
+PHOTO_TO_PSA_IMAGE_TYPE_MAP = {
+    "Detail": "Detail",
+    "Lifestyle": "Room_shot",
+    "Silo": "Silo",
+    "Styled_Silo": "Silo",
+    "Swatch": "Swatch_detail",
+    "Video_Shoot_Still": "Room_shot",
+}
+PSA_IMAGE_TYPE_PROMPT_CHOICES = ["Detail", "Room_shot", "Silo", "Swatch_detail"]
 
 ASSET_SUBTYPE_REQUIRED = "Product_Site_Asset"
 MARKED_FOR_DELETION_VALUE_NAME = "Marked_for_Deletion"
@@ -95,6 +105,7 @@ PHOTO_WATERMARK_TEXT = ("NOT", "FINAL")
 PHOTO_WATERMARK_WIDTH_RATIO = 0.86
 PHOTO_WATERMARK_HEIGHT_RATIO = 0.80
 PHOTO_WATERMARK_LINE_GAP_RATIO = 0.10
+SET_DIM_MAX_COMPONENTS = 6
 
 app = Flask(__name__)
 
@@ -696,6 +707,46 @@ def get_media_download_url(session: requests.Session, media_id: str) -> str:
     raise RuntimeError(f"Could not determine download URL for media {media_id}")
 
 
+def map_photo_image_type_to_psa_label(image_type: Any) -> str:
+    return PHOTO_TO_PSA_IMAGE_TYPE_MAP.get(string_value(image_type).strip(), "")
+
+
+def get_existing_psa_image_type_label(asset: Dict[str, Any]) -> str:
+    value = asset.get(f"property_{PSA_IMAGE_TYPE_DBNAME}")
+    if isinstance(value, list):
+        return string_value(value[0]) if value else ""
+    return string_value(value)
+
+
+def append_psa_image_type_field(
+    session: requests.Session,
+    fields: List[Tuple[str, Any]],
+    metaprops_by_dbname: Dict[str, Dict[str, Any]],
+    psa_image_type_label: str,
+) -> None:
+    label = string_value(psa_image_type_label).strip()
+    if not label:
+        return
+    mp = metaprops_by_dbname.get(PSA_IMAGE_TYPE_DBNAME)
+    if not mp:
+        raise RuntimeError(f"Could not find metaproperty {PSA_IMAGE_TYPE_DBNAME}.")
+    mp_id = string_value(mp.get("id"))
+    if not mp_id:
+        raise RuntimeError(f"Metaproperty {PSA_IMAGE_TYPE_DBNAME} is missing an id.")
+    option_value = get_metaproperty_option_value(session, mp_id, label)
+    if not option_value:
+        raise RuntimeError(f"Could not resolve PSA Image Type option '{label}'.")
+    fields.append((f"metaproperty.{mp_id}", option_value))
+
+
+def set_media_psa_image_type(session: requests.Session, media_id: str, psa_image_type_label: str) -> None:
+    metaprops_by_dbname = fetch_metaproperties_map(session)
+    fields: List[Tuple[str, Any]] = []
+    append_psa_image_type_field(session, fields, metaprops_by_dbname, psa_image_type_label)
+    if fields:
+        post_media_fields(session, media_id, fields)
+
+
 def get_original_image_bytes(session: requests.Session, media_id: str) -> bytes:
     cache = STATE.setdefault("photo_image_cache", {})
     if media_id in cache:
@@ -964,6 +1015,312 @@ def image_to_jpg_bytes(image: Image.Image) -> bytes:
     return bio.getvalue()
 
 
+
+def trim_whitespace(image: Image.Image, pad: int = 10) -> Image.Image:
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    thresh = 245
+    w, h = image.size
+    px = image.load()
+    min_x, min_y = w, h
+    max_x, max_y = -1, -1
+    for y in range(h):
+        for x in range(w):
+            r, g, b = px[x, y]
+            if r < thresh or g < thresh or b < thresh:
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+    if max_x < 0 or max_y < 0:
+        return image
+    min_x = max(0, min_x - pad)
+    min_y = max(0, min_y - pad)
+    max_x = min(w - 1, max_x + pad)
+    max_y = min(h - 1, max_y + pad)
+    return image.crop((min_x, min_y, max_x + 1, max_y + 1))
+
+
+def _fit_size(iw: int, ih: int, bw: int, bh: int) -> tuple[int, int]:
+    scale = min(bw / max(1, iw), bh / max(1, ih))
+    return max(1, int(iw * scale)), max(1, int(ih * scale))
+
+
+def get_set_dim_layout_boxes(images: List[Image.Image]) -> List[tuple[int, int, int, int]]:
+    n = max(0, len(images))
+    edge = 10
+    gap = 30
+    usable_w = 3000 - (2 * edge)
+    usable_h = 1688 - (2 * edge)
+    x0 = edge
+    y0 = edge
+    x1 = edge + usable_w
+    y1 = edge + usable_h
+    if n <= 0:
+        return []
+    if n == 1:
+        return [(x0, y0, x1, y1)]
+    if n == 2:
+        w0, h0 = images[0].size
+        w1, h1 = images[1].size
+        a0 = w0 / max(1, h0)
+        a1 = w1 / max(1, h1)
+        both_wide = a0 > 1.0 and a1 > 1.0
+        both_tall = a0 <= 1.0 and a1 <= 1.0
+        row_h = (usable_h - gap) // 2
+        col_w = (usable_w - gap) // 2
+        area_a = math.prod(_fit_size(w0, h0, usable_w, row_h)) + math.prod(_fit_size(w1, h1, usable_w, row_h))
+        area_b = math.prod(_fit_size(w0, h0, col_w, usable_h)) + math.prod(_fit_size(w1, h1, col_w, usable_h))
+        if both_wide or (not both_tall and area_a >= area_b):
+            return [
+                (x0, y0, x1, y0 + row_h),
+                (x0, y0 + row_h + gap, x1, y1),
+            ]
+        return [
+            (x0, y0, x0 + col_w, y1),
+            (x0 + col_w + gap, y0, x1, y1),
+        ]
+    if n == 3:
+        col_w = (usable_w - gap) // 2
+        row_h = (usable_h - gap) // 2
+        return [
+            (x0, y0, x0 + col_w, y0 + row_h),
+            (x0 + col_w + gap, y0, x1, y0 + row_h),
+            (x0, y0 + row_h + gap, x1, y1),
+        ]
+    if n == 4:
+        col_w = (usable_w - gap) // 2
+        row_h = (usable_h - gap) // 2
+        return [
+            (x0, y0, x0 + col_w, y0 + row_h),
+            (x0 + col_w + gap, y0, x1, y0 + row_h),
+            (x0, y0 + row_h + gap, x0 + col_w, y1),
+            (x0 + col_w + gap, y0 + row_h + gap, x1, y1),
+        ]
+    if n == 5:
+        row_h = (usable_h - gap) // 2
+        col_w3 = (usable_w - (2 * gap)) // 3
+        col_w2 = (usable_w - gap) // 2
+        xA = x0
+        xB = x0 + col_w3 + gap
+        xC = x0 + (2 * col_w3) + (2 * gap)
+        yBtm0 = y0 + row_h + gap
+        return [
+            (xA, y0, xA + col_w3, y0 + row_h),
+            (xB, y0, xB + col_w3, y0 + row_h),
+            (xC, y0, x1, y0 + row_h),
+            (x0, yBtm0, x0 + col_w2, y1),
+            (x0 + col_w2 + gap, yBtm0, x1, y1),
+        ]
+    row_h = (usable_h - gap) // 2
+    col_w = (usable_w - (2 * gap)) // 3
+    xA = x0
+    xB = x0 + col_w + gap
+    xC = x0 + (2 * col_w) + (2 * gap)
+    yBtm0 = y0 + row_h + gap
+    return [
+        (xA, y0, xA + col_w, y0 + row_h),
+        (xB, y0, xB + col_w, y0 + row_h),
+        (xC, y0, x1, y0 + row_h),
+        (xA, yBtm0, xA + col_w, y1),
+        (xB, yBtm0, xB + col_w, y1),
+        (xC, yBtm0, x1, y1),
+    ]
+
+
+def normalize_set_dim_order(images: List[Image.Image], component_subcats: Optional[List[str]] = None, parent_subcat: str = "") -> tuple[List[Image.Image], List[str]]:
+    working_images = list(images)
+    working_subcats = list(component_subcats or [""] * len(working_images))
+    n = len(working_images)
+
+    if n == 4 and parent_subcat == "Bedroom_Sets" and set(working_subcats) == {"Beds", "Nightstands", "Dressers", "Mirrors"}:
+        desired = ["Beds", "Mirrors", "Nightstands", "Dressers"]
+        ordered_images = []
+        ordered_subcats = []
+        for wanted in desired:
+            idx = working_subcats.index(wanted)
+            ordered_images.append(working_images[idx])
+            ordered_subcats.append(working_subcats[idx])
+        return ordered_images, ordered_subcats
+
+    if n == 3:
+        widest_idx = max(range(n), key=lambda i: working_images[i].size[0])
+        if widest_idx != 2:
+            order = [i for i in range(n) if i != widest_idx] + [widest_idx]
+            working_images = [working_images[i] for i in order]
+            working_subcats = [working_subcats[i] for i in order]
+
+    if n == 4:
+        idx = sorted(range(n), key=lambda i: working_images[i].size[0], reverse=True)
+        order = [idx[0], idx[3], idx[1], idx[2]]
+        working_images = [working_images[i] for i in order]
+        working_subcats = [working_subcats[i] for i in order]
+
+    if n == 2:
+        if working_images[0].size[0] > working_images[1].size[0]:
+            working_images = [working_images[1], working_images[0]]
+            working_subcats = [working_subcats[1], working_subcats[0]]
+
+    return working_images, working_subcats
+
+
+def _normalized_set_dim_weights(raw_weights: Optional[List[Any]], count: int) -> List[float]:
+    weights: List[float] = []
+    for idx in range(count):
+        try:
+            val = float((raw_weights or [])[idx])
+        except Exception:
+            val = 100.0
+        val = max(60.0, min(160.0, val))
+        weights.append(val / 100.0)
+    return weights
+
+
+def _split_span(total_span: int, weights: List[float]) -> List[int]:
+    if not weights:
+        return []
+    total_weight = sum(max(0.01, float(w)) for w in weights)
+    raw = [total_span * (max(0.01, float(w)) / total_weight) for w in weights]
+    ints = [max(1, int(math.floor(x))) for x in raw]
+    remainder = total_span - sum(ints)
+    if remainder > 0:
+        order = sorted(range(len(raw)), key=lambda i: raw[i] - ints[i], reverse=True)
+        for i in range(remainder):
+            ints[order[i % len(order)]] += 1
+    elif remainder < 0:
+        order = sorted(range(len(raw)), key=lambda i: raw[i] - ints[i])
+        for i in range(-remainder):
+            idx = order[i % len(order)]
+            if ints[idx] > 1:
+                ints[idx] -= 1
+    return ints
+
+
+def get_set_dim_layout_boxes_weighted(images: List[Image.Image], raw_weights: Optional[List[Any]] = None) -> List[tuple[int, int, int, int]]:
+    n = max(0, len(images))
+    edge = 10
+    gap = 30
+    usable_w = 3000 - (2 * edge)
+    usable_h = 1688 - (2 * edge)
+    x0 = edge
+    y0 = edge
+    x1 = edge + usable_w
+    y1 = edge + usable_h
+    if n <= 0:
+        return []
+    if n == 1:
+        return [(x0, y0, x1, y1)]
+    weights = _normalized_set_dim_weights(raw_weights, n)
+
+    def boxes_from_rows(row_heights: List[int], row_width_groups: List[List[int]]) -> List[tuple[int, int, int, int]]:
+        boxes: List[tuple[int, int, int, int]] = []
+        y = y0
+        for row_idx, h in enumerate(row_heights):
+            widths = row_width_groups[row_idx]
+            x = x0
+            for w in widths:
+                boxes.append((x, y, x + w, y + h))
+                x += w + gap
+            y += h + gap
+        return boxes
+
+    if n == 2:
+        w0, h0 = images[0].size
+        w1, h1 = images[1].size
+        a0 = w0 / max(1, h0)
+        a1 = w1 / max(1, h1)
+        both_wide = a0 > 1.0 and a1 > 1.0
+        both_tall = a0 <= 1.0 and a1 <= 1.0
+        row_h = (usable_h - gap) // 2
+        col_w = (usable_w - gap) // 2
+        area_a = math.prod(_fit_size(w0, h0, usable_w, row_h)) + math.prod(_fit_size(w1, h1, usable_w, row_h))
+        area_b = math.prod(_fit_size(w0, h0, col_w, usable_h)) + math.prod(_fit_size(w1, h1, col_w, usable_h))
+        if both_wide or (not both_tall and area_a >= area_b):
+            heights = _split_span(usable_h - gap, [weights[0], weights[1]])
+            return boxes_from_rows(heights, [[usable_w], [usable_w]])
+        widths = _split_span(usable_w - gap, [weights[0], weights[1]])
+        return [(x0, y0, x0 + widths[0], y1), (x0 + widths[0] + gap, y0, x1, y1)]
+
+    if n == 3:
+        row_heights = _split_span(usable_h - gap, [sum(weights[:2]) / 2.0, weights[2]])
+        top_widths = _split_span(usable_w - gap, weights[:2])
+        return boxes_from_rows(row_heights, [top_widths, [usable_w]])
+
+    if n == 4:
+        row_heights = _split_span(usable_h - gap, [sum(weights[:2]) / 2.0, sum(weights[2:4]) / 2.0])
+        top_widths = _split_span(usable_w - gap, weights[:2])
+        bottom_widths = _split_span(usable_w - gap, weights[2:4])
+        return boxes_from_rows(row_heights, [top_widths, bottom_widths])
+
+    if n == 5:
+        row_heights = _split_span(usable_h - gap, [sum(weights[:3]) / 3.0, sum(weights[3:5]) / 2.0])
+        top_widths = _split_span(usable_w - (2 * gap), weights[:3])
+        bottom_widths = _split_span(usable_w - gap, weights[3:5])
+        return boxes_from_rows(row_heights, [top_widths, bottom_widths])
+
+    row_heights = _split_span(usable_h - gap, [sum(weights[:3]) / 3.0, sum(weights[3:6]) / 3.0])
+    top_widths = _split_span(usable_w - (2 * gap), weights[:3])
+    bottom_widths = _split_span(usable_w - (2 * gap), weights[3:6])
+    return boxes_from_rows(row_heights, [top_widths, bottom_widths])
+
+
+def compose_set_dim_canvas(
+    images: List[Image.Image],
+    component_subcats: Optional[List[str]] = None,
+    parent_subcat: str = "",
+    manual_slots: Optional[List[int]] = None,
+    scale_percents: Optional[List[int]] = None,
+) -> Image.Image:
+    images = [trim_whitespace(im, 10).convert("RGB") for im in images[:SET_DIM_MAX_COMPONENTS]]
+    if not images:
+        return Image.new("RGB", (3000, 1688), (255, 255, 255))
+    weights = _normalized_set_dim_weights(scale_percents, len(images))
+    if manual_slots is None:
+        images, component_subcats = normalize_set_dim_order(images, component_subcats, parent_subcat)
+        ordered_images = images
+        ordered_weights = weights[:len(images)]
+    else:
+        count = len(images)
+        ordered_images: List[Optional[Image.Image]] = [None] * count
+        ordered_weights: List[Optional[float]] = [None] * count
+        leftovers: List[tuple[Image.Image, float]] = []
+        for idx, im in enumerate(images):
+            slot_idx = int(manual_slots[idx]) if idx < len(manual_slots) else idx
+            slot_idx = max(0, min(count - 1, slot_idx))
+            weight = weights[idx] if idx < len(weights) else 1.0
+            if ordered_images[slot_idx] is None:
+                ordered_images[slot_idx] = im
+                ordered_weights[slot_idx] = weight
+            else:
+                leftovers.append((im, weight))
+        for slot_idx in range(count):
+            if ordered_images[slot_idx] is None and leftovers:
+                im, weight = leftovers.pop(0)
+                ordered_images[slot_idx] = im
+                ordered_weights[slot_idx] = weight
+        ordered_images = [im for im in ordered_images if im is not None]
+        ordered_weights = [float(w if w is not None else 1.0) for w in ordered_weights[:len(ordered_images)]]
+    boxes = get_set_dim_layout_boxes_weighted(ordered_images, ordered_weights)
+    canvas = Image.new("RGB", (3000, 1688), (255, 255, 255))
+
+    def paste_fit(im: Image.Image, box: tuple[int, int, int, int]) -> None:
+        bx0, by0, bx1, by1 = box
+        bw = bx1 - bx0
+        bh = by1 - by0
+        iw, ih = im.size
+        scale = min(bw / max(1, iw), bh / max(1, ih))
+        new_w = max(1, int(iw * scale))
+        new_h = max(1, int(ih * scale))
+        resized = im.resize((new_w, new_h), Image.LANCZOS)
+        x = bx0 + (bw - new_w) // 2
+        y = by0 + (bh - new_h) // 2
+        canvas.paste(resized, (x, y))
+
+    for idx, im in enumerate(ordered_images):
+        paste_fit(im, boxes[idx])
+    return canvas
+
+
 def reformat_silo_like_image(image: Image.Image, canvas_size: tuple[int, int] = (3000, 1688), margin: int = 10) -> Image.Image:
     """Apply the same core logic as reformat1688_silo.py to a PIL image."""
     im = image.convert("RGBA")
@@ -1093,11 +1450,13 @@ def upload_new_asset_group_upload(session: requests.Session, file_path: Path, as
     return new_media_id
 
 
-def build_metadata_copy_fields(session: requests.Session, source_media: Dict[str, Any], metaprops_by_dbname: Dict[str, Dict[str, Any]], target_sku: str, target_position: str, target_name: str, deliverable_override_label: str = "") -> List[Tuple[str, Any]]:
+def build_metadata_copy_fields(session: requests.Session, source_media: Dict[str, Any], metaprops_by_dbname: Dict[str, Dict[str, Any]], target_sku: str, target_position: str, target_name: str, deliverable_override_label: str = "", psa_image_type_override_label: str = "") -> List[Tuple[str, Any]]:
     fields: List[Tuple[str, Any]] = []
     skip_db_names = {"Product_SKU", "Product_SKU_Position"}
     if deliverable_override_label:
         skip_db_names.add("Deliverable")
+    if psa_image_type_override_label:
+        skip_db_names.add(PSA_IMAGE_TYPE_DBNAME)
     for key, value in source_media.items():
         if not key.startswith("property_"):
             continue
@@ -1137,6 +1496,8 @@ def build_metadata_copy_fields(session: requests.Session, source_media: Dict[str
             deliverable_mp_id = string_value(deliverable_mp.get("id"))
             option_value = get_metaproperty_option_value(session, deliverable_mp_id, deliverable_override_label) if deliverable_mp_id else ""
             fields.append((f"metaproperty.{deliverable_mp_id}", option_value or deliverable_override_label))
+    if psa_image_type_override_label:
+        append_psa_image_type_field(session, fields, metaprops_by_dbname, psa_image_type_override_label)
     fields.append(("name", target_name))
     fields.append(("tags", target_sku))
     return fields
@@ -1158,6 +1519,7 @@ def create_copied_asset_for_target(
     target_position: str,
     asset_name: str = "",
     deliverable_override_label: str = "",
+    psa_image_type_override_label: str = "",
 ) -> Dict[str, Any]:
     source_media = fetch_media_by_id(session, source_media_id)
     fallback_name = string_value(source_media.get("name")) or f"{source_media_id}.jpg"
@@ -1179,7 +1541,7 @@ def create_copied_asset_for_target(
         except Exception:
             pass
     metaprops_by_dbname = fetch_metaproperties_map(session)
-    fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, target_sku, target_position, target_name, deliverable_override_label)
+    fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, target_sku, target_position, target_name, deliverable_override_label, psa_image_type_override_label)
     post_media_fields(session, new_media_id, fields)
     return {"new_media_id": new_media_id, "new_filename": temp_path.name, "target_name": target_name}
 
@@ -1207,6 +1569,7 @@ def apply_prepared_file_to_slot(
     target_lane: str,
     target_slot: str,
     prepared_file_path: Path,
+    psa_image_type_override: str = "",
 ) -> Dict[str, Any]:
     row = get_row_by_id(board, row_id)
     if not row:
@@ -1245,7 +1608,11 @@ def apply_prepared_file_to_slot(
                 version_path = Path(td) / target_name
                 shutil.copyfile(temp_path, version_path)
             upload_new_version_to_media(session, target_media_id, version_path, target_name)
+            if string_value(psa_image_type_override):
+                set_media_psa_image_type(session, target_media_id, psa_image_type_override)
             mark_asset_uploaded_notice(target_asset, 'new_version', 'New version uploaded to this slot. Reload to view.')
+            if string_value(psa_image_type_override):
+                target_asset["property_" + PSA_IMAGE_TYPE_DBNAME] = psa_image_type_override
             return {"message": "Prepared image was updated. Reload to see it!", "kind": "updated"}
 
         profile = resolve_new_asset_profile(row, target_lane, target_slot, prepared_name)
@@ -1268,9 +1635,10 @@ def apply_prepared_file_to_slot(
             raise RuntimeError("Could not determine source media for metadata copy.")
         source_media = fetch_media_by_id(session, source_media_id)
         metaprops_by_dbname = fetch_metaproperties_map(session)
-        fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, sku, target_position, target_stem, profile.get("deliverable_override", ""))
+        effective_psa_image_type = string_value(psa_image_type_override or profile.get("psa_image_type_override") or "")
+        fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, sku, target_position, target_stem, profile.get("deliverable_override", ""), effective_psa_image_type)
         post_media_fields(session, new_media_id, fields)
-        placeholder = build_uploaded_new_asset_placeholder(exemplar, sku, target_position, target_name, target_lane, target_slot, new_media_id, profile.get("deliverable_override", ""))
+        placeholder = build_uploaded_new_asset_placeholder(exemplar, sku, target_position, target_name, target_lane, target_slot, new_media_id, profile.get("deliverable_override", ""), effective_psa_image_type)
         row.setdefault('assets', []).append(placeholder)
         return {"message": "Prepared image was added. Reload to see it!", "kind": "added"}
 
@@ -1286,6 +1654,7 @@ def apply_prepared_media_to_slot(
     flip: bool,
     offset_y: Any,
     offset_x: Any = None,
+    psa_image_type_override: str = "",
 ) -> Dict[str, Any]:
     img = open_image_from_media(session, media_id)
     result = prepare_photo_result(img, prep_mode, flip, offset_y, offset_x)
@@ -1294,7 +1663,7 @@ def apply_prepared_media_to_slot(
         temp_path = Path(td) / f"prepared_{out_w}x{out_h}{'_flip' if flip else ''}.jpg"
         result = result.convert("RGB")
         result.save(temp_path, format="JPEG", quality=92, optimize=True)
-        return apply_prepared_file_to_slot(session, board, row_id, target_lane, target_slot, temp_path)
+        return apply_prepared_file_to_slot(session, board, row_id, target_lane, target_slot, temp_path, psa_image_type_override)
 
 
 def upload_new_version_to_media(session: requests.Session, media_id: str, file_path: Path, file_name: str) -> Dict[str, Any]:
@@ -1542,7 +1911,7 @@ def cleanup_staged_file(path_text: str) -> None:
         pass
 
 
-def build_pending_new_asset(source_asset: Dict[str, Any], target_sku: str, target_position: str, staged_path: Path, target_name: str, deliverable_override: str = "") -> Dict[str, Any]:
+def build_pending_new_asset(source_asset: Dict[str, Any], target_sku: str, target_position: str, staged_path: Path, target_name: str, deliverable_override: str = "", psa_image_type_override: str = "") -> Dict[str, Any]:
     clone = deepcopy(source_asset)
     clone["id"] = f"pending-file::{uuid.uuid4()}"
     clone["sku"] = target_sku
@@ -1562,6 +1931,7 @@ def build_pending_new_asset(source_asset: Dict[str, Any], target_sku: str, targe
     clone["size_warning"] = ""
     clone["pending_file_local_name"] = Path(staged_path).name.split('__',1)[-1]
     clone["deliverable_override"] = string_value(deliverable_override)
+    clone["psa_image_type_override"] = string_value(psa_image_type_override)
     return clone
 
 
@@ -1579,7 +1949,7 @@ def mark_asset_uploaded_notice(asset: Dict[str, Any], kind: str, message: str) -
     asset["asset_mode_message"] = message
 
 
-def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sku: str, target_position: str, target_name: str, target_lane: str, target_slot: str, new_media_id: str = '', deliverable_override: str = '') -> Dict[str, Any]:
+def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sku: str, target_position: str, target_name: str, target_lane: str, target_slot: str, new_media_id: str = '', deliverable_override: str = '', psa_image_type_override: str = '') -> Dict[str, Any]:
     clone = deepcopy(source_asset)
     clone["id"] = new_media_id or f"uploaded-placeholder::{uuid.uuid4()}"
     clone["copy_source_media_id"] = new_media_id or source_asset.get("copy_source_media_id") or source_asset.get("id") or ''
@@ -1599,6 +1969,7 @@ def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sk
     clone["original"] = ""
     clone["size_warning"] = ""
     clone["deliverable_override"] = string_value(deliverable_override)
+    clone["psa_image_type_override"] = string_value(psa_image_type_override)
     clone.pop("pending_upload", None)
     clone.pop("pending_upload_kind", None)
     clone.pop("pending_message", None)
@@ -1606,7 +1977,7 @@ def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sk
     return clone
 
 
-def apply_uploaded_file_to_slot(session: requests.Session, board: Dict[str, Any], row_id: str, target_lane: str, target_slot: str, uploaded_file_storage) -> str:
+def apply_uploaded_file_to_slot(session: requests.Session, board: Dict[str, Any], row_id: str, target_lane: str, target_slot: str, uploaded_file_storage, psa_image_type_override: str = "") -> str:
     row = get_row_by_id(board, row_id)
     if not row:
         raise RuntimeError("Target row not found.")
@@ -1645,6 +2016,9 @@ def apply_uploaded_file_to_slot(session: requests.Session, board: Dict[str, Any]
                 version_path = Path(td) / target_name
                 shutil.copyfile(temp_path, version_path)
             upload_new_version_to_media(session, target_media_id, version_path, target_name)
+            if string_value(psa_image_type_override):
+                set_media_psa_image_type(session, target_media_id, psa_image_type_override)
+                target_asset["property_" + PSA_IMAGE_TYPE_DBNAME] = psa_image_type_override
             mark_asset_uploaded_notice(target_asset, 'new_version', 'New version uploaded to this slot. Reload to view.')
             return {"message": "Asset was updated. Reload to see it!", "kind": "updated"}
 
@@ -1668,9 +2042,10 @@ def apply_uploaded_file_to_slot(session: requests.Session, board: Dict[str, Any]
             raise RuntimeError("Could not determine source media for metadata copy.")
         source_media = fetch_media_by_id(session, source_media_id)
         metaprops_by_dbname = fetch_metaproperties_map(session)
-        fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, sku, target_position, target_stem, profile.get("deliverable_override", ""))
+        effective_psa_image_type = string_value(psa_image_type_override or profile.get("psa_image_type_override") or "")
+        fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, sku, target_position, target_stem, profile.get("deliverable_override", ""), effective_psa_image_type)
         post_media_fields(session, new_media_id, fields)
-        placeholder = build_uploaded_new_asset_placeholder(exemplar, sku, target_position, target_name, target_lane, target_slot, new_media_id, profile.get("deliverable_override", ""))
+        placeholder = build_uploaded_new_asset_placeholder(exemplar, sku, target_position, target_name, target_lane, target_slot, new_media_id, profile.get("deliverable_override", ""), effective_psa_image_type)
         row.setdefault('assets', []).append(placeholder)
         return {"message": "Asset was added. Reload to see it!", "kind": "added"}
 
@@ -1862,6 +2237,57 @@ def get_component_skus_for_grid_asset_cached(session: requests.Session, grid_ass
     component_skus = get_component_skus_for_grid_asset(session, grid_asset)
     cache[grid_media_id] = list(component_skus)
     return list(component_skus)
+
+def get_dimensions_asset_for_sku(session: requests.Session, sku: str) -> Optional[Dict[str, Any]]:
+    if not sku:
+        return None
+    items = fetch_assets_for_product_sku(session, "Product_SKU", sku)
+    candidates: List[Dict[str, Any]] = []
+    for item in items:
+        position = normalize_position_for_row(get_asset_position(item), sku)
+        if position == "SKU_dimension" and not is_marked_for_deletion(item):
+            candidates.append(item)
+    if not candidates:
+        return None
+    candidates = sort_assets_in_slot(candidates)
+    best = candidates[0]
+    return {
+        "sku": sku,
+        "dim_media_id": string_value(best.get("id")),
+        "component_subcat": prop(best, "Product_Sub-Category", "Product_Sub-Category"),
+        "name": string_value(best.get("name")),
+    }
+
+
+def get_dimensions_asset_for_sku_cached(session: requests.Session, sku: str) -> Optional[Dict[str, Any]]:
+    cache = STATE.setdefault("component_dim_cache", {})
+    key = string_value(sku)
+    if key in cache:
+        cached = cache.get(key)
+        return deepcopy(cached) if cached else None
+    found = get_dimensions_asset_for_sku(session, key)
+    cache[key] = deepcopy(found) if found else None
+    return deepcopy(found) if found else None
+
+
+def build_set_dim_compile_info_for_row(session: requests.Session, row: Dict[str, Any]) -> tuple[bool, List[Dict[str, Any]], str]:
+    component_skus = [string_value(x) for x in safe_list(row.get("component_skus")) if string_value(x)]
+    if not component_skus:
+        return False, [], "No linked component SKUs were found."
+    if len(component_skus) > SET_DIM_MAX_COMPONENTS:
+        return False, [], f"Set dim compile currently supports up to {SET_DIM_MAX_COMPONENTS} components."
+    components: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for sku in component_skus:
+        found = get_dimensions_asset_for_sku_cached(session, sku)
+        if found and found.get("dim_media_id"):
+            components.append(found)
+        else:
+            missing.append(sku)
+    if missing:
+        return False, components, f"Missing dimensions for: {', '.join(missing)}"
+    return True, components, ""
+
 def get_status_from_grid_asset(grid_asset: Dict[str, Any]) -> str:
     dropped = prop(grid_asset, "Dropped", "Dropped")
     visible = prop(grid_asset, "Visible_on_Website", "Visible_on_Website")
@@ -1996,6 +2422,7 @@ def invalidate_collection_caches(option_id: str = "") -> None:
             cache.clear()
     if not target:
         STATE.setdefault("component_sku_cache", {}).clear()
+        STATE.setdefault("component_dim_cache", {}).clear()
 
 
 def replace_row_in_board(board: Dict[str, Any], row_id: str, new_row: Dict[str, Any]) -> bool:
@@ -2082,6 +2509,8 @@ def photo_asset_to_client_model(asset: Dict[str, Any], matching_skus: List[str])
         "width": int(asset.get("width") or 0),
         "height": int(asset.get("height") or 0),
         "source": prop(asset, "Source", "Source"),
+        "season": prop(asset, "Season", "Season"),
+        "image_type": prop(asset, "ImageType", "ImageType"),
         "asset_status": get_photography_asset_status(asset),
         "is_final": photography_asset_is_final(asset),
         "reviewed_for_site": photo_asset_is_reviewed_for_site(asset),
@@ -2238,6 +2667,7 @@ def build_board_row_from_prefetched_assets(
         "mattress_size": prop(anchor, "Mattress_Size", "Mattress_Size"),
         "component_skus": component_skus,
         "product_collection": prop(anchor, "Product_Collection", "Product_Collection") or collection_label,
+        "product_subcategory": prop(anchor, "Product_Sub-Category", "Product_Sub-Category"),
         "dropped": prop(anchor, "Dropped", "Dropped"),
         "visible_on_website": prop(anchor, "Visible_on_Website", "Visible_on_Website"),
         "date_oldest": oldest_dt.isoformat() if oldest_dt else "",
@@ -2248,6 +2678,10 @@ def build_board_row_from_prefetched_assets(
         "commit_failures": [],
         "is_non_collection": bool(is_non_collection),
     }
+    set_dim_ready, set_dim_components, set_dim_reason = build_set_dim_compile_info_for_row(session, row)
+    row["set_dim_compile_ready"] = bool(set_dim_ready)
+    row["set_dim_compile_reason"] = set_dim_reason
+    row["set_dim_components"] = set_dim_components
     refresh_row_asset_flags(row)
     return row
 
@@ -2503,6 +2937,7 @@ def make_pending_copy_asset(source_asset: Dict[str, Any], target_sku: str, profi
     clone["copy_source_media_id"] = source_asset.get("copy_source_media_id") or source_asset.get("id")
     clone["copy_source_sku"] = source_asset.get("copy_source_sku") or source_asset.get("sku") or source_asset.get("source_sku") or ""
     clone["deliverable_override"] = string_value(profile.get("deliverable_override") or "")
+    clone["psa_image_type_override"] = string_value(profile.get("psa_image_type_override") or get_existing_psa_image_type_label(source_asset) or "")
     target_name = string_value(profile.get("target_name") or source_asset.get("file_name") or source_asset.get("name") or "")
     if target_name:
         clone["file_name"] = target_name
@@ -2855,6 +3290,7 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                                 "source_media_id": asset.get("copy_source_media_id") or asset.get("id"),
                                 "source_sku": asset.get("copy_source_sku") or asset.get("source_sku") or "",
                                 "deliverable_override": asset.get("deliverable_override") or "",
+                                "psa_image_type_override": asset.get("psa_image_type_override") or get_existing_psa_image_type_label(asset) or "",
                             }
                         )
                     else:
@@ -2936,7 +3372,7 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                 target_name = os.path.splitext(job["asset_name"])[0]
                 new_media_id = upload_new_asset_group_upload(session, staged_path, target_name)
                 metaprops_by_dbname = fetch_metaproperties_map(session)
-                fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, job["sku"], job["target_position"], target_name, job.get("deliverable_override") or "")
+                fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, job["sku"], job["target_position"], target_name, job.get("deliverable_override") or "", job.get("psa_image_type_override") or "")
                 post_media_fields(session, new_media_id, fields)
                 cleanup_staged_file(str(staged_path))
                 response = {"new_media_id": new_media_id}
@@ -3277,6 +3713,96 @@ def api_photo_prep_download() -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+
+def build_set_dim_canvas_for_row(session: requests.Session, row: Dict[str, Any], slot_assignments: Optional[List[int]] = None, scale_percents: Optional[List[int]] = None) -> Image.Image:
+    components = [c for c in safe_list(row.get("set_dim_components")) if isinstance(c, dict) and string_value(c.get("dim_media_id"))]
+    if not components:
+        raise RuntimeError("No compiled set-dim components are available for this SKU.")
+    images: List[Image.Image] = []
+    subcats: List[str] = []
+    for comp in components[:SET_DIM_MAX_COMPONENTS]:
+        img = open_image_from_media(session, string_value(comp.get("dim_media_id")))
+        images.append(trim_whitespace(img, 10).convert("RGB"))
+        subcats.append(string_value(comp.get("component_subcat")))
+    manual_slots = None
+    if slot_assignments:
+        manual_slots = [max(0, min(len(images) - 1, int(x))) for x in slot_assignments[:len(images)]]
+    return compose_set_dim_canvas(images, subcats, string_value(row.get("product_subcategory")), manual_slots, scale_percents)
+
+
+@app.route("/api/set_dim_compile_preview", methods=["POST"])
+def api_set_dim_compile_preview() -> Response:
+    try:
+        board = STATE.get("board")
+        if board is None:
+            return jsonify({"error": "No collection is currently loaded."}), 400
+        payload = request.get_json(force=True)
+        row_id = string_value(payload.get("row_id"))
+        row = get_row_by_id(board, row_id)
+        if not row:
+            return jsonify({"error": "Row not found."}), 404
+        slot_assignments = payload.get("slot_assignments") or []
+        scale_percents = payload.get("scale_percents") or []
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        result = build_set_dim_canvas_for_row(session, row, slot_assignments, scale_percents)
+        return send_file(BytesIO(image_to_png_bytes(result)), mimetype="image/png")
+    except Exception as exc:
+        log_message(f"Set dim compile preview failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/set_dim_compile_apply", methods=["POST"])
+def api_set_dim_compile_apply() -> Response:
+    try:
+        board = STATE.get("board")
+        if board is None:
+            return jsonify({"error": "No collection is currently loaded."}), 400
+        payload = request.get_json(force=True)
+        mode = string_value(payload.get("mode")) or "positions"
+        if mode != "assets":
+            return jsonify({"error": "Compiled set dims are only available in Update assets mode."}), 400
+        row_id = string_value(payload.get("row_id"))
+        row = get_row_by_id(board, row_id)
+        if not row:
+            return jsonify({"error": "Row not found."}), 404
+        buckets = bucket_assets(row)
+        if buckets.get("special", {}).get("SKU_dimension"):
+            return jsonify({"error": "This SKU already has a dimensions asset."}), 400
+        if not bool(row.get("set_dim_compile_ready")):
+            return jsonify({"error": string_value(row.get("set_dim_compile_reason")) or "This SKU is not eligible for compiled set dims."}), 400
+        slot_assignments = payload.get("slot_assignments") or []
+        scale_percents = payload.get("scale_percents") or []
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        result_image = build_set_dim_canvas_for_row(session, row, slot_assignments, scale_percents)
+        with tempfile.TemporaryDirectory(prefix="content_refresher_set_dim_") as td:
+            target_name = force_jpg_filename(f"{string_value(row.get('sku'))}_compiled_set_dim.jpg", "compiled_set_dim")
+            temp_path = Path(td) / target_name
+            result_image.save(temp_path, format="JPEG", quality=92, optimize=True)
+            result = apply_prepared_file_to_slot(
+                session,
+                board,
+                row_id,
+                "special",
+                "SKU_dimension",
+                temp_path,
+                psa_image_type_override="Dimensions_diagram_image",
+            )
+        message = result.get("message") if isinstance(result, dict) else string_value(result)
+        notice_html = 'Compiled set dim was added. <button type="button" class="inline-link" data-reload-board>Reload</button> to see it!'
+        return jsonify({
+            "board": board,
+            "summary": compute_change_summary(board),
+            "notice": {"kind": "success", "text": message, "html": notice_html},
+            "asset_mode_refresh_pending": True,
+            "dirty_row_ids": [row_id] if row_id else [],
+        })
+    except Exception as exc:
+        log_message(f"Set dim compile apply failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/move", methods=["POST"])
 def api_move() -> Response:
     try:
@@ -3495,7 +4021,8 @@ def api_prepared_drop_upload() -> Response:
             return jsonify({"error": "media_id is required"}), 400
         token = load_bynder_token(BYNDER_TOKEN_PATH)
         session = make_session(token)
-        result = apply_prepared_media_to_slot(session, board, row_id, target_lane, target_slot, media_id, prep_mode, flip, offset_y, offset_x)
+        psa_image_type_override = string_value(payload.get("psa_image_type_override"))
+        result = apply_prepared_media_to_slot(session, board, row_id, target_lane, target_slot, media_id, prep_mode, flip, offset_y, offset_x, psa_image_type_override)
         message = result.get("message") if isinstance(result, dict) else string_value(result)
         kind_word = result.get("kind") if isinstance(result, dict) else "updated"
         notice_html = f'Prepared image was {kind_word}. <button type="button" class="inline-link" data-reload-board>Reload</button> to see it!'
@@ -3528,7 +4055,8 @@ def api_file_drop_upload() -> Response:
             return jsonify({"error": "No file was provided."}), 400
         token = load_bynder_token(BYNDER_TOKEN_PATH)
         session = make_session(token)
-        result = apply_uploaded_file_to_slot(session, board, row_id, target_lane, target_slot, upload)
+        psa_image_type_override = string_value(request.form.get("psa_image_type_override"))
+        result = apply_uploaded_file_to_slot(session, board, row_id, target_lane, target_slot, upload, psa_image_type_override)
         message = result.get("message") if isinstance(result, dict) else string_value(result)
         kind_word = result.get("kind") if isinstance(result, dict) else "updated"
         notice_html = f'Assets were {kind_word}. <button type="button" class="inline-link" data-reload-board>Reload</button> to see them!'
@@ -3719,7 +4247,8 @@ INDEX_HTML = r'''
   .missing-notice { padding: 10px 12px; border-radius: 12px; background: #fff6db; border: 1px solid #ead48b; color: #6d5500; font-size: 13px; cursor: pointer; text-align: left; width: 100%; }
   .missing-notice strong { color: #523d00; }
 
-  .mode-panel { padding: 8px 10px; }
+  .mode-panel { padding: 8px 10px; transition: background .18s ease, border-color .18s ease, box-shadow .18s ease; }
+  .mode-panel.assets-mode { background: linear-gradient(180deg, #eef5ff, #e3efff); border-color:#b8cff7; box-shadow: 0 8px 20px rgba(34, 99, 214, .10); }
   .mode-panel .panel-title { font-size: 12px; font-weight: 800; letter-spacing: .04em; color: var(--rf-navy); text-transform: uppercase; margin: 0 0 6px 0; }
   .mode-help { font-size: 12px; color: #6d5a77; line-height: 1.18; margin-bottom: 6px; }
   .mode-options { display: grid; gap: 6px; }
@@ -3960,8 +4489,33 @@ INDEX_HTML = r'''
   .photo-pull-btn-checking { animation: photoPullCheckingPulse 1.2s ease-in-out infinite; }
   .photo-toolbar { padding: 10px 14px; border-bottom:1px solid #d8e7da; background:#f7fbf7; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
   .photo-body { flex:1; overflow:auto; padding: 12px; }
-  .photo-prep-drawer { position: sticky; top: 0; z-index: 5; border:1px solid #cddfd0; background: linear-gradient(180deg,#f8fcf8,#eef7ef); border-radius:16px; padding:10px; margin-bottom:12px; box-shadow:0 8px 18px rgba(65,98,71,.08); }
+  .photo-prep-drawer { position: sticky; top: 0; z-index: 30; isolation:isolate; border:1px solid #cddfd0; background: linear-gradient(180deg,#f8fcf8,#eef7ef); border-radius:16px; padding:10px; margin-bottom:12px; box-shadow:0 8px 18px rgba(65,98,71,.08); }
   .photo-prep-drawer h4 { margin:0 0 4px; font-size:14px; color:#2f5134; }
+
+  .set-dim-drawer {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    isolation:isolate;
+    border:1px solid #cfd8ea;
+    background: linear-gradient(180deg,#f8fbff,#edf4ff);
+    border-radius:16px;
+    padding:10px;
+    margin-bottom:12px;
+    box-shadow:0 8px 18px rgba(72,97,156,.10);
+  }
+  .set-dim-drawer h4 { margin:0 0 4px; font-size:14px; color:#27498f; }
+  .set-dim-drawer .set-dim-preview-wrap { margin-top:10px; border-radius:14px; padding:10px; background:#fff; border:1px solid #d7e3fb; }
+  .set-dim-drawer img { width:100%; height:auto; display:block; border-radius:10px; }
+  .set-dim-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px; margin-top:10px; }
+  .set-dim-item { background:#fff; border:1px solid #d7e3fb; border-radius:12px; padding:8px; font-size:12px; }
+  .set-dim-item label { display:block; font-weight:700; color:#3559a8; margin-bottom:4px; }
+  .set-dim-item select { width:100%; border:1px solid #c9d7f3; border-radius:8px; padding:6px 8px; font:inherit; background:#fff; }
+  .set-dim-control-label { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; color:#5f76aa; margin-bottom:4px; }
+  .set-dim-scale-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto; gap:6px; align-items:center; }
+  .set-dim-scale-row input[type=range] { width:100%; }
+  .set-dim-scale-value { min-width:44px; text-align:right; font-weight:700; color:#3559a8; }
+  .empty-slot-actions { margin-top:6px; display:flex; justify-content:flex-start; }
   .photo-prep-top { display:flex; justify-content:space-between; align-items:center; gap:12px; }
   .photo-prep-sub { font-size:12px; color:#55705a; line-height:1.35; }
   .photo-prep-controls { display:grid; gap:10px; margin-top:8px; }
@@ -4014,7 +4568,7 @@ INDEX_HTML = r'''
   .photo-tile.selected .photo-select-badge { background:#5ea870; border-color:#5ea870; }
   .photo-image-wrap { position:relative; }
   .photo-empty { border:1px dashed #b8cfbc; background:#fbfefb; border-radius:16px; padding:18px; color:#55705a; font-size:13px; }
-  .photo-grid { display:grid; gap:12px; grid-template-columns: repeat(auto-fill, minmax(var(--photo-tile-min, 220px), 1fr)); }
+  .photo-grid { display:grid; gap:12px; grid-template-columns: repeat(auto-fill, minmax(var(--photo-tile-min, 220px), 1fr)); position:relative; z-index:1; }
   .photo-tile { background:white; border:1px solid #d6e5d9; border-radius:14px; box-shadow: 0 6px 16px rgba(56,90,61,.08); overflow:hidden; display:flex; flex-direction:column; }
   .photo-tile.dragover { border-color: #56a06a; box-shadow: 0 0 0 2px rgba(86,160,106,.18); }
   .photo-tile img { width:100%; height: var(--photo-thumb-height, 170px); object-fit: contain; display:block; background:#f4f7f4; padding: 4px; }
@@ -4023,6 +4577,7 @@ INDEX_HTML = r'''
   .photo-name a { color: inherit; text-decoration: underline; text-decoration-color: rgba(30, 64, 175, 0.28); }
   .photo-name a:hover { text-decoration-color: rgba(30, 64, 175, 0.62); }
   .photo-line { font-size:11px; color:#5b6a5e; }
+  .photo-line.photo-season { font-weight:700; color:#314f76; }
   .photo-actions { display:flex; gap:8px; flex-wrap:wrap; }
   .photo-actions a { font-size:11px; color: var(--rf-blue); text-decoration:none; }
   .photo-review-row { display:flex; justify-content:flex-start; margin-top:6px; }
@@ -4578,7 +5133,7 @@ INDEX_HTML = r'''
       </div>
     </div>
 
-    <div class="panel mode-panel">
+    <div class="panel mode-panel" id="modePanel">
       <div class="panel-title">Mode</div>
       <div class="mode-help" id="modeHelp">Update positions stages reorder, trash, restore, and cross-SKU copy changes. File uploads are disabled in this mode.</div>
       <div class="mode-options">
@@ -4691,6 +5246,8 @@ INDEX_HTML = r'''
   </div>
 
 <script>
+window.PHOTO_TO_PSA_IMAGE_TYPE_MAP = {"Detail":"Detail","Lifestyle":"Room_shot","Silo":"Silo","Styled_Silo":"Silo","Swatch":"Swatch_detail","Video_Shoot_Still":"Room_shot"};
+
 const state = {
   collections: [],
   filteredCollections: [],
@@ -4724,6 +5281,14 @@ const state = {
   photoSkuOpen: {},
   photoDragId: null,
   preparedPreviewDrag: null,
+  setDim: {
+    activeRowId: '',
+    slotAssignments: [],
+    scalePercents: [],
+    previewUrl: '',
+    loading: false,
+    applying: false,
+  },
   additionalPhotoAvailabilityBySku: {},
   additionalPhotoCheckInFlight: {},
   nonCollectionSkuLoading: {},
@@ -4972,11 +5537,13 @@ async function delay(ms) {
 
 function renderModeUI() {
   const help = document.getElementById('modeHelp');
+  const modePanel = document.getElementById('modePanel');
   document.querySelectorAll('input[name="appMode"]').forEach(el => {
     el.checked = el.value === state.mode;
   });
   const hideInactiveToggle = document.getElementById('hideInactiveToggle');
   if (hideInactiveToggle) hideInactiveToggle.checked = !!state.hideInactive;
+  if (modePanel) modePanel.classList.toggle('assets-mode', state.mode === 'assets');
   if (state.mode === 'assets') {
     help.innerHTML = 'Update assets disables reordering and lets you drop files onto slots to create new assets or upload new versions. Asset uploads happen <strong>immediately</strong> in this mode.';
   } else {
@@ -5047,19 +5614,22 @@ async function switchMode(newMode) {
   }
   state.mode = 'positions';
   renderModeUI();
+  let didFullReload = false;
   if (state.assetModeDirty && state.loadedCollectionOptionId) {
     try {
       const refreshed = await refreshDirtyAssetRows();
       if (!refreshed) {
         await launchCollection(state.loadedCollectionOptionId, {forceRefresh:true, scrollTopAfter:true});
+        didFullReload = true;
       }
     } catch (err) {
       console.warn(err);
       await launchCollection(state.loadedCollectionOptionId, {forceRefresh:true, scrollTopAfter:true});
+      didFullReload = true;
     }
   }
   renderBoard();
-  scrollBoardToFirstColorTop('auto');
+  if (didFullReload) scrollBoardToFirstColorTop('auto');
 }
 
 function getLaneMax(laneType) {
@@ -5260,10 +5830,177 @@ function slotNeedsCriticalHighlight(row, slotName, items) {
   return slotName === 'SKU_grid' || slotName === 'SKU_100';
 }
 
+
+function currentSetDimRow() {
+  return state.setDim && state.setDim.activeRowId ? getRowById(state.setDim.activeRowId) : null;
+}
+
+function clearSetDimSelection() {
+  if (state.setDim.previewUrl && String(state.setDim.previewUrl).startsWith('blob:')) URL.revokeObjectURL(state.setDim.previewUrl);
+  state.setDim = {activeRowId:'', slotAssignments:[], scalePercents:[], previewUrl:'', loading:false, applying:false};
+  renderPhotographyPanel();
+}
+
+async function openCompileSetDim(rowId) {
+  const row = getRowById(rowId);
+  if (!row) return;
+  state.photography.expanded = true;
+  state.setDim.activeRowId = String(rowId || '');
+  state.setDim.slotAssignments = (row.set_dim_components || []).map((_, idx) => idx);
+  state.setDim.scalePercents = (row.set_dim_components || []).map(() => 100);
+  state.setDim.loading = true;
+  renderPhotographyPanel();
+  await refreshSetDimPreview();
+}
+
+async function refreshSetDimPreview() {
+  const row = currentSetDimRow();
+  if (!row) return;
+  state.setDim.loading = true;
+  renderPhotographyPanel();
+  try {
+    const resp = await fetch('/api/set_dim_compile_preview', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({row_id: row.row_id, slot_assignments: state.setDim.slotAssignments || [], scale_percents: state.setDim.scalePercents || []})
+    });
+    const blob = await resp.blob();
+    if (!resp.ok) {
+      let msg = 'Could not preview compiled set dim.';
+      try {
+        const parsed = JSON.parse(await blob.text());
+        msg = parsed.error || msg;
+      } catch (e) {}
+      throw new Error(msg);
+    }
+    if (state.setDim.previewUrl && String(state.setDim.previewUrl).startsWith('blob:')) URL.revokeObjectURL(state.setDim.previewUrl);
+    state.setDim.previewUrl = URL.createObjectURL(blob);
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    state.setDim.loading = false;
+    renderPhotographyPanel();
+  }
+}
+
+function setDimSlotLabel(index, total) {
+  const labels = ['Top left', 'Top middle', 'Top right', 'Bottom left', 'Bottom middle', 'Bottom right'];
+  if (total === 1) return 'Full canvas';
+  if (total === 2) return index === 0 ? 'First slot' : 'Second slot';
+  if (total === 3) return ['Top left', 'Top right', 'Bottom'][index] || `Slot ${index + 1}`;
+  if (total === 4) return ['Top left', 'Top right', 'Bottom left', 'Bottom right'][index] || `Slot ${index + 1}`;
+  if (total === 5) return ['Top left', 'Top middle', 'Top right', 'Bottom left', 'Bottom right'][index] || `Slot ${index + 1}`;
+  return labels[index] || `Slot ${index + 1}`;
+}
+
+function renderSetDimDrawer() {
+  const row = currentSetDimRow();
+  if (!row) return '';
+  const components = row.set_dim_components || [];
+  const total = components.length;
+  const preview = state.setDim.loading
+    ? `<div class="photo-empty">Building compiled set dim preview...</div>`
+    : (state.setDim.previewUrl ? `<img src="${escapeHtml(state.setDim.previewUrl)}" alt="Compiled set dim preview" />` : `<div class="photo-empty">Preview loading...</div>`);
+  return `
+    <div class="set-dim-drawer">
+      <div class="photo-prep-top">
+        <h4>Compile set dim</h4>
+        <div class="photo-prep-actions">
+          <button type="button" class="btn btn-secondary photo-mini-btn" onclick="clearSetDimSelection()">Clear selection</button>
+          <button type="button" class="btn btn-primary photo-mini-btn ${state.setDim.applying ? 'btn-reload-flashing' : ''}" ${state.setDim.applying ? 'disabled' : ''} onclick="applyCompiledSetDim()">${state.setDim.applying ? 'Applying...' : 'Apply as dimensions asset'}</button>
+        </div>
+      </div>
+      <div class="photo-prep-note">We built a 3000x1688 set-dim canvas from the component dimensions. You can move a component to a different slot and nudge its visual scale so the overall composition feels more true to size before applying it.</div>
+      <div class="set-dim-grid">
+        ${components.map((comp, idx) => `
+          <div class="set-dim-item">
+            <label>${escapeHtml(comp.sku || `Component ${idx + 1}`)}</label>
+            <div style="margin-bottom:6px;color:#4d628a;">${escapeHtml(comp.component_subcat || '')}</div>
+            <div class="set-dim-control-label">Canvas slot</div>
+            <select onchange="changeSetDimSlot(${idx}, this.value)">
+              ${Array.from({length: total}).map((_, slotIdx) => `<option value="${slotIdx}" ${(Number((state.setDim.slotAssignments || [])[idx]) === slotIdx) ? 'selected' : ''}>${escapeHtml(setDimSlotLabel(slotIdx, total))}</option>`).join('')}
+            </select>
+            <div class="set-dim-control-label" style="margin-top:8px;">Visual scale</div>
+            <div class="set-dim-scale-row">
+              <button type="button" class="btn btn-secondary photo-mini-btn" onclick="nudgeSetDimScale(${idx}, -10)">-</button>
+              <input type="range" min="60" max="160" step="5" value="${Number((state.setDim.scalePercents || [])[idx] || 100)}" onchange="changeSetDimScale(${idx}, this.value)" />
+              <button type="button" class="btn btn-secondary photo-mini-btn" onclick="nudgeSetDimScale(${idx}, 10)">+</button>
+              <div class="set-dim-scale-value">${Number((state.setDim.scalePercents || [])[idx] || 100)}%</div>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+      <div class="set-dim-preview-wrap">${preview}</div>
+    </div>
+  `;
+}
+
+async function changeSetDimSlot(componentIdx, slotValue) {
+  const next = [...(state.setDim.slotAssignments || [])];
+  const desired = Number(slotValue);
+  const currentIdx = next.findIndex((val, idx) => idx !== componentIdx && Number(val) === desired);
+  const oldValue = Number(next[componentIdx]);
+  next[componentIdx] = desired;
+  if (currentIdx >= 0) next[currentIdx] = oldValue;
+  state.setDim.slotAssignments = next;
+  await refreshSetDimPreview();
+}
+
+async function changeSetDimScale(componentIdx, nextValue) {
+  const pct = Math.max(60, Math.min(160, Number(nextValue) || 100));
+  const next = [...(state.setDim.scalePercents || [])];
+  next[componentIdx] = pct;
+  state.setDim.scalePercents = next;
+  renderPhotographyPanel();
+  await refreshSetDimPreview();
+}
+
+function nudgeSetDimScale(componentIdx, delta) {
+  const current = Number((state.setDim.scalePercents || [])[componentIdx] || 100);
+  return changeSetDimScale(componentIdx, current + delta);
+}
+
+async function applyCompiledSetDim() {
+  const row = currentSetDimRow();
+  if (!row) return;
+  state.setDim.applying = true;
+  renderPhotographyPanel();
+  try {
+    const resp = await fetch('/api/set_dim_compile_apply', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mode: state.mode, row_id: row.row_id, slot_assignments: state.setDim.slotAssignments || [], scale_percents: state.setDim.scalePercents || []})
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not apply compiled set dim.');
+    state.board = data.board || state.board;
+    state.summary = data.summary || state.summary;
+    if (data.notice) addAppNotice(data.notice.text || 'Compiled set dim applied.', data.notice.kind || 'success', data.notice.html || '');
+    if (data.asset_mode_refresh_pending) state.assetModeDirty = true;
+    markAssetModeDirtyRows(data.dirty_row_ids || [row.row_id || row.id]);
+    clearSetDimSelection();
+    renderBoard();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    state.setDim.applying = false;
+    renderPhotographyPanel();
+  }
+}
+
+function renderEmptySlotActions(row, lane, slotName, items) {
+  if (!row || items.length) return '';
+  if (state.mode === 'assets' && lane === 'special' && slotName === 'SKU_dimension' && row.set_dim_compile_ready) {
+    return `<div class="empty-slot-actions"><a href="#" class="asset-fix-action" onclick="openCompileSetDim('${escapeHtml(row.row_id || '')}'); return false;">Compile set dim</a></div>`;
+  }
+  return '';
+}
+
 function renderSlot(rowId, lane, slotName, items, label, changedSet, extraClass='') {
   const row = getRowById(rowId);
   const isCriticalMissing = slotNeedsCriticalHighlight(row, slotName, items);
-  const cards = items.length ? items.map(a => renderAssetCard(a, changedSet.has(a.id))).join('') : `<div class="empty">${isCriticalMissing ? 'Missing required image' : 'Drop here'}</div>`;
+  const emptyActions = renderEmptySlotActions(row, lane, slotName, items);
+  const cards = items.length ? items.map(a => renderAssetCard(a, changedSet.has(a.id))).join('') : `<div class="empty">${isCriticalMissing ? 'Missing required image' : 'Drop here'}</div>${emptyActions}`;
   return `
     <div class="slot ${extraClass} ${isCriticalMissing ? 'slot-missing-critical' : ''}" data-row-id="${escapeHtml(rowId)}" data-lane="${escapeHtml(lane)}" data-slot="${escapeHtml(slotName)}">
       <div class="slot-label">${escapeHtml(label)}</div>
@@ -5375,6 +6112,7 @@ function renderPhotoTile(asset) {
         <div class="photo-name"><a href="https://www.bynder.raymourflanigan.com/media/?mediaId=${encodeURIComponent(asset.id || '')}" target="_blank" rel="noopener">${escapeHtml(asset.name)}</a></div>
         <div class="photo-line">${escapeHtml(shortDate(asset.dateCreated || ''))}</div>
         <div class="photo-line">Source: ${escapeHtml(asset.source || '')}</div>
+        ${asset.season ? `<div class="photo-line photo-season">Season: ${escapeHtml(asset.season)}</div>` : ''}
         <div class="photo-line">${escapeHtml((asset.width || 0) + 'x' + (asset.height || 0))}</div>
         <div class="photo-actions">
           <a href="${escapeHtml(asset.original || asset.transformBaseUrl || '#')}" target="_blank" rel="noopener">Open</a>
@@ -5412,6 +6150,7 @@ function refreshActivePhotoSelectionAfterFilter() {
     state.photography.selectedIds = [];
     if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl);
     state.photography.previewUrl = '';
+    clearSetDimSelection();
   }
 }
 
@@ -5622,6 +6361,33 @@ function modifyBoardAsset(event, assetId) {
   state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
   renderPhotographyPanel();
   refreshPhotoPreview();
+}
+
+function normalizePsaImageTypeChoice(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const lower = raw.toLowerCase();
+  const match = ['Detail', 'Room_shot', 'Silo', 'Swatch_detail'].find(x => x.toLowerCase() === lower);
+  return match || '';
+}
+
+function resolvePreparedPhotoPsaImageType(active) {
+  if (!active || active.from_board) return '';
+  const mapped = normalizePsaImageTypeChoice((window.PHOTO_TO_PSA_IMAGE_TYPE_MAP || {})[String(active.image_type || '')] || '');
+  if (mapped) return mapped;
+  const message = [
+    'This photography asset does not have a clean Image Type to PSA Image Type match yet.',
+    'Please choose the PSA Image Type for the asset you are about to upload or update.',
+    '',
+    'Choices: Detail, Room_shot, Silo, Swatch_detail'
+  ].join('\n');
+  const picked = window.prompt(message, 'Room_shot');
+  const normalized = normalizePsaImageTypeChoice(picked);
+  if (!normalized) {
+    alert('Please enter one of these PSA Image Type values exactly: Detail, Room_shot, Silo, or Swatch_detail.');
+    return null;
+  }
+  return normalized;
 }
 
 async function addPreparedAsNewVersion() {
@@ -5845,6 +6611,8 @@ function currentPreparedPreviewPayload() {
     flip: !!state.photography.prep.flip,
     offset_y: activePhotoOffsetY(active.id),
     offset_x: activePhotoOffsetX(active.id),
+    source_is_board_asset: !!active.from_board,
+    source_photo_image_type: String(active.image_type || ''),
   };
 }
 
@@ -5922,14 +6690,16 @@ function renderPhotographyPanel() {
 
   if (!photo.items.length) {
     sub.textContent = 'Reference panel for available product photography in the selected collection/color.';
-    body.innerHTML = `<div class="photo-empty">Pull available product photography from a color header to load this panel.</div>`;
+    const standaloneDrawer = renderSetDimDrawer();
+    body.innerHTML = `${standaloneDrawer || ''}${standaloneDrawer ? '' : `<div class="photo-empty">Pull available product photography from a color header to load this panel.</div>`}`;
     return;
   }
 
   const visibleItems = getVisiblePhotographyItems();
   if (!visibleItems.length) {
     sub.textContent = `${photo.items.length} photography asset(s) for ${photo.color}.`;
-    body.innerHTML = `<div class="photo-empty">All loaded photography is currently hidden by the active Photography filters.</div>`;
+    const standaloneDrawer = renderSetDimDrawer();
+    body.innerHTML = `${standaloneDrawer || ''}<div class="photo-empty">All loaded photography is currently hidden by the active Photography filters.</div>`;
     return;
   }
 
@@ -5938,7 +6708,7 @@ function renderPhotographyPanel() {
   if (photo.hideFpo) activeFilters.push('Hide FPO');
   if (photo.hideReviewed) activeFilters.push('Hide reviewed');
   sub.textContent = hiddenCount ? `${visibleItems.length} photography asset(s) shown for ${photo.color}. ${hiddenCount} hidden by ${activeFilters.join(' and ')}.` : `${visibleItems.length} photography asset(s) for ${photo.color}.`;
-  const prepDrawer = renderPhotoPrepDrawer();
+  const prepDrawer = renderSetDimDrawer() || renderPhotoPrepDrawer();
   body.innerHTML = `${prepDrawer || ''}<div class="photo-grid">${visibleItems.map(renderPhotoTile).join('')}</div>`;
   bindPhotographyDnD();
 }
@@ -6000,6 +6770,7 @@ function clearPhotographyPanel() {
   state.photography.activeId='';
   if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl);
   state.photography.previewUrl='';
+  clearSetDimSelection();
   state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
   state.photography.hideFpo = false;
   state.photography.hideReviewed = false;
@@ -6103,6 +6874,7 @@ function computeMissingNotices() {
   let firstMissing100 = null;
   let firstMissingSwatch = null;
   let firstMissingDimension = null;
+  let firstCompilableSetDim = null;
   let firstOffPattern = null;
   let firstDuplicateSlot = null;
 
@@ -6131,6 +6903,7 @@ function computeMissingNotices() {
       if (!has100 && !firstMissing100) firstMissing100 = {rowId: row.row_id, color: section.color, slot: 'SKU_100'};
       if (!hasSwatch && !firstMissingSwatch) firstMissingSwatch = {rowId: row.row_id, color: section.color, slot: 'SKU_swatch'};
       if (!hasDimension && !firstMissingDimension) firstMissingDimension = {rowId: row.row_id, color: section.color, slot: 'SKU_dimension'};
+      if (!hasDimension && row.set_dim_compile_ready && !firstCompilableSetDim) firstCompilableSetDim = {rowId: row.row_id, color: section.color, slot: 'SKU_dimension'};
       if (offPatternAssets.length && !firstOffPattern) {
         firstOffPattern = {
           rowId: row.row_id,
@@ -6149,6 +6922,7 @@ function computeMissingNotices() {
   if (firstMissing100) notices.push({id:'missing-100', kind:'error', text:'Missing SKU_100: Jump to the first active SKU missing its SKU_100 image.', rowId:firstMissing100.rowId, color:firstMissing100.color, slot:firstMissing100.slot});
   if (firstMissingSwatch) notices.push({id:'missing-swatch', kind:'notice', text:'Missing swatch: Jump to the first active SKU missing a swatch asset.', rowId:firstMissingSwatch.rowId, color:firstMissingSwatch.color, slot:firstMissingSwatch.slot});
   if (firstMissingDimension) notices.push({id:'missing-dimension', kind:'notice', text:'Missing dimensions: Jump to the first active SKU missing a dimensions asset.', rowId:firstMissingDimension.rowId, color:firstMissingDimension.color, slot:firstMissingDimension.slot});
+  if (firstCompilableSetDim) notices.push({id:'missing-set-dim', kind:'notice', text:'Missing set dim: Jump to the first active SKU where a set dim could be compiled.', rowId:firstCompilableSetDim.rowId, color:firstCompilableSetDim.color, slot:firstCompilableSetDim.slot});
   if (firstOffPattern) notices.push({id:'off-pattern', kind:'notice', text:'Off-pattern assets found: Jump to the first active SKU with off-pattern assets.', rowId:firstOffPattern.rowId, color:firstOffPattern.color, slot:firstOffPattern.slot});
   if (firstDuplicateSlot) notices.push({id:'duplicate-slot', kind:'notice', text:'Duplicate-slot assets found: Jump to the first active SKU with multiple assets sharing a slot.', rowId:firstDuplicateSlot.rowId, color:firstDuplicateSlot.color, slot:firstDuplicateSlot.slot});
   return notices;
@@ -6214,9 +6988,24 @@ function bindNotificationActions() {
     btn.addEventListener('click', async (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (state.loadedCollectionOptionId) {
-        await launchCollection(state.loadedCollectionOptionId);
-        state.assetModeDirty = false;
+      try {
+        if (state.assetModeDirty) {
+          const refreshed = await refreshDirtyAssetRows();
+          if (refreshed) {
+            renderBoard();
+            return;
+          }
+        }
+        if (state.loadedCollectionOptionId) {
+          await launchCollection(state.loadedCollectionOptionId);
+          state.assetModeDirty = false;
+        }
+      } catch (err) {
+        console.warn(err);
+        if (state.loadedCollectionOptionId) {
+          await launchCollection(state.loadedCollectionOptionId);
+          state.assetModeDirty = false;
+        }
       }
     });
   });
@@ -6492,6 +7281,13 @@ function bindBoardDnD() {
           alert('Prepared image drops are only available in Update assets mode.');
           return;
         }
+        let psaImageTypeOverride = '';
+        if (!preparedPayload.source_is_board_asset) {
+          const active = currentActivePhoto();
+          const resolvedType = resolvePreparedPhotoPsaImageType(active);
+          if (resolvedType === null) return;
+          psaImageTypeOverride = resolvedType || '';
+        }
         try {
           const resp = await fetch('/api/prepared_drop_upload', {
             method:'POST',
@@ -6501,6 +7297,7 @@ function bindBoardDnD() {
               target_lane: targetLane || '',
               target_slot: targetSlot || '',
               mode: state.mode,
+              psa_image_type_override: psaImageTypeOverride,
               ...preparedPayload
             })
           });
