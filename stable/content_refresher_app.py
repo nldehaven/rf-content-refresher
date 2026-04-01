@@ -80,6 +80,7 @@ PHOTO_TO_PSA_IMAGE_TYPE_MAP = {
     "Video_Shoot_Still": "Room_shot",
 }
 PSA_IMAGE_TYPE_PROMPT_CHOICES = ["Detail", "Room_shot", "Silo", "Swatch_detail"]
+SWATCH_OPTIONAL_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
 
 ASSET_SUBTYPE_REQUIRED = "Product_Site_Asset"
 MARKED_FOR_DELETION_VALUE_NAME = "Marked_for_Deletion"
@@ -878,6 +879,8 @@ def prep_mode_to_size(mode: str) -> tuple[int, int]:
     mode = string_value(mode)
     if mode == "crop_square":
         return (2000, 2000)
+    if mode == "crop_swatch":
+        return (163, 163)
     if mode in ("crop_2200", "pad_tb_2200"):
         return (3000, 2200)
     if mode == "crop_remove_sides_1688":
@@ -918,7 +921,7 @@ def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offs
         im = ImageOps.mirror(im)
     src_w, src_h = im.size
 
-    if mode == "crop_square":
+    if mode in ("crop_square", "crop_swatch"):
         bounds = get_square_crop_bounds(src_w, src_h, offset_x)
         square = im.crop(bounds)
         return square.resize((out_w, out_h), Image.LANCZOS)
@@ -969,7 +972,7 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
         im = ImageOps.mirror(im)
     src_w, src_h = im.size
 
-    if mode == "crop_square":
+    if mode in ("crop_square", "crop_swatch"):
         base = im.convert("RGBA")
         left, top, right, bottom = get_square_crop_bounds(src_w, src_h, offset_x)
         overlay = base.copy()
@@ -1679,7 +1682,7 @@ def upload_new_asset_group_upload(session: requests.Session, file_path: Path, as
 
 def build_metadata_copy_fields(session: requests.Session, source_media: Dict[str, Any], metaprops_by_dbname: Dict[str, Dict[str, Any]], target_sku: str, target_position: str, target_name: str, deliverable_override_label: str = "", psa_image_type_override_label: str = "") -> List[Tuple[str, Any]]:
     fields: List[Tuple[str, Any]] = []
-    skip_db_names = {"Product_SKU", "Product_SKU_Position"}
+    skip_db_names = {"Product_SKU", "Product_SKU_Position", "Asset_Identifier"}
     if deliverable_override_label:
         skip_db_names.add("Deliverable")
     if psa_image_type_override_label:
@@ -1725,6 +1728,11 @@ def build_metadata_copy_fields(session: requests.Session, source_media: Dict[str
             fields.append((f"metaproperty.{deliverable_mp_id}", option_value or deliverable_override_label))
     if psa_image_type_override_label:
         append_psa_image_type_field(session, fields, metaprops_by_dbname, psa_image_type_override_label)
+    asset_identifier_mp = metaprops_by_dbname.get("Asset_Identifier")
+    if asset_identifier_mp:
+        asset_identifier_mp_id = string_value(asset_identifier_mp.get("id"))
+        if asset_identifier_mp_id and string_value(target_name):
+            fields.append((f"metaproperty.{asset_identifier_mp_id}", string_value(target_name)))
     fields.append(("name", target_name))
     fields.append(("tags", target_sku))
     return fields
@@ -6547,7 +6555,7 @@ function rowHasCore8000(row) {
 function laneInfo(row, laneType) {
   if (laneType === 'core') {
     const slots = [];
-    let maxVal = 100;
+    let maxVal = 0;
     for (const asset of row.assets || []) {
       if (String(asset.lane || '') !== 'core') continue;
       const match = /^SKU_(\d+)$/.exec(asset.slot_key || '');
@@ -6556,13 +6564,18 @@ function laneInfo(row, laneType) {
       if (!Number.isFinite(num) || num === 8000) continue;
       if (num > maxVal) maxVal = num;
     }
-    for (let n = 100; n <= maxVal; n += 100) slots.push(`SKU_${n}`);
+    if (maxVal <= 0) {
+      slots.push('SKU_100');
+    } else {
+      const displayMax = Math.min(maxVal + 100, 4900);
+      for (let n = 100; n <= displayMax; n += 100) slots.push(`SKU_${n}`);
+    }
     if (rowHasCore8000(row)) slots.push('SKU_8000');
     return slots;
   }
   if (laneType === 'swatch_detail') {
     const slots = [];
-    let maxVal = 5000;
+    let maxVal = 0;
     for (const asset of row.assets || []) {
       if (String(asset.lane || '') !== 'swatch_detail') continue;
       const match = /^SKU_(\d+)$/.exec(asset.slot_key || '');
@@ -6570,7 +6583,12 @@ function laneInfo(row, laneType) {
       const num = Number(match[1]);
       if (Number.isFinite(num) && num > maxVal) maxVal = num;
     }
-    for (let n = 5000; n <= maxVal; n += 100) slots.push(`SKU_${n}`);
+    if (maxVal <= 0) {
+      slots.push('SKU_5000');
+    } else {
+      const displayMax = Math.min(maxVal + 100, 5900);
+      for (let n = 5000; n <= displayMax; n += 100) slots.push(`SKU_${n}`);
+    }
     return slots;
   }
   return [];
@@ -7172,7 +7190,7 @@ function activePhotoOffsetX(photoId) {
   const mode = prepModeFromState();
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
-  if (!srcW || !srcH || mode !== 'crop_square') return 0;
+  if (!srcW || !srcH || (mode !== 'crop_square' && mode !== 'crop_swatch')) return 0;
   const side = Math.min(srcW, srcH);
   const maxOff = Math.max(0, srcW - side);
   if (overrides[photoId] === undefined || overrides[photoId] === null) return Math.round(maxOff / 2);
@@ -7207,9 +7225,10 @@ function renderPhotoPrepDrawer() {
               <label><input type="radio" name="prepMode" value="pad_lr_1688" ${mode==='pad_lr_1688'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white sides</label>
               <label><input type="radio" name="prepMode" value="pad_tb_2200" ${mode==='pad_tb_2200'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white top/bottom</label>
               <label><input type="radio" name="prepMode" value="crop_square" ${mode==='crop_square'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to largest square</label>
+              <label><input type="radio" name="prepMode" value="crop_swatch" ${mode==='crop_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Crop swatch</label>
             </div>
-            ${((mode === 'crop_1688' || mode === 'crop_2200' || mode === 'crop_square')) ? `<div class="photo-prep-focusbox">
-              ${mode === 'crop_square' ? `<div class="photo-focus-pad" aria-label="Square crop nudger">
+            ${((mode === 'crop_1688' || mode === 'crop_2200' || mode === 'crop_square' || mode === 'crop_swatch')) ? `<div class="photo-prep-focusbox">
+              ${(mode === 'crop_square' || mode === 'crop_swatch') ? `<div class="photo-focus-pad" aria-label="Square crop nudger">
                 <button type="button" onclick="setCropToLeft()" title="Jump crop all the way left">&#8678;</button>
                 <button type="button" onclick="nudgeCropX(-1)" title="Move crop left">&#11164;</button>
                 <button type="button" onclick="nudgeCropX(1)" title="Move crop right">&#11166;</button>
@@ -7516,7 +7535,7 @@ function cropStepXForActive() {
 function nudgeCropX(direction) {
   const active = currentActivePhoto();
   if (!active) return;
-  if (prepModeFromState() !== 'crop_square') return;
+  if (prepModeFromState() !== 'crop_square' && prepModeFromState() !== 'crop_swatch') return;
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return;
@@ -7846,7 +7865,7 @@ function computeClientChallengeIssueCount() {
       if (!hasDimension && row.set_dim_compile_ready) total += 1;
       if (offPatternAssets.length) total += 1;
       if (hasDuplicate) total += 1;
-      const sizeWarnings = (row.assets || []).filter(a => !a.is_marked_for_deletion && !!a.has_size_warning).length;
+      const sizeWarnings = (row.assets || []).filter(a => !a.is_marked_for_deletion && (!!a.has_size_warning || !!String(a.size_warning || '').trim())).length;
       total += sizeWarnings;
     }
   }
@@ -7864,7 +7883,7 @@ function renderChallengeIssuePill() {
   }
   const clientCount = computeClientChallengeIssueCount();
   const backendCount = Number((((state.game || {}).current || {}).issue_total) || ((((state.game || {}).current || {}).issues || {}).total) || 0);
-  const count = clientCount > 0 ? clientCount : backendCount;
+  const count = Math.max(clientCount, backendCount);
   pill.style.display = 'inline-flex';
   pill.classList.toggle('good', count === 0);
   pill.textContent = `${count} issue${count === 1 ? '' : 's'} remaining`;
