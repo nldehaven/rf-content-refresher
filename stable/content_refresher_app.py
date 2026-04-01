@@ -6028,7 +6028,7 @@ function renderSetDimDrawer() {
           const scalePct = componentIdx >= 0 ? Number((state.setDim.scalePercents || [])[componentIdx] || 100) : 100;
           const thumbSrc = comp ? `/api/set_dim_component_thumb/${encodeURIComponent(comp.dim_media_id || '')}` : '';
           return `
-            <div class="set-dim-item ${Number(state.setDim.dragSlotIdx) === slotIdx ? 'dragging' : ''}" draggable="true" ondragstart="beginSetDimDrag(${slotIdx}, event)" ondragover="allowSetDimDrop(event)" ondrop="dropSetDimSlot(${slotIdx}, event)" ondragend="endSetDimDrag()">
+            <div class="set-dim-item ${state.setDim.dragSlotIdx !== null && state.setDim.dragSlotIdx !== undefined && Number(state.setDim.dragSlotIdx) === slotIdx ? 'dragging' : ''}" draggable="true" ondragstart="beginSetDimDrag(${slotIdx}, event)" ondragover="allowSetDimDrop(event)" ondrop="dropSetDimSlot(${slotIdx}, event)" ondragend="endSetDimDrag()">
               <div class="set-dim-slot-title">Canvas slot - ${escapeHtml(setDimSlotLabel(slotIdx, total))}</div>
               <div class="set-dim-slot-thumb">${comp ? `<img src="${thumbSrc}" alt="Canvas slot preview" />` : `<div class="photo-empty">Empty slot</div>`}</div>
               ${comp ? `<div class="set-dim-control-label">Visual scale</div>
