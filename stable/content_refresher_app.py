@@ -96,6 +96,13 @@ GRID_SLOT = "SKU_grid"
 SPECIAL_SLOTS = ["SKU_dimension", "SKU_swatch", "SKU_square"]
 ALL_KNOWN_SLOTS = [GRID_SLOT] + CORE_SLOTS + SWATCH_DETAIL_SLOTS + SPECIAL_SLOTS
 
+DELIVERABLE_BY_LANE_SLOT = {
+    ("grid", GRID_SLOT): "Product_Grid_Image",
+    ("special", "SKU_dimension"): "DimensionsDiagram",
+    ("special", "SKU_swatch"): "Product_Swatch_Image",
+}
+
+
 DOWNLOADS_DIR = Path.home() / "Downloads"
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -841,6 +848,45 @@ def append_psa_image_type_field(
     if not option_value:
         raise RuntimeError(f"Could not resolve PSA Image Type option '{label}'.")
     fields.append((f"metaproperty.{mp_id}", option_value))
+
+
+def get_deliverable_override_for_target(target_lane: str, target_slot: str) -> str:
+    lane = string_value(target_lane)
+    slot = string_value(target_slot)
+    if lane == "core":
+        return "Product_Image_Carousel"
+    if lane == "swatch_detail":
+        return "Product_Swatch_Detail_Image"
+    return DELIVERABLE_BY_LANE_SLOT.get((lane, slot), "")
+
+
+def append_deliverable_field(
+    session: requests.Session,
+    fields: List[Tuple[str, Any]],
+    metaprops_by_dbname: Dict[str, Dict[str, Any]],
+    deliverable_label: str,
+) -> None:
+    label = string_value(deliverable_label).strip()
+    if not label:
+        return
+    mp = metaprops_by_dbname.get("Deliverable")
+    if not mp:
+        raise RuntimeError("Could not find metaproperty Deliverable.")
+    mp_id = string_value(mp.get("id"))
+    if not mp_id:
+        raise RuntimeError("Metaproperty Deliverable is missing an id.")
+    option_value = get_metaproperty_option_value(session, mp_id, label)
+    if not option_value:
+        raise RuntimeError(f"Could not resolve Deliverable option '{label}'.")
+    fields.append((f"metaproperty.{mp_id}", option_value))
+
+
+def set_media_deliverable(session: requests.Session, media_id: str, deliverable_label: str) -> None:
+    metaprops_by_dbname = fetch_metaproperties_map(session)
+    fields: List[Tuple[str, Any]] = []
+    append_deliverable_field(session, fields, metaprops_by_dbname, deliverable_label)
+    if fields:
+        post_media_fields(session, media_id, fields)
 
 
 def set_media_psa_image_type(session: requests.Session, media_id: str, psa_image_type_label: str) -> None:
@@ -1699,11 +1745,7 @@ def build_metadata_copy_fields(session: requests.Session, source_media: Dict[str
     fields.append((f"metaproperty.{PRODUCT_SKU_METAPROPERTY_ID}", target_sku))
     fields.append((f"metaproperty.{PRODUCT_SKU_POSITION_METAPROPERTY_ID}", target_position))
     if deliverable_override_label:
-        deliverable_mp = metaprops_by_dbname.get("Deliverable")
-        if deliverable_mp:
-            deliverable_mp_id = string_value(deliverable_mp.get("id"))
-            option_value = get_metaproperty_option_value(session, deliverable_mp_id, deliverable_override_label) if deliverable_mp_id else ""
-            fields.append((f"metaproperty.{deliverable_mp_id}", option_value or deliverable_override_label))
+        append_deliverable_field(session, fields, metaprops_by_dbname, deliverable_override_label)
     if psa_image_type_override_label:
         append_psa_image_type_field(session, fields, metaprops_by_dbname, psa_image_type_override_label)
     asset_identifier_mp = metaprops_by_dbname.get("Asset_Identifier")
@@ -2103,7 +2145,7 @@ def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot
     return {
         "exemplar": exemplar,
         "target_slot": target_slot,
-        "deliverable_override": "",
+        "deliverable_override": get_deliverable_override_for_target(target_lane, target_slot),
         "target_name": target_name,
     }
 
@@ -2144,6 +2186,7 @@ def build_pending_new_asset(source_asset: Dict[str, Any], target_sku: str, targe
     clone["size_warning"] = ""
     clone["pending_file_local_name"] = Path(staged_path).name.split('__',1)[-1]
     clone["deliverable_override"] = string_value(deliverable_override)
+    clone["deliverable"] = string_value(deliverable_override or source_asset.get("deliverable") or "")
     clone["psa_image_type_override"] = string_value(psa_image_type_override)
     return clone
 
@@ -2176,12 +2219,13 @@ def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sk
     clone["asset_mode_message"] = "New asset uploaded to this slot. Reload to view."
     clone["file_name"] = target_name
     clone["name"] = os.path.splitext(target_name)[0]
-    clone["original_state"] = {"position": target_position, "is_marked_for_deletion": False}
+    clone["original_state"] = {"position": target_position, "is_marked_for_deletion": False, "deliverable": string_value(deliverable_override or source_asset.get("deliverable") or "")}
     clone["dateCreated"] = datetime.now().isoformat()
     clone["transformBaseUrl"] = ""
     clone["original"] = ""
     clone["size_warning"] = ""
     clone["deliverable_override"] = string_value(deliverable_override)
+    clone["deliverable"] = string_value(deliverable_override or source_asset.get("deliverable") or "")
     clone["psa_image_type_override"] = string_value(psa_image_type_override)
     clone.pop("pending_upload", None)
     clone.pop("pending_upload_kind", None)
@@ -2597,6 +2641,7 @@ def asset_to_client_model(asset: Dict[str, Any], sku: str, position_override: Op
         "original_state": {
             "position": position,
             "is_marked_for_deletion": deleted,
+            "deliverable": prop(asset, "Deliverable", "Deliverable"),
         },
         "meta": {
             "productSkuPosition": position,
@@ -3377,6 +3422,11 @@ def apply_move(board: Dict[str, Any], row_id: str, asset_id: str, target_lane: s
                 f"{source_asset.get('file_name') or source_asset.get('name') or source_asset.get('id')} will be copied from SKU {source_asset.get('copy_source_sku') or source_asset.get('source_sku') or source_row.get('sku')} to SKU {target_row.get('sku')}."
             )
 
+    deliverable_override = get_deliverable_override_for_target(target_lane, target_slot or "")
+    asset["deliverable_override"] = deliverable_override
+    if deliverable_override:
+        asset["deliverable"] = deliverable_override
+
     if target_lane == "trash":
         move_asset_to_trash(target_row, target_buckets, asset)
     elif target_lane == "core":
@@ -3478,6 +3528,8 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
             "You need to fill in these config values before committing changes: " + ", ".join(missing)
         )
 
+    metaprops_by_dbname = fetch_metaproperties_map(session)
+
     copy_jobs = []
     update_jobs = []
     for section in board.get("color_sections", []):
@@ -3529,6 +3581,14 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                     payload[f"metaproperty.{PRODUCT_SKU_POSITION_METAPROPERTY_ID}"] = current_position
                 if current_deleted != original_deleted:
                     payload[f"metaproperty.{MARKED_FOR_DELETION_METAPROPERTY_ID}"] = MARKED_FOR_DELETION_OPTION_ID if current_deleted else ""
+
+                current_deliverable = string_value(asset.get("deliverable") or asset.get("deliverable_override") or "")
+                original_deliverable = string_value(original.get("deliverable") or "")
+                if current_deliverable != original_deliverable:
+                    deliverable_fields: List[Tuple[str, Any]] = []
+                    append_deliverable_field(session, deliverable_fields, metaprops_by_dbname, current_deliverable)
+                    for field_key, field_value in deliverable_fields:
+                        payload[field_key] = field_value
 
                 if payload:
                     update_jobs.append(
@@ -3585,7 +3645,6 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                 source_media = fetch_media_by_id(session, job["source_media_id"])
                 target_name = os.path.splitext(job["asset_name"])[0]
                 new_media_id = upload_new_asset_group_upload(session, staged_path, target_name)
-                metaprops_by_dbname = fetch_metaproperties_map(session)
                 fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, job["sku"], job["target_position"], target_name, job.get("deliverable_override") or "", job.get("psa_image_type_override") or "")
                 post_media_fields(session, new_media_id, fields)
                 cleanup_staged_file(str(staged_path))
@@ -3892,8 +3951,42 @@ def pop_next_game_candidate(force_fill: bool = True) -> Optional[Dict[str, Any]]
         if not game.get("queue"):
             return None
         candidate = game["queue"].pop(0)
-        game["current"] = candidate
         return deepcopy(candidate)
+
+
+def get_next_hydrated_game_board(force_fill: bool = True, max_attempts: int = 24) -> tuple[Optional[Dict[str, Any]], bool]:
+    """Return the next valid hydrated challenge board.
+
+    Keeps walking the queued lightweight candidates, silently skipping any that
+    turn out to be stale by hydration time. Returns (board, had_candidates).
+    """
+    game = STATE["game"]
+    had_candidates = False
+    attempts = 0
+    while attempts < max_attempts:
+        attempts += 1
+        candidate = pop_next_game_candidate(force_fill=force_fill)
+        force_fill = False
+        if candidate is None:
+            if not had_candidates:
+                maybe_start_game_queue_fill(force=True)
+                start = time.time()
+                while time.time() - start < 2.0:
+                    with game["lock"]:
+                        if game.get("queue"):
+                            break
+                    time.sleep(0.15)
+                candidate = pop_next_game_candidate(force_fill=False)
+            if candidate is None:
+                break
+        had_candidates = True
+        board = hydrate_game_candidate(candidate)
+        if board is not None:
+            return board, True
+    with game["lock"]:
+        game["current"] = None
+    maybe_start_game_queue_fill(force=False)
+    return None, had_candidates
 
 
 def game_status_payload() -> Dict[str, Any]:
@@ -4017,20 +4110,13 @@ def api_game_launch() -> Response:
         game = STATE["game"]
         with game["lock"]:
             has_ready_candidate = bool(game.get("queue"))
-        if not has_ready_candidate:
-            maybe_start_game_queue_fill(force=True)
-        board = None
-        for _ in range(6):
-            candidate = pop_next_game_candidate(force_fill=not has_ready_candidate)
-            has_ready_candidate = True
-            if candidate is None:
-                break
-            board = hydrate_game_candidate(candidate)
-            if board is not None:
-                break
+        board, had_candidates = get_next_hydrated_game_board(force_fill=not has_ready_candidate, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
         if board is None:
             maybe_start_game_queue_fill(force=True)
-            return jsonify({"error": "No Cleanup Challenge board is ready yet. Please try again in a moment."}), 503
+            message = "No Cleanup Challenge board is ready yet. Please try again in a moment."
+            if had_candidates:
+                message = "Queued challenge candidates were stale by the time they loaded. Try again in a moment while the queue refreshes."
+            return jsonify({"error": message}), 503
         STATE["game"]["active"] = True
         STATE["board"] = deepcopy(board)
         STATE["baseline_board"] = deepcopy(board)
@@ -4052,16 +4138,13 @@ def api_game_next() -> Response:
             STATE["game"]["current"] = None
             return jsonify({"ok": True, "game": game_status_payload()})
         maybe_start_game_queue_fill(force=False)
-        board = None
-        for _ in range(4):
-            candidate = pop_next_game_candidate(force_fill=True)
-            if candidate is None:
-                break
-            board = hydrate_game_candidate(candidate)
-            if board is not None:
-                break
+        board, had_candidates = get_next_hydrated_game_board(force_fill=True, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
         if board is None:
-            return jsonify({"error": "No Cleanup Challenge board is ready yet."}), 503
+            maybe_start_game_queue_fill(force=True)
+            message = "No Cleanup Challenge board is ready yet."
+            if had_candidates:
+                message = "Queued Cleanup Challenge candidates were stale by the time they loaded. The queue is refreshing now."
+            return jsonify({"error": message}), 503
         STATE["game"]["active"] = True
         STATE["board"] = deepcopy(board)
         STATE["baseline_board"] = deepcopy(board)
@@ -8955,6 +9038,13 @@ function bindStaticUI() {
   document.getElementById('collectionFilter').addEventListener('input', filterCollections);
   document.getElementById('launchBtn').addEventListener('click', () => launchCollection());
   document.getElementById('reloadBtn').addEventListener('click', async () => {
+    const queuedCount = changedAssetIds().size;
+    if (queuedCount > 0) {
+      const shouldCommit = confirm(`You have ${queuedCount} queued change(s). Press OK to commit them to Bynder before reloading. Press Cancel to stay on this board.`);
+      if (!shouldCommit) return;
+      const success = await commitChanges(true);
+      if (!success) return;
+    }
     if (state.game && state.game.active) {
       setReloadButtonFlashing(true);
       try {
@@ -9043,12 +9133,9 @@ function bindStaticUI() {
   document.getElementById('idleKeepWorkingBtn').addEventListener('click', closeIdleModal);
   document.getElementById('idleReloadBtn').addEventListener('click', async () => {
     closeIdleModal();
-    if (state.game && state.game.active) {
-      document.getElementById('reloadBtn').click();
-      return;
-    }
-    if (state.loadedCollectionOptionId) {
-      await launchCollection(state.loadedCollectionOptionId, {flashReload:true, scrollTopAfter:true});
+    const reloadBtn = document.getElementById('reloadBtn');
+    if (reloadBtn) {
+      reloadBtn.click();
     }
   });
 }
