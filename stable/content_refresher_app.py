@@ -82,6 +82,10 @@ PHOTO_TO_PSA_IMAGE_TYPE_MAP = {
 PSA_IMAGE_TYPE_PROMPT_CHOICES = ["Detail", "Room_shot", "Silo", "Swatch_detail"]
 SWATCH_OPTIONAL_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
 WALL_ART_SIZING_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
+# Defensive aliases for game/background scanners so these checks never explode if a future edit
+# accidentally renames one constant in one code path.
+CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS = SWATCH_OPTIONAL_STEP_PATHS
+CHALLENGE_WALL_ART_SIZING_STEP_PATHS = WALL_ART_SIZING_STEP_PATHS
 WALL_ART_SIZING_GUIDE_MEDIA_ID = "ed5aad96-4b05-4f8b-8a60-621b9f955fac"
 WALL_ART_SIZING_GUIDE_FILENAME = "Image_Carousel_Wall_Art_Sizing_Guide_3000x1688.jpg"
 
@@ -117,6 +121,7 @@ GAME_QUEUE_TARGET = 10
 GAME_SCAN_BATCH = 14
 GAME_SCAN_MIN_GAP_SECONDS = 8
 GAME_LEADERBOARD_WEBHOOK_URL = os.environ.get("CONTENT_REFRESHER_LEADERBOARD_WEBHOOK_URL", "")
+RECENT_POSITION_OVERRIDE_TTL_SECONDS = 72 * 60 * 60
 
 PHOTO_WATERMARK_ALPHA = 0.46
 PHOTO_WATERMARK_TEXT = ("NOT", "FINAL")
@@ -158,6 +163,7 @@ STATE = {
     "last_commit": None,
     "server_messages": [],
     "collection_asset_cache": {},
+    "recent_position_overrides": {},
 }
 STATE["game"] = {
     "active": False,
@@ -301,6 +307,42 @@ def save_collection_options_to_disk_cache(items: List[Dict[str, str]]) -> None:
     except Exception as exc:
         log_message(f"Could not write collection options cache: {exc}")
     return None
+
+
+def get_recent_position_override(media_id: Any) -> str:
+    media_id = string_value(media_id)
+    if not media_id:
+        return ""
+    cache = STATE.setdefault("recent_position_overrides", {})
+    entry = cache.get(media_id)
+    if not isinstance(entry, dict):
+        return ""
+    try:
+        saved_at = float(entry.get("saved_at") or 0.0)
+    except Exception:
+        saved_at = 0.0
+    if (time.time() - saved_at) > RECENT_POSITION_OVERRIDE_TTL_SECONDS:
+        cache.pop(media_id, None)
+        return ""
+    return string_value(entry.get("position"))
+
+
+def set_recent_position_override(media_id: Any, position: Any) -> None:
+    media_id = string_value(media_id)
+    position = string_value(position)
+    if not media_id or not position:
+        return
+    STATE.setdefault("recent_position_overrides", {})[media_id] = {
+        "position": position,
+        "saved_at": time.time(),
+    }
+
+
+def clear_recent_position_override(media_id: Any) -> None:
+    media_id = string_value(media_id)
+    if not media_id:
+        return
+    STATE.setdefault("recent_position_overrides", {}).pop(media_id, None)
 
 
 def get_local_username() -> str:
@@ -853,6 +895,21 @@ def append_psa_image_type_field(
 def get_deliverable_override_for_target(target_lane: str, target_slot: str) -> str:
     lane = string_value(target_lane)
     slot = string_value(target_slot)
+    if lane == "core":
+        return "Product_Image_Carousel"
+    if lane == "swatch_detail":
+        return "Product_Swatch_Detail_Image"
+    return DELIVERABLE_BY_LANE_SLOT.get((lane, slot), "")
+
+
+def expected_deliverable_for_asset(asset: Dict[str, Any], row_sku: str = "") -> str:
+    lane = string_value(asset.get("lane"))
+    slot = string_value(asset.get("slot_key")) or normalize_position_for_row(
+        asset.get("last_nontrash_position") or asset.get("current_position") or get_asset_position(asset),
+        row_sku or string_value(asset.get("sku")) or prop(asset, "Product_SKU", "Product_SKU"),
+    )
+    if lane == "off_pattern" or lane == "trash":
+        return ""
     if lane == "core":
         return "Product_Image_Carousel"
     if lane == "swatch_detail":
@@ -2349,7 +2406,13 @@ def prop(asset: Dict[str, Any], logical_name: str, fallback_db_name: Optional[st
 
 
 def get_asset_position(asset: Dict[str, Any]) -> str:
-    return prop(asset, "Product_SKU_Position", "Product_SKU_Position")
+    media_id = string_value(asset.get("id"))
+    actual = prop(asset, "Product_SKU_Position", "Product_SKU_Position")
+    override = get_recent_position_override(media_id)
+    if actual and override and normalize_uuid(actual) == normalize_uuid(override):
+        clear_recent_position_override(media_id)
+        return actual
+    return override or actual
 
 
 def exact_position_for_row(row_sku: str, normalized_slot: str) -> str:
@@ -3142,6 +3205,23 @@ def get_asset_by_id(board: Dict[str, Any], asset_id: str) -> Optional[Dict[str, 
             return asset
     return None
 
+def queue_deliverable_fix_on_board(board: Dict[str, Any], asset_id: str) -> Tuple[Dict[str, Any], str, str]:
+    asset = get_asset_by_id(board, asset_id)
+    if asset is None:
+        raise ValueError("Asset not found on current board.")
+    row = get_row_by_id(board, string_value(asset.get("row_id")))
+    row_sku = string_value(row.get("sku")) if row else ""
+    expected = expected_deliverable_for_asset(asset, row_sku)
+    if not expected:
+        raise ValueError("This asset does not have an expected Deliverable for its current lane.")
+    asset["deliverable_override"] = expected
+    asset["deliverable"] = expected
+    original = asset.setdefault("original_state", {})
+    if "deliverable" not in original:
+        original["deliverable"] = string_value(asset.get("deliverable") or "")
+    return board, string_value(row.get("row_id")) if row else "", expected
+
+
 
 def sanitize_copy_warning(target_lane: str) -> bool:
     return target_lane != "swatch_detail"
@@ -3617,6 +3697,9 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                 job.get("deliverable_override") or "",
             )
             results.append({**job, "success": True, "response": response, "job_type": "copy"})
+            new_media_id = string_value(((response or {}).get("new_media_id") if isinstance(response, dict) else "") or ((response or {}).get("id") if isinstance(response, dict) else ""))
+            if new_media_id:
+                set_recent_position_override(new_media_id, job["target_position"])
             success_count += 1
             log_message(f"Created copied asset from {job['source_media_id']} for SKU {job['target_sku']} in position {job['target_position']}.")
         except Exception as exc:
@@ -3650,11 +3733,14 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                 cleanup_staged_file(str(staged_path))
                 response = {"new_media_id": new_media_id}
                 results.append({**job, "success": True, "response": response})
+                set_recent_position_override(new_media_id, job["target_position"])
                 success_count += 1
                 log_message(f"Uploaded pending new asset for SKU {job['sku']} into {job['target_position']} successfully.")
                 continue
             response = update_asset_metadata(session, job["media_id"], job["payload"])
             results.append({**job, "success": True, "response": response})
+            if f"metaproperty.{PRODUCT_SKU_POSITION_METAPROPERTY_ID}" in (job.get("payload") or {}):
+                set_recent_position_override(job["media_id"], (job.get("payload") or {}).get(f"metaproperty.{PRODUCT_SKU_POSITION_METAPROPERTY_ID}"))
             success_count += 1
             log_message(f"Updated asset {job['media_id']} ({job['asset_name']}) successfully.")
         except Exception as exc:
@@ -3723,12 +3809,12 @@ def filter_board_to_colors(board: Dict[str, Any], color_names: List[str]) -> Dic
 
 def row_requires_swatch(row: Dict[str, Any]) -> bool:
     step_path = string_value(row.get("step_path") or row.get("property_STEP_Path") or "")
-    return step_path not in SWATCH_OPTIONAL_STEP_PATHS
+    return step_path not in CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS
 
 
 def row_requires_wall_art_sizing(row: Dict[str, Any]) -> bool:
     step_path = string_value(row.get("step_path") or row.get("property_STEP_Path") or "")
-    return step_path in WALL_ART_SIZING_STEP_PATHS
+    return step_path in CHALLENGE_WALL_ART_SIZING_STEP_PATHS
 
 
 def candidate_sort_key(candidate: Dict[str, Any]) -> Tuple[int, float]:
@@ -3766,6 +3852,7 @@ def compute_row_issue_summary(row: Dict[str, Any], include_missing_dims: bool = 
         "compilable_set_dim": 1 if (not has_dim and bool(row.get("set_dim_compile_ready"))) else 0,
         "off_pattern": off_pattern,
         "duplicate_slot": sum(1 for v in dup_counts.values() if v > 1),
+        "wrong_deliverable": sum(1 for a in live_assets if string_value(a.get("lane")) not in {"off_pattern", "trash"} and string_value(a.get("deliverable") or a.get("deliverable_override") or "") != expected_deliverable_for_asset(a, string_value(row.get("sku")))),
         "size_warnings": size_issue_count,
     }
     if not include_missing_dims:
@@ -3777,7 +3864,7 @@ def compute_row_issue_summary(row: Dict[str, Any], include_missing_dims: bool = 
 def compute_board_issue_summary(board: Dict[str, Any], include_missing_dims: bool = True) -> Dict[str, Any]:
     summary = {
         "missing_grid": 0, "missing_100": 0, "missing_swatch": 0, "missing_dimension": 0,
-        "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "size_warnings": 0, "total": 0,
+        "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "wrong_deliverable": 0, "size_warnings": 0, "total": 0,
         "rows": {},
     }
     for section in board.get("color_sections", []):
@@ -3787,9 +3874,9 @@ def compute_board_issue_summary(board: Dict[str, Any], include_missing_dims: boo
             row_summary = compute_row_issue_summary(row, include_missing_dims=include_missing_dims)
             if row_summary["total"]:
                 summary["rows"][string_value(row.get("row_id") or row.get("sku"))] = row_summary
-            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "size_warnings"]:
+            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"]:
                 summary[key] += int(row_summary.get(key) or 0)
-    summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "size_warnings"])
+    summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"])
     return summary
 
 
@@ -3833,7 +3920,7 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
     for color_name, sku_map in by_color_sku.items():
         summary = {
             "missing_grid": 0, "missing_100": 0, "missing_swatch": 0, "missing_dimension": 0,
-            "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "size_warnings": 0, "total": 0,
+            "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "wrong_deliverable": 0, "size_warnings": 0, "total": 0,
             "rows": {},
         }
         for sku, sku_assets in sku_map.items():
@@ -3843,28 +3930,117 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
                 continue
             step_path = prop(anchor, "STEP_Path", "STEP_Path")
             lane = _lane_presence_from_assets_for_sku(sku_assets, sku)
+            dup_counts: Dict[str, int] = {}
+            off_pattern_count = 0
+            wrong_deliverable_count = 0
+            for asset in [a for a in sku_assets if not is_marked_for_deletion(a)]:
+                lane_name, slot_name = get_lane_and_slot_for_row(get_asset_position(asset), sku)
+                if lane_name == "off_pattern":
+                    off_pattern_count += 1
+                    continue
+                if lane_name == "trash":
+                    continue
+                if slot_name:
+                    dup_counts[slot_name] = dup_counts.get(slot_name, 0) + 1
+                expected = get_deliverable_override_for_target(lane_name, slot_name)
+                current_deliverable = prop(asset, "Deliverable", "Deliverable")
+                if expected and current_deliverable != expected:
+                    wrong_deliverable_count += 1
             row_summary = {
                 "missing_grid": 0 if lane["has_grid"] else 1,
                 "missing_100": 0 if lane["has_100"] else 1,
-                "missing_swatch": 0 if (lane["has_swatch"] or step_path in SWATCH_OPTIONAL_STEP_PATHS) else 1,
+                "missing_swatch": 0 if (lane["has_swatch"] or step_path in CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS) else 1,
                 "missing_dimension": 0,
-                "missing_wall_art_sizing": 0 if (lane["has_8000"] or step_path not in WALL_ART_SIZING_STEP_PATHS) else 1,
+                "missing_wall_art_sizing": 0 if (lane["has_8000"] or step_path not in CHALLENGE_WALL_ART_SIZING_STEP_PATHS) else 1,
                 "compilable_set_dim": 0,
-                "off_pattern": 0,
-                "duplicate_slot": 0,
+                "off_pattern": off_pattern_count,
+                "duplicate_slot": sum(1 for v in dup_counts.values() if v > 1),
+                "wrong_deliverable": wrong_deliverable_count,
                 "size_warnings": 0,
             }
             row_summary["total"] = sum(int(v or 0) for k, v in row_summary.items() if k != "total")
             if row_summary["total"]:
                 summary["rows"][sku] = row_summary
-            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing"]:
+            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"]:
                 summary[key] += int(row_summary.get(key) or 0)
-        summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "size_warnings"])
+        summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"])
         if int(summary.get("total") or 0) > 0:
             candidates.append(build_game_candidate_from_color(collection_option, color_name, summary))
     candidates.sort(key=candidate_sort_key)
     log_message(f"Scanned lightweight game candidates for {collection_label}: {len(candidates)} candidate colorways")
     return candidates
+
+
+def _scan_game_queue_candidates(sync: bool = False, stop_after_first: bool = False) -> None:
+    game = STATE["game"]
+    try:
+        collections = ensure_collections_loaded()
+        if not collections:
+            return
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        pool = list(collections)
+        random.shuffle(pool)
+        scanned = 0
+        for collection_option in pool:
+            with game["lock"]:
+                existing_keys = {string_value(c.get("key")) for c in (game.get("queue") or [])}
+                current_key = string_value((game.get("current") or {}).get("key"))
+                if len(game.get("queue") or []) >= GAME_QUEUE_TARGET:
+                    break
+            if scanned >= GAME_SCAN_BATCH:
+                break
+            scanned += 1
+            try:
+                queued_any = False
+                for candidate in scan_collection_for_game_candidates(session, collection_option):
+                    key = string_value(candidate.get("key"))
+                    with game["lock"]:
+                        if key and key != current_key and key not in existing_keys and len(game.get("queue") or []) < GAME_QUEUE_TARGET:
+                            game.setdefault("queue", []).append(candidate)
+                            game["queue"].sort(key=candidate_sort_key)
+                            existing_keys.add(key)
+                            queued_any = True
+                            log_message(f"Queued Cleanup Challenge candidate: {candidate['collection'].get('label')} / {candidate['color']}")
+                if stop_after_first and queued_any:
+                    break
+            except Exception as exc:
+                log_message(f"Game queue scan skipped {collection_option.get('label')}: {exc}")
+    finally:
+        if not sync:
+            with game["lock"]:
+                game["scanner_running"] = False
+
+
+def ensure_game_queue_ready(min_ready: int = 1, timeout_seconds: float = 10.0) -> bool:
+    game = STATE["game"]
+    with game["lock"]:
+        ready_count = len(game.get("queue") or [])
+        scanner_running = bool(game.get("scanner_running"))
+    if ready_count >= min_ready:
+        return True
+    if not scanner_running:
+        with game["lock"]:
+            game["scanner_running"] = True
+            game["last_scan_at"] = time.time()
+        _scan_game_queue_candidates(sync=True, stop_after_first=(min_ready <= 1))
+    start = time.time()
+    while time.time() - start < timeout_seconds:
+        with game["lock"]:
+            if len(game.get("queue") or []) >= min_ready:
+                return True
+            running = bool(game.get("scanner_running"))
+        if not running:
+            with game["lock"]:
+                game["scanner_running"] = True
+                game["last_scan_at"] = time.time()
+            _scan_game_queue_candidates(sync=True, stop_after_first=(min_ready <= 1))
+            with game["lock"]:
+                if len(game.get("queue") or []) >= min_ready:
+                    return True
+        time.sleep(0.15)
+    with game["lock"]:
+        return len(game.get("queue") or []) >= min_ready
 
 
 def maybe_start_game_queue_fill(force: bool = False) -> None:
@@ -3880,38 +4056,7 @@ def maybe_start_game_queue_fill(force: bool = False) -> None:
         game["last_scan_at"] = time.time()
 
     def _worker() -> None:
-        try:
-            collections = ensure_collections_loaded()
-            if not collections:
-                return
-            token = load_bynder_token(BYNDER_TOKEN_PATH)
-            session = make_session(token)
-            pool = list(collections)
-            random.shuffle(pool)
-            scanned = 0
-            for collection_option in pool:
-                with game["lock"]:
-                    existing_keys = {string_value(c.get("key")) for c in (game.get("queue") or [])}
-                    current_key = string_value((game.get("current") or {}).get("key"))
-                    if len(game.get("queue") or []) >= GAME_QUEUE_TARGET:
-                        break
-                if scanned >= GAME_SCAN_BATCH:
-                    break
-                scanned += 1
-                try:
-                    for candidate in scan_collection_for_game_candidates(session, collection_option):
-                        key = string_value(candidate.get("key"))
-                        with game["lock"]:
-                            if key and key != current_key and key not in existing_keys and len(game.get("queue") or []) < GAME_QUEUE_TARGET:
-                                game.setdefault("queue", []).append(candidate)
-                                game["queue"].sort(key=candidate_sort_key)
-                                existing_keys.add(key)
-                                log_message(f"Queued Cleanup Challenge candidate: {candidate['collection'].get('label')} / {candidate['color']}")
-                except Exception as exc:
-                    log_message(f"Game queue scan skipped {collection_option.get('label')}: {exc}")
-        finally:
-            with game["lock"]:
-                game["scanner_running"] = False
+        _scan_game_queue_candidates(sync=False, stop_after_first=False)
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -3940,13 +4085,7 @@ def hydrate_game_candidate(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]
 def pop_next_game_candidate(force_fill: bool = True) -> Optional[Dict[str, Any]]:
     game = STATE["game"]
     if force_fill and not game.get("queue"):
-        maybe_start_game_queue_fill(force=True)
-        start = time.time()
-        while time.time() - start < 4.5:
-            with game["lock"]:
-                if game.get("queue"):
-                    break
-            time.sleep(0.15)
+        ensure_game_queue_ready(min_ready=1, timeout_seconds=10.0)
     with game["lock"]:
         if not game.get("queue"):
             return None
@@ -4112,10 +4251,13 @@ def api_game_launch() -> Response:
             has_ready_candidate = bool(game.get("queue"))
         board, had_candidates = get_next_hydrated_game_board(force_fill=not has_ready_candidate, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
         if board is None:
+            ensure_game_queue_ready(min_ready=1, timeout_seconds=10.0)
+            board, had_candidates = get_next_hydrated_game_board(force_fill=False, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
+        if board is None:
             maybe_start_game_queue_fill(force=True)
             message = "No Cleanup Challenge board is ready yet. Please try again in a moment."
             if had_candidates:
-                message = "Queued challenge candidates were stale by the time they loaded. Try again in a moment while the queue refreshes."
+                message = "Queued challenge candidates were stale by the time they loaded. The queue is refreshing."
             return jsonify({"error": message}), 503
         STATE["game"]["active"] = True
         STATE["board"] = deepcopy(board)
@@ -4140,10 +4282,13 @@ def api_game_next() -> Response:
         maybe_start_game_queue_fill(force=False)
         board, had_candidates = get_next_hydrated_game_board(force_fill=True, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
         if board is None:
+            ensure_game_queue_ready(min_ready=1, timeout_seconds=10.0)
+            board, had_candidates = get_next_hydrated_game_board(force_fill=False, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
+        if board is None:
             maybe_start_game_queue_fill(force=True)
             message = "No Cleanup Challenge board is ready yet."
             if had_candidates:
-                message = "Queued Cleanup Challenge candidates were stale by the time they loaded. The queue is refreshing now."
+                message = "Queued Cleanup Challenge candidates were stale by the time they loaded. The queue is refreshing."
             return jsonify({"error": message}), 503
         STATE["game"]["active"] = True
         STATE["board"] = deepcopy(board)
@@ -4529,6 +4674,29 @@ def api_set_dim_compile_apply() -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/queue_deliverable_fix", methods=["POST"])
+def api_queue_deliverable_fix() -> Response:
+    try:
+        if STATE["board"] is None:
+            return jsonify({"error": "No collection is currently loaded."}), 400
+        payload = request.get_json(force=True)
+        asset_id = string_value(payload.get("asset_id"))
+        if not asset_id:
+            return jsonify({"error": "asset_id is required."}), 400
+        board, row_id, expected = queue_deliverable_fix_on_board(STATE["board"], asset_id)
+        STATE["board"] = board
+        STATE["summary"] = compute_change_summary(STATE["board"])
+        return jsonify({
+            "board": STATE["board"],
+            "summary": STATE["summary"],
+            "dirty_row_ids": [row_id] if row_id else [],
+            "notice": {"kind": "success", "text": f"Deliverable queued to update to {expected}."},
+        })
+    except Exception as exc:
+        log_message(f"Queue deliverable fix failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/move", methods=["POST"])
 def api_move() -> Response:
     try:
@@ -4609,7 +4777,7 @@ def api_apply_wall_art_sizing_guide() -> Response:
             string_value(source_asset.get(f"property_{PSA_IMAGE_TYPE_DBNAME}"))
         )
         row.setdefault("assets", []).append(placeholder)
-        STATE["summary"] = build_commit_summary(STATE["board"])
+        STATE["summary"] = compute_change_summary(STATE["board"])
         return jsonify({
             "board": STATE["board"],
             "summary": STATE["summary"],
@@ -4995,16 +5163,13 @@ def api_commit() -> Response:
                     "game": {**game_status_payload(), "resolved": 0, "completed": False, "remaining": int((current_game.get("issues") or {}).get("total") or current_game.get("issue_total") or 0), "pending_verification": True},
                 })
 
-            refreshed = build_board_for_collection(session, STATE["board"]["collection"], force_refresh=True)
-            board = refreshed
-            STATE["board"] = board
-            STATE["baseline_board"] = deepcopy(board)
             return jsonify({
                 "commit": result,
-                "board": board,
-                "summary": compute_change_summary(board),
-                "refreshed": True,
+                "board": STATE["board"],
+                "summary": compute_change_summary(STATE["board"]),
+                "refreshed": False,
                 "game": game_status_payload(),
+                "pending_verification": True,
             })
 
         return jsonify({
@@ -6270,7 +6435,8 @@ const state = {
     lastActivityAt: Date.now(),
     modalOpen: false,
   },
-};
+
+  commitInFlight: false,};
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -6406,6 +6572,7 @@ function boardFingerprint(board) {
           asset.id || '',
           asset.current_position || '',
           asset.slot_key || '',
+          String(asset.deliverable_override || asset.deliverable || ''),
           asset.pending_upload ? '1' : '0',
           asset.is_marked_for_deletion ? '1' : '0'
         ].join(':'));
@@ -6638,6 +6805,10 @@ async function exitCleanupChallenge() {
 }
 
 function scheduleGameQueueEnsure() {
+  if (state.commitInFlight) return;
+  if (state.waitFlow && state.waitFlow.activeToken) return;
+  const queuedCount = Object.values(state.changeSummary || {}).reduce((acc, value) => acc + Number(value || 0), 0);
+  if (queuedCount > 0) return;
   const now = Date.now();
   if ((now - Number(state.game.lastEnsureAt || 0)) < 7000) return;
   state.game.lastEnsureAt = now;
@@ -6813,7 +6984,7 @@ function changedAssetIds() {
     for (const row of section.rows || []) {
       for (const asset of row.assets || []) {
         const original = asset.original_state || {};
-        if (asset.pending_upload || (asset.current_position || '') !== (original.position || '') || !!asset.is_marked_for_deletion !== !!original.is_marked_for_deletion) {
+        if (asset.pending_upload || (asset.current_position || '') !== (original.position || '') || !!asset.is_marked_for_deletion !== !!original.is_marked_for_deletion || String(asset.deliverable_override || asset.deliverable || '') !== String(original.deliverable || asset.deliverable || '')) {
           changed.add(asset.id);
         }
       }
@@ -6896,6 +7067,22 @@ function formatAssetSizeWarning(asset) {
   return `<div class="asset-size-warning">${escapeHtml(text)}</div>`;
 }
 
+function assetSharesSlot(asset) {
+  if (!asset || !state.board) return false;
+  const lane = String(asset.lane || '').trim();
+  const slotKey = String(asset.slot_key || asset.current_position || '').trim();
+  if (!lane || !slotKey || lane === 'off_pattern' || lane === 'trash') return false;
+  for (const section of state.board.color_sections || []) {
+    for (const row of section.rows || []) {
+      const matches = (row.assets || []).filter(a => !a.pending_upload && !a.is_marked_for_deletion && String(a.lane || '').trim() === lane && String(a.slot_key || a.current_position || '').trim() === slotKey);
+      if (matches.some(a => String(a.id || '') === String(asset.id || ''))) {
+        return matches.length > 1;
+      }
+    }
+  }
+  return false;
+}
+
 function renderAssetCard(asset, changed) {
   const thumb = assetThumbUrl(asset);
   const classes = ['asset-card'];
@@ -6909,22 +7096,28 @@ function renderAssetCard(asset, changed) {
   if (asset.size_warning) classes.push('bad-dimensions');
   const openLink = asset.original || asset.transformBaseUrl || '#';
   const downloadLink = asset.pending_upload ? `/api/download/${encodeURIComponent(asset.copy_source_media_id || asset.id || '')}` : `/api/download/${encodeURIComponent(asset.id || '')}`;
-  let fixHtml = '';
+  let fixActions = [];
   let sizeWarningHtml = '';
+  const wrongDeliverable = assetHasWrongDeliverable(asset);
+  const sharedSlot = assetSharesSlot(asset);
   if (asset.size_warning) {
     if (state.mode === 'assets' && !asset.pending_upload) {
       if (asset.slot_key === 'SKU_swatch' && Number(asset.width || 0) > 0 && Number(asset.width || 0) === Number(asset.height || 0)) {
-        fixHtml = `<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'swatch')">Fix swatch</a>`;
+        fixActions.push(`<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'swatch')">Fix swatch</a>`);
       } else if (asset.slot_key === 'SKU_dimension') {
-        fixHtml = `<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'dim')">Fix dim</a>`;
+        fixActions.push(`<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'dim')">Fix dim</a>`);
       } else if (asset.slot_key === 'SKU_grid') {
-        fixHtml = `<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'grid')">Fix silo</a>`;
+        fixActions.push(`<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'grid')">Fix silo</a>`);
       } else if (asset.lane === 'core') {
-        fixHtml = `<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'silo')">Fix silo</a>`;
+        fixActions.push(`<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'silo')">Fix silo</a>`);
       }
     }
     sizeWarningHtml = formatAssetSizeWarning(asset);
   }
+  if (state.mode === 'positions' && !asset.pending_upload && wrongDeliverable) {
+    fixActions.push(`<a href="#" class="asset-fix-action" onclick="queueDeliverableFix(event, '${escapeHtml(asset.id || '')}')">Fix deliverable</a>`);
+  }
+  const fixHtml = fixActions.join('');
   return `
     <div class="${classes.join(' ')}" draggable="${state.mode === 'positions' ? 'true' : 'false'}" data-asset-id="${escapeHtml(asset.id)}" title="${escapeHtml(asset.size_warning || '')}">
       ${thumb ? `<img src="${escapeHtml(thumb)}" alt="" />` : `<div style="height:var(--thumb-height,84px);"></div>`}
@@ -6936,6 +7129,8 @@ function renderAssetCard(asset, changed) {
         ${fixHtml ? `<div class="asset-fix-pill-row">${fixHtml}</div>` : ''}
         ${asset.is_marked_for_deletion ? '<div class="asset-date" style="color:#a93d36;font-weight:700;">Marked for deletion</div>' : ''}
         ${asset.lane === 'off_pattern' ? `<div class="asset-date" style="color:#8b6b00;font-weight:700;">Off-pattern: ${escapeHtml(asset.current_position || '')}</div>` : ''}
+        ${wrongDeliverable ? `<div class="asset-date" style="color:#9c4f00;font-weight:700;">Wrong deliverable for lane</div>` : ''}
+        ${sharedSlot ? `<div class="asset-date" style="color:#8f2d56;font-weight:700;">Multiple assets share this slot</div>` : ''}
         ${asset.pending_upload && asset.pending_upload_kind === 'copy' ? `<button type="button" class="asset-undo-copy" onclick="undoPendingCopyClick(event, '${escapeHtml(asset.id || '')}', '${escapeHtml(asset.current_position || '')}', '${escapeHtml(asset.copy_source_media_id || '')}', '${escapeHtml(asset.sku || '')}')">No longer copy</button>` : ''}
         <div class="asset-actions">
           <a href="${escapeHtml(openLink)}" target="_blank" rel="noopener">Open</a>
@@ -7412,6 +7607,15 @@ function activePhotoOffsetX(photoId) {
   return Math.max(0, Math.min(maxOff, Number(overrides[photoId] || 0)));
 }
 
+
+function prepModeOutputSize(mode) {
+  const m = String(mode || '');
+  if (m === 'crop_2200' || m === 'pad_tb_2200') return '3000x2200';
+  if (m === 'crop_square') return '2000x2000';
+  if (m === 'crop_swatch') return '163x163';
+  return '3000x1688';
+}
+
 function renderPhotoPrepDrawer() {
   const active = currentActivePhoto();
   if (!active) return '';
@@ -7431,16 +7635,17 @@ function renderPhotoPrepDrawer() {
       </div>
       <div class="photo-prep-controls">
         <div class="photo-prep-toolbar">
+          <div class="photo-prep-note"><strong>Output size:</strong> ${escapeHtml(prepModeOutputSize(mode))}</div>
           <div class="photo-prep-left">
             <div class="photo-prep-options">
-              <label><input type="checkbox" ${state.photography.prep.flip ? 'checked' : ''} onchange="setPrepFlip(this.checked)" /> Flip horizontally</label>
-              <label><input type="radio" name="prepMode" value="crop_1688" ${mode==='crop_1688'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x1688</label>
-              <label><input type="radio" name="prepMode" value="crop_2200" ${mode==='crop_2200'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x2200</label>
-              <label><input type="radio" name="prepMode" value="crop_remove_sides_1688" ${mode==='crop_remove_sides_1688'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x1688 and remove sides</label>
-              <label><input type="radio" name="prepMode" value="pad_lr_1688" ${mode==='pad_lr_1688'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white sides</label>
-              <label><input type="radio" name="prepMode" value="pad_tb_2200" ${mode==='pad_tb_2200'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white top/bottom</label>
-              <label><input type="radio" name="prepMode" value="crop_square" ${mode==='crop_square'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to largest square</label>
-              <label><input type="radio" name="prepMode" value="crop_swatch" ${mode==='crop_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Crop swatch</label>
+              <label title="Mirrors the image left-to-right before any crop or padding is applied. Use this to reverse orientation while preserving scale and aspect ratio."><input type="checkbox" ${state.photography.prep.flip ? 'checked' : ''} onchange="setPrepFlip(this.checked)" /> Flip horizontally</label>
+              <label title="Scales the image to cover a 3000x1688 frame and crops away excess area. No white padding is added."><input type="radio" name="prepMode" value="crop_1688" ${mode==='crop_1688'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x1688</label>
+              <label title="Scales the image to cover a 3000x2200 frame and crops away excess area. Good when you need a taller canvas with no padding."><input type="radio" name="prepMode" value="crop_2200" ${mode==='crop_2200'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x2200</label>
+              <label title="Resizes proportionally to 1688 px tall, then trims equal amounts from the left and right to land at 3000 px wide."><input type="radio" name="prepMode" value="crop_remove_sides_1688" ${mode==='crop_remove_sides_1688'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x1688 and remove sides</label>
+              <label title="Fits the full image inside a 3000x1688 canvas without cropping and fills the leftover side space with white."><input type="radio" name="prepMode" value="pad_lr_1688" ${mode==='pad_lr_1688'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white sides</label>
+              <label title="Fits the full image inside a 3000x2200 canvas without cropping and fills the leftover top and bottom space with white."><input type="radio" name="prepMode" value="pad_tb_2200" ${mode==='pad_tb_2200'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white top/bottom</label>
+              <label title="Takes the largest possible square crop from the source image and preserves only that square area."><input type="radio" name="prepMode" value="crop_square" ${mode==='crop_square'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to largest square</label>
+              <label title="Uses the square-crop workflow, then outputs a final swatch image at 163x163 pixels."><input type="radio" name="prepMode" value="crop_swatch" ${mode==='crop_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Crop swatch</label>
             </div>
             ${((mode === 'crop_1688' || mode === 'crop_2200' || mode === 'crop_square' || mode === 'crop_swatch')) ? `<div class="photo-prep-focusbox">
               ${(mode === 'crop_square' || mode === 'crop_swatch') ? `<div class="photo-focus-pad" aria-label="Square crop nudger">
@@ -7536,6 +7741,40 @@ function modifyBoardAsset(event, assetId) {
   state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
   renderPhotographyPanel();
   refreshPhotoPreview();
+}
+
+
+function findAssetAndRowById(assetId) {
+  if (!state.board || !assetId) return {asset:null,row:null};
+  for (const section of state.board.color_sections || []) {
+    for (const row of section.rows || []) {
+      const asset = (row.assets || []).find(a => String(a.id || '') === String(assetId || ''));
+      if (asset) return {asset, row};
+    }
+  }
+  return {asset:null,row:null};
+}
+
+async function queueDeliverableFix(event, assetId) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  const found = findAssetAndRowById(assetId);
+  if (!found.asset || !found.row) return;
+  try {
+    const resp = await fetch('/api/queue_deliverable_fix', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({asset_id: assetId || ''})
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not queue Deliverable fix');
+    state.board = data.board || state.board;
+    state.summary = data.summary || state.summary;
+    markAssetModeDirtyRows(data.dirty_row_ids || [found.row.row_id || found.row.id]);
+    renderBoard();
+    if (data.notice && (data.notice.text || data.notice.html)) addAppNotice(data.notice.text || '', data.notice.kind || 'success', data.notice.html || '');
+  } catch (err) {
+    alert(err.message || String(err));
+  }
 }
 
 function normalizePsaImageTypeChoice(value) {
@@ -8104,6 +8343,26 @@ function rowRequiresWallArtSizing(row) {
   return WALL_ART_SIZING_STEP_PATHS.has(stepPath);
 }
 
+function expectedDeliverableForAsset(asset) {
+  if (!asset) return '';
+  const lane = String(asset.lane || '').trim();
+  const slot = String(asset.slot_key || '').trim();
+  if (!lane || lane === 'off_pattern' || lane === 'trash') return '';
+  if (lane === 'core') return 'Product_Image_Carousel';
+  if (lane === 'swatch_detail') return 'Product_Swatch_Detail_Image';
+  if (lane === 'grid' && slot === 'SKU_grid') return 'Product_Grid_Image';
+  if (lane === 'special' && slot === 'SKU_dimension') return 'DimensionsDiagram';
+  if (lane === 'special' && slot === 'SKU_swatch') return 'Product_Swatch_Image';
+  return '';
+}
+
+function assetHasWrongDeliverable(asset) {
+  const expected = expectedDeliverableForAsset(asset);
+  if (!expected) return false;
+  const current = String(asset.deliverable_override || asset.deliverable || '').trim();
+  return current !== expected;
+}
+
 function computeClientChallengeIssueCount() {
   if (!state.board) return 0;
   let total = 0;
@@ -8126,6 +8385,7 @@ function computeClientChallengeIssueCount() {
         dupCounts[key] = (dupCounts[key] || 0) + 1;
       }
       const hasDuplicate = Object.values(dupCounts).some(v => Number(v || 0) > 1);
+      const wrongDeliverableCount = liveAssets.filter(a => assetHasWrongDeliverable(a)).length;
       if (!hasGrid) total += 1;
       if (!has100) total += 1;
       if (rowRequiresSwatch(row) && !hasSwatch) total += 1;
@@ -8133,6 +8393,7 @@ function computeClientChallengeIssueCount() {
       if (!hasDimension && row.set_dim_compile_ready) total += 1;
       if (offPatternAssets.length) total += 1;
       if (hasDuplicate) total += 1;
+      total += wrongDeliverableCount;
       const sizeWarnings = (row.assets || []).filter(a => !a.is_marked_for_deletion && (!!a.has_size_warning || !!String(a.size_warning || '').trim())).length;
       total += sizeWarnings;
     }
@@ -8151,7 +8412,7 @@ function renderChallengeIssuePill() {
   }
   const clientCount = computeClientChallengeIssueCount();
   const backendCount = Number((((state.game || {}).current || {}).issue_total) || ((((state.game || {}).current || {}).issues || {}).total) || 0);
-  const count = Math.max(clientCount, backendCount);
+  const count = state.board ? clientCount : backendCount;
   pill.style.display = 'inline-flex';
   pill.classList.toggle('good', count === 0);
   pill.textContent = `${count} issue${count === 1 ? '' : 's'} remaining`;
@@ -8169,6 +8430,7 @@ function computeMissingNotices() {
   let firstCompilableSetDim = null;
   let firstOffPattern = null;
   let firstDuplicateSlot = null;
+  let firstWrongDeliverable = null;
 
   for (const section of state.board.color_sections || []) {
     for (const row of section.rows || []) {
@@ -8191,6 +8453,7 @@ function computeMissingNotices() {
         dupCounts[key] = (dupCounts[key] || 0) + 1;
       }
       const duplicateSlotKey = Object.keys(dupCounts).find(key => dupCounts[key] > 1) || '';
+      const firstWrongDeliverableAsset = liveAssets.find(a => assetHasWrongDeliverable(a));
 
       if (!hasGrid && !firstMissingGrid) firstMissingGrid = {rowId: row.row_id, color: section.color, slot: 'SKU_grid'};
       if (!has100 && !firstMissing100) firstMissing100 = {rowId: row.row_id, color: section.color, slot: 'SKU_100'};
@@ -8208,6 +8471,9 @@ function computeMissingNotices() {
       if (duplicateSlotKey && !firstDuplicateSlot) {
         firstDuplicateSlot = {rowId: row.row_id, color: section.color, slot: normalizeJumpSlotKey(duplicateSlotKey)};
       }
+      if (firstWrongDeliverableAsset && !firstWrongDeliverable) {
+        firstWrongDeliverable = {rowId: row.row_id, color: section.color, slot: normalizeJumpSlotKey(firstWrongDeliverableAsset.slot_key || firstWrongDeliverableAsset.current_position || '', row.row_id)};
+      }
     }
   }
 
@@ -8220,6 +8486,7 @@ function computeMissingNotices() {
   if (firstCompilableSetDim) notices.push({id:'missing-set-dim', kind:'notice', text:'Missing set dim: Jump to the first active SKU where a set dim could be compiled.', rowId:firstCompilableSetDim.rowId, color:firstCompilableSetDim.color, slot:firstCompilableSetDim.slot});
   if (firstOffPattern) notices.push({id:'off-pattern', kind:'notice', text:'Off-pattern assets found: Jump to the first active SKU with off-pattern assets.', rowId:firstOffPattern.rowId, color:firstOffPattern.color, slot:firstOffPattern.slot});
   if (firstDuplicateSlot) notices.push({id:'duplicate-slot', kind:'notice', text:'Duplicate-slot assets found: Jump to the first active SKU with multiple assets sharing a slot.', rowId:firstDuplicateSlot.rowId, color:firstDuplicateSlot.color, slot:firstDuplicateSlot.slot});
+  if (firstWrongDeliverable) notices.push({id:'wrong-deliverable', kind:'notice', text:'Wrong deliverable for lane: Jump to the first active SKU with an asset whose Deliverable does not match its lane.', rowId:firstWrongDeliverable.rowId, color:firstWrongDeliverable.color, slot:firstWrongDeliverable.slot});
   return notices;
 }
 
@@ -8873,36 +9140,47 @@ async function launchCollection(optionIdOverride=null, options={}) {
 }
 
 
-async function waitThenPollForRefresh() {
+async function waitThenPollForRefresh(commitSummary=null) {
   const token = Date.now();
   state.waitFlow.activeToken = token;
-  const baseline = state.waitFlow.baselineFingerprint || boardFingerprint(state.board);
+  const priorCollapsed = {...(state.collapsedColors || {})};
+  const boardMain = document.getElementById('boardMain');
+  const priorScrollTop = boardMain ? boardMain.scrollTop : 0;
+  const successCount = Number((commitSummary && commitSummary.success_count) || 0);
+  const failureCount = Number((commitSummary && commitSummary.failure_count) || 0);
+  if (successCount <= 0 && failureCount <= 0) {
+    setWaitOverlay(false, '');
+    addAppNotice('No queued metadata changes were sent to Bynder.', 'notice');
+    closeIdleModal();
+    return false;
+  }
   setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed metadata...');
   await delay(30000);
   if (state.waitFlow.activeToken !== token) return false;
 
-  let attempts = 0;
-  const maxAttempts = 18; // about 90 seconds at 5-second intervals
-  while (attempts < maxAttempts) {
-    attempts += 1;
-    setWaitOverlay(true, `Checking Bynder for refreshed metadata... Attempt ${attempts} of ${maxAttempts}.`);
-    const result = await launchCollection(state.loadedCollectionOptionId, {
-      silent: true,
-      flashReload: true,
-      scrollTopAfter: true,
-    });
-    if (state.waitFlow.activeToken !== token) return false;
-    const current = boardFingerprint(state.board);
-    if (current && current !== baseline) {
-      setWaitOverlay(false, '');
-      addAppNotice('Board refreshed from Bynder.', 'success');
-      closeIdleModal();
-      return true;
-    }
-    await delay(5000);
-  }
+  setWaitOverlay(true, 'Loading refreshed board from Bynder...');
+  const resp = await fetch('/api/load_collection', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({option_id: state.loadedCollectionOptionId, force_refresh: true, game_mode: false})
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (state.waitFlow.activeToken !== token) return false;
   setWaitOverlay(false, '');
-  addAppNotice('Updates went through, but refreshed metadata is still taking a while to show. Use Reload From Bynder again in a moment.', 'notice');
+  if (resp.ok && data && data.board) {
+    applyBoardResponse(data, {keepPhotography:true, keepNotices:true});
+    state.collapsedColors = priorCollapsed;
+    renderBoard();
+    requestAnimationFrame(() => {
+      const boardMainNow = document.getElementById('boardMain');
+      if (boardMainNow) boardMainNow.scrollTop = priorScrollTop;
+    });
+    addAppNotice('Board refreshed from Bynder.', 'success');
+    closeIdleModal();
+    return true;
+  }
+  addAppNotice('Updates went through, but the refreshed board is not ready yet. Use Reload From Bynder again in a moment.', 'notice');
+  closeIdleModal();
   return false;
 }
 
@@ -8984,6 +9262,7 @@ async function commitChanges(skipConfirm=false) {
   const btn = document.getElementById('commitBtn');
   btn.disabled = true;
   btn.textContent = 'Updating...';
+  state.commitInFlight = true;
   try {
     state.waitFlow.baselineFingerprint = boardFingerprint(state.board);
     const resp = await fetch('/api/commit', {method: 'POST'});
@@ -8996,7 +9275,7 @@ async function commitChanges(skipConfirm=false) {
         await waitThenPollForChallengeRefresh();
       } else {
         addAppNotice(`Beautiful. ${c.success_count} change(s) went through. Waiting a bit before reloading from Bynder. A log was saved to ${c.log_path}.`, 'success');
-        await waitThenPollForRefresh();
+        await waitThenPollForRefresh(c);
       }
       return true;
     } else {
@@ -9009,6 +9288,8 @@ async function commitChanges(skipConfirm=false) {
     alert(err.message || String(err));
     return false;
   } finally {
+    state.commitInFlight = false;
+    if (state.waitFlow) state.waitFlow.activeToken = null;
     btn.disabled = false;
     btn.textContent = 'Update in Bynder';
   }
