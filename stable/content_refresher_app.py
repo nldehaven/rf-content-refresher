@@ -11,6 +11,10 @@ import time
 import uuid
 import webbrowser
 import getpass
+import socket
+import subprocess
+import signal
+import sys
 from collections import defaultdict
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -36,7 +40,7 @@ BYNDER_TOKEN_PATH = os.environ.get(
     r"C:\bynderAPI\byndercredentials_permanenttoken.json",
 )
 
-APP_VERSION = "dev13"
+APP_VERSION = "dev62"
 
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
@@ -121,6 +125,7 @@ GAME_QUEUE_TARGET = 10
 GAME_SCAN_BATCH = 14
 GAME_SCAN_MIN_GAP_SECONDS = 8
 GAME_LEADERBOARD_WEBHOOK_URL = os.environ.get("CONTENT_REFRESHER_LEADERBOARD_WEBHOOK_URL", "")
+GAME_SERVER_QUEUE_WORKER_INTERVAL_SECONDS = 5.0
 RECENT_POSITION_OVERRIDE_TTL_SECONDS = 72 * 60 * 60
 
 PHOTO_WATERMARK_ALPHA = 0.46
@@ -1019,6 +1024,33 @@ def get_square_crop_bounds(src_w: int, src_h: int, offset_x: int | float | None 
     return (left, top, left + side, top + side)
 
 
+def get_swatch_crop_bounds(
+    src_w: int,
+    src_h: int,
+    offset_x: int | float | None = None,
+    offset_y: int | float | None = None,
+    crop_w: int = 163,
+    crop_h: int = 163,
+) -> tuple[int, int, int, int]:
+    if not src_w or not src_h:
+        return (0, 0, 1, 1)
+    crop_w = max(1, min(int(crop_w), src_w))
+    crop_h = max(1, min(int(crop_h), src_h))
+    max_off_x = max(0, src_w - crop_w)
+    max_off_y = max(0, src_h - crop_h)
+    if offset_x is None:
+        left = max_off_x // 2
+    else:
+        left = int(round(float(offset_x)))
+    if offset_y is None:
+        top = max_off_y // 2
+    else:
+        top = int(round(float(offset_y)))
+    left = int(clamp(left, 0, max_off_x))
+    top = int(clamp(top, 0, max_off_y))
+    return (left, top, left + crop_w, top + crop_h)
+
+
 def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offset_y: int | float | None = None, offset_x: int | float | None = None) -> Image.Image:
     mode = string_value(mode) or "crop_1688"
     out_w, out_h = prep_mode_to_size(mode)
@@ -1027,10 +1059,17 @@ def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offs
         im = ImageOps.mirror(im)
     src_w, src_h = im.size
 
-    if mode in ("crop_square", "crop_swatch"):
+    if mode == "crop_square":
         bounds = get_square_crop_bounds(src_w, src_h, offset_x)
         square = im.crop(bounds)
         return square.resize((out_w, out_h), Image.LANCZOS)
+
+    if mode == "crop_swatch":
+        bounds = get_swatch_crop_bounds(src_w, src_h, offset_x, offset_y, out_w, out_h)
+        swatch = im.crop(bounds)
+        if swatch.size != (out_w, out_h):
+            swatch = swatch.resize((out_w, out_h), Image.LANCZOS)
+        return swatch
 
     if mode in ("crop_1688", "crop_2200"):
         scaled_h = int(round(src_h * (out_w / src_w)))
@@ -1087,7 +1126,7 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
         im = ImageOps.mirror(im)
     src_w, src_h = im.size
 
-    if mode in ("crop_square", "crop_swatch"):
+    if mode == "crop_square":
         base = im.convert("RGBA")
         left, top, right, bottom = get_square_crop_bounds(src_w, src_h, offset_x)
         overlay = base.copy()
@@ -1097,6 +1136,28 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
             haze_draw.rectangle((0, 0, left, src_h), fill=(115, 115, 115, 125))
         if right < src_w:
             haze_draw.rectangle((right, 0, src_w, src_h), fill=(115, 115, 115, 125))
+        overlay = Image.alpha_composite(overlay, haze)
+        draw = ImageDraw.Draw(overlay, "RGBA")
+        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=(255,255,255,235), width=4)
+        scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
+        prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
+        preview = overlay.resize(prev_size, Image.LANCZOS)
+        return preview.convert("RGB")
+
+    if mode == "crop_swatch":
+        base = im.convert("RGBA")
+        left, top, right, bottom = get_swatch_crop_bounds(src_w, src_h, offset_x, offset_y, out_w, out_h)
+        overlay = base.copy()
+        haze = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+        haze_draw = ImageDraw.Draw(haze, "RGBA")
+        if left > 0:
+            haze_draw.rectangle((0, 0, left, src_h), fill=(115, 115, 115, 125))
+        if right < src_w:
+            haze_draw.rectangle((right, 0, src_w, src_h), fill=(115, 115, 115, 125))
+        if top > 0:
+            haze_draw.rectangle((left, 0, right, top), fill=(115, 115, 115, 125))
+        if bottom < src_h:
+            haze_draw.rectangle((left, bottom, right, src_h), fill=(115, 115, 115, 125))
         overlay = Image.alpha_composite(overlay, haze)
         draw = ImageDraw.Draw(overlay, "RGBA")
         draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=(255,255,255,235), width=4)
@@ -4061,6 +4122,25 @@ def maybe_start_game_queue_fill(force: bool = False) -> None:
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def start_server_side_game_queue_worker() -> None:
+    game = STATE["game"]
+    if game.get("server_queue_worker_started"):
+        return
+    game["server_queue_worker_started"] = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                # Keep a lightweight candidate bank topped up on the server side so
+                # browser timer throttling or idle gating on macOS cannot starve the queue.
+                maybe_start_game_queue_fill(force=False)
+            except Exception as exc:
+                log_message(f"Server-side game queue worker error: {exc}")
+            time.sleep(GAME_SERVER_QUEUE_WORKER_INTERVAL_SECONDS)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def hydrate_game_candidate(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     collection = deepcopy(candidate.get("collection") or {})
     color_name = string_value(candidate.get("color"))
@@ -4548,8 +4628,9 @@ def api_photo_prep_download() -> Response:
             media_id = string_value(item.get("media_id"))
             name = string_value(item.get("name")) or media_id
             offset_y = item.get("offset_y")
+            offset_x = item.get("offset_x")
             img = open_image_from_media(session, media_id)
-            result = prepare_photo_result(img, mode, flip, offset_y)
+            result = prepare_photo_result(img, mode, flip, offset_y, offset_x)
             fname = f"{Path(name).stem}_{out_w}x{out_h}{'_flip' if flip else ''}.jpg"
             return send_file(BytesIO(image_to_jpg_bytes(result)), mimetype="image/jpeg", as_attachment=True, download_name=fname)
         bio = BytesIO()
@@ -4558,8 +4639,9 @@ def api_photo_prep_download() -> Response:
                 media_id = string_value(item.get("media_id"))
                 name = string_value(item.get("name")) or media_id
                 offset_y = item.get("offset_y")
+                offset_x = item.get("offset_x")
                 img = open_image_from_media(session, media_id)
-                result = prepare_photo_result(img, mode, flip, offset_y)
+                result = prepare_photo_result(img, mode, flip, offset_y, offset_x)
                 fname = f"{Path(name).stem}_{out_w}x{out_h}{'_flip' if flip else ''}.jpg"
                 zf.writestr(fname, image_to_jpg_bytes(result))
         bio.seek(0)
@@ -5283,7 +5365,10 @@ INDEX_HTML = r'''
   .mode-option input { accent-color: var(--rf-purple); }
   .mode-banner { display:none; }
   .notifications-panel { padding: 12px; min-width: 0; }
-  .notifications-panel .panel-title { font-size: 12px; font-weight: 800; letter-spacing: .04em; color: var(--rf-navy); text-transform: uppercase; margin: 0 0 8px 0; }
+  .notifications-header { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 8px 0; }
+  .notifications-panel .panel-title { font-size: 12px; font-weight: 800; letter-spacing: .04em; color: var(--rf-navy); text-transform: uppercase; margin: 0; }
+  .notifications-clear-btn { width:28px; height:28px; padding:0; border-radius:999px; display:inline-flex; align-items:center; justify-content:center; font-size:14px; line-height:1; }
+  .notifications-clear-btn[disabled] { opacity:.45; cursor:not-allowed; }
   .notifications-panel .top-notices { margin: 0; }
   .notifications-empty { padding: 10px 12px; border-radius: 12px; background: #faf7ff; border: 1px dashed var(--rf-border); color: #6d5a77; font-size: 13px; overflow-wrap:anywhere; }
 
@@ -6256,7 +6341,10 @@ INDEX_HTML = r'''
       </div>
 
     <div class="panel notifications-panel">
-      <div class="panel-title">Notifications</div>
+      <div class="notifications-header">
+        <div class="panel-title">Notifications</div>
+        <button type="button" class="btn btn-secondary notifications-clear-btn" id="clearNotificationsBtn" title="Clear dismissible notifications" aria-label="Clear dismissible notifications">&#129529;</button>
+      </div>
       <div id="boardNotifications"><div class="notifications-empty">No collection notifications yet.</div></div>
     </div>
 
@@ -6383,7 +6471,7 @@ const state = {
     activeSkuSet: [],
     selectedIds: [],
     activeId: '',
-    prep: { flip: false, mode: 'crop_1688', offsetYOverrides: {} },
+    prep: { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} },
     previewUrl: '',
     hideFpo: false,
     hideReviewed: false,
@@ -7583,10 +7671,16 @@ function activePhotoOffsetY(photoId) {
   if (!active) return 0;
   const overrides = state.photography.prep.offsetYOverrides || {};
   const mode = prepModeFromState();
-  const outH = mode === 'crop_2200' ? 2200 : 1688;
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH || !mode.startsWith('crop_') || mode === 'crop_square') return 0;
+  if (mode === 'crop_swatch') {
+    const cropH = Math.min(163, srcH);
+    const maxOff = Math.max(0, srcH - cropH);
+    if (overrides[photoId] === undefined || overrides[photoId] === null) return Math.round(maxOff / 2);
+    return Math.max(0, Math.min(maxOff, Number(overrides[photoId] || 0)));
+  }
+  const outH = mode === 'crop_2200' ? 2200 : 1688;
   const scaledH = Math.round(srcH * (3000 / srcW));
   const maxOff = Math.max(0, scaledH - outH);
   if (overrides[photoId] === undefined || overrides[photoId] === null) return Math.round(maxOff / 2);
@@ -7601,6 +7695,12 @@ function activePhotoOffsetX(photoId) {
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH || (mode !== 'crop_square' && mode !== 'crop_swatch')) return 0;
+  if (mode === 'crop_swatch') {
+    const cropW = Math.min(163, srcW);
+    const maxOff = Math.max(0, srcW - cropW);
+    if (overrides[photoId] === undefined || overrides[photoId] === null) return Math.round(maxOff / 2);
+    return Math.max(0, Math.min(maxOff, Number(overrides[photoId] || 0)));
+  }
   const side = Math.min(srcW, srcH);
   const maxOff = Math.max(0, srcW - side);
   if (overrides[photoId] === undefined || overrides[photoId] === null) return Math.round(maxOff / 2);
@@ -7645,10 +7745,10 @@ function renderPhotoPrepDrawer() {
               <label title="Fits the full image inside a 3000x1688 canvas without cropping and fills the leftover side space with white."><input type="radio" name="prepMode" value="pad_lr_1688" ${mode==='pad_lr_1688'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white sides</label>
               <label title="Fits the full image inside a 3000x2200 canvas without cropping and fills the leftover top and bottom space with white."><input type="radio" name="prepMode" value="pad_tb_2200" ${mode==='pad_tb_2200'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white top/bottom</label>
               <label title="Takes the largest possible square crop from the source image and preserves only that square area."><input type="radio" name="prepMode" value="crop_square" ${mode==='crop_square'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to largest square</label>
-              <label title="Uses the square-crop workflow, then outputs a final swatch image at 163x163 pixels."><input type="radio" name="prepMode" value="crop_swatch" ${mode==='crop_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Crop swatch</label>
+              <label title="Places a true 163x163 crop box on the source image so you can move it around and output a final 163x163 swatch."><input type="radio" name="prepMode" value="crop_swatch" ${mode==='crop_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Pick swatch</label>
             </div>
             ${((mode === 'crop_1688' || mode === 'crop_2200' || mode === 'crop_square' || mode === 'crop_swatch')) ? `<div class="photo-prep-focusbox">
-              ${(mode === 'crop_square' || mode === 'crop_swatch') ? `<div class="photo-focus-pad" aria-label="Square crop nudger">
+              ${mode === 'crop_square' ? `<div class="photo-focus-pad" aria-label="Square crop nudger">
                 <button type="button" onclick="setCropToLeft()" title="Jump crop all the way left">&#8678;</button>
                 <button type="button" onclick="nudgeCropX(-1)" title="Move crop left">&#11164;</button>
                 <button type="button" onclick="nudgeCropX(1)" title="Move crop right">&#11166;</button>
@@ -7657,6 +7757,20 @@ function renderPhotoPrepDrawer() {
               <div class="photo-focus-meta">
                 <span class="photo-prep-note">Use the left and right arrows to move the square crop box.</span>
                 <span class="photo-prep-note">Jump buttons move it all the way left or right.</span>
+                <span class="photo-prep-note">Click Add as new version to apply your modified image to this asset.</span>
+              </div>` : mode === 'crop_swatch' ? `<div class="photo-focus-pad" aria-label="Swatch crop nudger">
+                <button type="button" onclick="setSwatchCropToTop()" title="Jump swatch to top">&#8679;</button>
+                <button type="button" onclick="setCropToLeft()" title="Jump swatch all the way left">&#8678;</button>
+                <button type="button" onclick="nudgeCropY(-1)" title="Move swatch up">&#8593;</button>
+                <button type="button" onclick="nudgeCropX(-1)" title="Move swatch left">&#11164;</button>
+                <button type="button" onclick="nudgeCropX(1)" title="Move swatch right">&#11166;</button>
+                <button type="button" onclick="nudgeCropY(1)" title="Move swatch down">&#8595;</button>
+                <button type="button" onclick="setCropToRight()" title="Jump swatch all the way right">&#8680;</button>
+                <button type="button" onclick="setSwatchCropToBottom()" title="Jump swatch to bottom">&#8681;</button>
+              </div>
+              <div class="photo-focus-meta">
+                <span class="photo-prep-note">Use the arrows to move the 163x163 swatch crop box.</span>
+                <span class="photo-prep-note">Jump buttons snap it to each edge.</span>
                 <span class="photo-prep-note">Click Add as new version to apply your modified image to this asset.</span>
               </div>` : `<div class="photo-focus-pad" aria-label="Crop nudger">
                 <button type="button" onclick="setCropToTop()" title="Jump crop to top">&#8679;</button>
@@ -7952,10 +8066,13 @@ function cropStepYForActive() {
   const active = currentActivePhoto();
   if (!active) return 100;
   const mode = prepModeFromState();
-  const outH = mode === 'crop_2200' ? 2200 : 1688;
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return 100;
+  if (mode === 'crop_swatch') {
+    return Math.max(10, Math.round(Math.max(0, srcH - Math.min(163, srcH)) * 0.08) || 24);
+  }
+  const outH = mode === 'crop_2200' ? 2200 : 1688;
   const scaledH = Math.round(srcH * (3000 / srcW));
   return Math.max(40, Math.round(Math.max(0, scaledH - outH) * 0.1) || 80);
 }
@@ -7963,11 +8080,20 @@ function nudgeCropY(direction) {
   const active = currentActivePhoto();
   if (!active) return;
   const mode = prepModeFromState();
-  if (!(mode === 'crop_1688' || mode === 'crop_2200')) return;
-  const outH = mode === 'crop_2200' ? 2200 : 1688;
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return;
+  if (mode === 'crop_swatch') {
+    const cropH = Math.min(163, srcH);
+    const maxOff = Math.max(0, srcH - cropH);
+    const current = activePhotoOffsetY(active.id);
+    const next = Math.max(0, Math.min(maxOff, current + (Number(direction || 0) * cropStepYForActive())));
+    state.photography.prep.offsetYOverrides[active.id] = next;
+    refreshPhotoPreview();
+    return;
+  }
+  if (!(mode === 'crop_1688' || mode === 'crop_2200')) return;
+  const outH = mode === 'crop_2200' ? 2200 : 1688;
   const scaledH = Math.round(srcH * (3000 / srcW));
   const maxOff = Math.max(0, scaledH - outH);
   const current = activePhotoOffsetY(active.id);
@@ -7976,13 +8102,18 @@ function nudgeCropY(direction) {
   refreshPhotoPreview();
 }
 function setCropToTop() { const active = currentActivePhoto(); if (!active) return; state.photography.prep.offsetYOverrides[active.id] = 0; refreshPhotoPreview(); }
-function setCropToBottom() { const active = currentActivePhoto(); if (!active) return; const mode = prepModeFromState(); const outH = mode === 'crop_2200' ? 2200 : 1688; const srcW = Number(active.width || 0) || 0; const srcH = Number(active.height || 0) || 0; if (!srcW || !srcH) return; const scaledH = Math.round(srcH * (3000 / srcW)); state.photography.prep.offsetYOverrides[active.id] = Math.max(0, scaledH - outH); refreshPhotoPreview(); }
+function setCropToBottom() { const active = currentActivePhoto(); if (!active) return; const mode = prepModeFromState(); const srcW = Number(active.width || 0) || 0; const srcH = Number(active.height || 0) || 0; if (!srcW || !srcH) return; if (mode === 'crop_swatch') { state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); refreshPhotoPreview(); return; } const outH = mode === 'crop_2200' ? 2200 : 1688; const scaledH = Math.round(srcH * (3000 / srcW)); state.photography.prep.offsetYOverrides[active.id] = Math.max(0, scaledH - outH); refreshPhotoPreview(); }
+function setSwatchCropToTop() { const active = currentActivePhoto(); if (!active) return; state.photography.prep.offsetYOverrides[active.id] = 0; refreshPhotoPreview(); }
+function setSwatchCropToBottom() { const active = currentActivePhoto(); if (!active) return; const srcH = Number(active.height || 0) || 0; if (!srcH) return; state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); refreshPhotoPreview(); }
 function cropStepXForActive() {
   const active = currentActivePhoto();
   if (!active) return 100;
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return 100;
+  if (prepModeFromState() === 'crop_swatch') {
+    return Math.max(10, Math.round(Math.max(0, srcW - Math.min(163, srcW)) * 0.08) || 24);
+  }
   const side = Math.min(srcW, srcH);
   return Math.max(40, Math.round(Math.max(0, srcW - side) * 0.1) || 80);
 }
@@ -7993,8 +8124,10 @@ function nudgeCropX(direction) {
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return;
-  const side = Math.min(srcW, srcH);
-  const maxOff = Math.max(0, srcW - side);
+  const mode = prepModeFromState();
+  const maxOff = mode === 'crop_swatch'
+    ? Math.max(0, srcW - Math.min(163, srcW))
+    : Math.max(0, srcW - Math.min(srcW, srcH));
   const current = activePhotoOffsetX(active.id);
   const next = Math.max(0, Math.min(maxOff, current + (Number(direction || 0) * cropStepXForActive())));
   state.photography.prep.offsetXOverrides[active.id] = next;
@@ -8012,9 +8145,39 @@ function setCropToRight() {
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return;
-  const side = Math.min(srcW, srcH);
-  state.photography.prep.offsetXOverrides[active.id] = Math.max(0, srcW - side);
+  const mode = prepModeFromState();
+  const maxOff = mode === 'crop_swatch'
+    ? Math.max(0, srcW - Math.min(163, srcW))
+    : Math.max(0, srcW - Math.min(srcW, srcH));
+  state.photography.prep.offsetXOverrides[active.id] = maxOff;
   refreshPhotoPreview();
+}
+
+function handlePhotoPrepArrowKeys(event) {
+  if (!state.photography || !state.photography.activeId) return;
+  const target = event.target;
+  if (target) {
+    const tag = String(target.tagName || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return;
+  }
+  const mode = prepModeFromState();
+  if (!mode) return;
+  if (mode === 'crop_swatch') {
+    if (event.key === 'ArrowLeft') { event.preventDefault(); nudgeCropX(-1); return; }
+    if (event.key === 'ArrowRight') { event.preventDefault(); nudgeCropX(1); return; }
+    if (event.key === 'ArrowUp') { event.preventDefault(); nudgeCropY(-1); return; }
+    if (event.key === 'ArrowDown') { event.preventDefault(); nudgeCropY(1); return; }
+    return;
+  }
+  if (mode === 'crop_square') {
+    if (event.key === 'ArrowLeft') { event.preventDefault(); nudgeCropX(-1); return; }
+    if (event.key === 'ArrowRight') { event.preventDefault(); nudgeCropX(1); return; }
+    return;
+  }
+  if (mode === 'crop_1688' || mode === 'crop_2200') {
+    if (event.key === 'ArrowUp') { event.preventDefault(); nudgeCropY(-1); return; }
+    if (event.key === 'ArrowDown') { event.preventDefault(); nudgeCropY(1); return; }
+  }
 }
 function currentPreparedPreviewPayload() {
   const active = currentActivePhoto();
@@ -8507,15 +8670,24 @@ function normalizeJumpSlotKey(slotKey, rowId='') {
   return key;
 }
 
+function clearDismissibleNotifications() {
+  state.appNotices = (state.appNotices || []).filter(n => !n.dismissible);
+  renderNotifications();
+}
+
 function renderNotifications() {
   const host = document.getElementById('boardNotifications');
+  const clearBtn = document.getElementById('clearNotificationsBtn');
   renderCollectionStatus();
   const notices = [
     ...computeMissingNotices(),
     ...((state.appNotices || []).slice().reverse())
   ];
+  const dismissibleCount = (state.appNotices || []).filter(n => n.dismissible).length;
+  if (clearBtn) clearBtn.disabled = !dismissibleCount;
   if (!notices.length) {
     host.innerHTML = `<div class="notifications-empty">No collection notifications.</div>`;
+    bindNotificationActions();
     return;
   }
   host.innerHTML = `<div class="panel-notice-wrap">${notices.map(n => `
@@ -8527,6 +8699,15 @@ function renderNotifications() {
 }
 
 function bindNotificationActions() {
+  const clearBtn = document.getElementById('clearNotificationsBtn');
+  if (clearBtn && !clearBtn.dataset.bound) {
+    clearBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      clearDismissibleNotifications();
+    });
+    clearBtn.dataset.bound = '1';
+  }
   document.querySelectorAll('[data-jump-row]').forEach(el => {
     el.addEventListener('click', (event) => {
       if (event.target && event.target.matches('[data-dismiss-notice]')) return;
@@ -9427,6 +9608,7 @@ refreshGameStatus();
 renderGameModesPanel();
 setInterval(() => { if ((Date.now() - Number(state.idle.lastActivityAt || 0)) > 12000) scheduleGameQueueEnsure(); }, 10000);
 window.addEventListener('resize', updateStickyOffsets);
+document.addEventListener('keydown', handlePhotoPrepArrowKeys);
 window.addEventListener('load', updateStickyOffsets);
 loadCollections();
 setTimeout(updateStickyOffsets, 50);
@@ -9440,6 +9622,110 @@ setTimeout(updateStickyOffsets, 300);
 # ============================================================
 # LAUNCHER
 # ============================================================
+def is_port_in_use(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.35)
+            return sock.connect_ex((host, int(port))) == 0
+    except Exception:
+        return False
+
+
+def wait_for_port_state(host: str, port: int, should_be_in_use: bool, timeout_seconds: float = 5.0) -> bool:
+    deadline = time.time() + max(0.1, float(timeout_seconds or 0.1))
+    while time.time() < deadline:
+        in_use = is_port_in_use(host, port)
+        if in_use == should_be_in_use:
+            return True
+        time.sleep(0.2)
+    return is_port_in_use(host, port) == should_be_in_use
+
+
+def find_listening_pids_on_port(port: int) -> list[int]:
+    pids: list[int] = []
+    try:
+        if os.name == 'nt':
+            cmd = ['netstat', '-ano', '-p', 'tcp']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            target = f':{int(port)}'
+            for line in (result.stdout or '').splitlines():
+                line = line.strip()
+                if not line or 'LISTENING' not in line.upper():
+                    continue
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                local_addr = parts[1]
+                state = parts[3].upper() if len(parts) >= 4 else ''
+                pid_text = parts[-1]
+                if not local_addr.endswith(target) or state != 'LISTENING':
+                    continue
+                try:
+                    pid = int(pid_text)
+                except Exception:
+                    continue
+                if pid > 0 and pid != os.getpid():
+                    pids.append(pid)
+        else:
+            cmd = ['lsof', '-nP', f'-iTCP:{int(port)}', '-sTCP:LISTEN', '-t']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            for line in (result.stdout or '').splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pid = int(line)
+                except Exception:
+                    continue
+                if pid > 0 and pid != os.getpid():
+                    pids.append(pid)
+    except Exception as exc:
+        log_message(f'Could not inspect port {port} usage: {exc}')
+    return sorted(set(pids))
+
+
+def terminate_pid(pid: int, force: bool = False) -> None:
+    try:
+        if os.name == 'nt':
+            cmd = ['taskkill', '/PID', str(pid)] + (['/F'] if force else [])
+            subprocess.run(cmd, capture_output=True, text=True, check=False)
+        else:
+            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception as exc:
+        log_message(f'Could not terminate PID {pid}: {exc}')
+
+
+def try_close_existing_instance(host: str, port: int) -> bool:
+    if not is_port_in_use(host, port):
+        return True
+
+    pids = find_listening_pids_on_port(port)
+    if pids:
+        log_message(f'Port {port} is already in use. Attempting to stop existing Content Refresher process(es): {", ".join(str(x) for x in pids)}')
+        for pid in pids:
+            terminate_pid(pid, force=False)
+        if wait_for_port_state(host, port, should_be_in_use=False, timeout_seconds=3.0):
+            log_message(f'Freed port {port} after graceful termination.')
+            return True
+        stubborn = find_listening_pids_on_port(port)
+        for pid in stubborn:
+            terminate_pid(pid, force=True)
+        if wait_for_port_state(host, port, should_be_in_use=False, timeout_seconds=2.5):
+            log_message(f'Freed port {port} after force termination.')
+            return True
+        log_message(f'Port {port} is still busy after termination attempts.')
+        return False
+
+    # Port is busy but we could not identify a PID. On macOS this can happen briefly
+    # while the old process is winding down. Give it a short grace period.
+    log_message(f'Port {port} appears busy, but no listening PID was found. Waiting briefly for it to clear...')
+    if wait_for_port_state(host, port, should_be_in_use=False, timeout_seconds=3.0):
+        return True
+    return False
+
+
 def open_browser_later() -> None:
     if not OPEN_BROWSER_ON_START:
         return
@@ -9450,6 +9736,10 @@ def open_browser_later() -> None:
 
 
 if __name__ == "__main__":
+    if not try_close_existing_instance(HOST, PORT):
+        print(f'Could not free port {PORT}. Please fully close the existing Content Refresher instance and try again.', file=sys.stderr)
+        sys.exit(1)
     log_message("Starting Content Refresher local server.")
+    start_server_side_game_queue_worker()
     open_browser_later()
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
