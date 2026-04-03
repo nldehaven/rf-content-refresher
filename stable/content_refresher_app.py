@@ -40,7 +40,7 @@ BYNDER_TOKEN_PATH = os.environ.get(
     r"C:\bynderAPI\byndercredentials_permanenttoken.json",
 )
 
-APP_VERSION = "dev62"
+APP_VERSION = "dev68"
 
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
@@ -990,7 +990,7 @@ def prep_mode_to_size(mode: str) -> tuple[int, int]:
     mode = string_value(mode)
     if mode == "crop_square":
         return (2000, 2000)
-    if mode == "crop_swatch":
+    if mode in {"crop_swatch", "pick_swatch"}:
         return (163, 163)
     if mode in ("crop_2200", "pad_tb_2200"):
         return (3000, 2200)
@@ -1065,6 +1065,11 @@ def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offs
         return square.resize((out_w, out_h), Image.LANCZOS)
 
     if mode == "crop_swatch":
+        bounds = get_square_crop_bounds(src_w, src_h, offset_x)
+        square = im.crop(bounds)
+        return square.resize((out_w, out_h), Image.LANCZOS)
+
+    if mode == "pick_swatch":
         bounds = get_swatch_crop_bounds(src_w, src_h, offset_x, offset_y, out_w, out_h)
         swatch = im.crop(bounds)
         if swatch.size != (out_w, out_h):
@@ -1145,6 +1150,24 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
         return preview.convert("RGB")
 
     if mode == "crop_swatch":
+        base = im.convert("RGBA")
+        left, top, right, bottom = get_square_crop_bounds(src_w, src_h, offset_x)
+        overlay = base.copy()
+        haze = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+        haze_draw = ImageDraw.Draw(haze, "RGBA")
+        if left > 0:
+            haze_draw.rectangle((0, 0, left, src_h), fill=(115, 115, 115, 125))
+        if right < src_w:
+            haze_draw.rectangle((right, 0, src_w, src_h), fill=(115, 115, 115, 125))
+        overlay = Image.alpha_composite(overlay, haze)
+        draw = ImageDraw.Draw(overlay, "RGBA")
+        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=(255,255,255,235), width=4)
+        scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
+        prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
+        preview = overlay.resize(prev_size, Image.LANCZOS)
+        return preview.convert("RGB")
+
+    if mode == "pick_swatch":
         base = im.convert("RGBA")
         left, top, right, bottom = get_swatch_crop_bounds(src_w, src_h, offset_x, offset_y, out_w, out_h)
         overlay = base.copy()
@@ -4259,6 +4282,95 @@ def api_collections() -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+def find_random_unreviewed_photography_candidate(session: requests.Session, collections: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    pool = list(collections or [])
+    random.shuffle(pool)
+    for collection_option in pool:
+        try:
+            raw_collection_assets = fetch_collection_assets_cached(session, string_value(collection_option.get("id")))
+            by_color: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for asset in raw_collection_assets:
+                if not is_available_product_photography_asset(asset):
+                    continue
+                if photo_asset_is_reviewed_for_site(asset):
+                    continue
+                color_name = string_value(asset.get("property_Product_Color"))
+                if not color_name:
+                    continue
+                by_color[color_name].append(asset)
+            if not by_color:
+                continue
+            color_name = random.choice(list(by_color.keys()))
+            color_assets = by_color.get(color_name) or []
+            random.shuffle(color_assets)
+            sample = color_assets[0] if color_assets else {}
+            return {
+                "collection": deepcopy(collection_option),
+                "color": color_name,
+                "photo_count": len(color_assets),
+                "sample_media_id": string_value(sample.get("id")),
+            }
+        except Exception as exc:
+            log_message(f"Random collection scan skipped {collection_option.get('label')}: {exc}")
+    return None
+
+
+def get_board_matching_skus_for_color(board: Dict[str, Any], color: str) -> List[str]:
+    target = string_value(color)
+    for section in (board or {}).get("color_sections", []):
+        if string_value(section.get("color")) == target:
+            return [string_value(r.get("sku")) for r in section.get("rows", []) if string_value(r.get("sku"))]
+    return []
+
+
+@app.route("/api/launch_random_collection", methods=["POST"])
+def api_launch_random_collection() -> Response:
+    try:
+        collections = ensure_collections_loaded()
+        if not collections:
+            return jsonify({"error": "No Product Collection options are loaded yet."}), 404
+
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        candidate = find_random_unreviewed_photography_candidate(session, collections)
+        if candidate is None:
+            return jsonify({"error": "Could not find a Product Collection with unreviewed available Product Photography."}), 404
+
+        collection_option = deepcopy(candidate.get("collection") or {})
+        color_name = string_value(candidate.get("color"))
+        if not string_value(collection_option.get("id")) or not color_name:
+            return jsonify({"error": "Random launch candidate was incomplete."}), 500
+
+        board = build_board_for_collection(session, collection_option, force_refresh=False)
+        board = filter_board_to_colors(board, [color_name])
+        matching_skus = get_board_matching_skus_for_color(board, color_name)
+        photography_payload = build_photography_payload_for_color(session, collection_option, color_name, matching_skus)
+
+        STATE["board"] = board
+        STATE["baseline_board"] = deepcopy(board)
+        STATE["last_load"] = datetime.now().isoformat()
+        STATE["game"]["active"] = False
+        STATE["game"]["current"] = None
+
+        log_message(f"Launched random collection {collection_option.get('label')} / {color_name} with {len(photography_payload.get('items') or [])} available photography assets.")
+
+        return jsonify({
+            "board": board,
+            "summary": compute_change_summary(board),
+            "game": game_status_payload(),
+            "photography_autoload": photography_payload,
+            "random_launch": {
+                "collection": collection_option,
+                "color": color_name,
+                "photo_count": int(candidate.get("photo_count") or len(photography_payload.get("items") or [])),
+                "sample_media_id": string_value(candidate.get("sample_media_id")),
+            },
+        })
+    except Exception as exc:
+        log_message(f"Random collection launch failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/load_collection", methods=["POST"])
 def api_load_collection() -> Response:
     try:
@@ -6133,6 +6245,15 @@ INDEX_HTML = r'''
   .notifications-panel { overflow:hidden; }
   .inline-link { background:none; border:none; color:inherit; text-decoration:underline; cursor:pointer; font:inherit; padding:0; }
   .hidden { display: none !important; }
+  @media (max-width: 1700px) {
+    .inline-launch-group { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .launch-button-col { grid-column: 1 / -1; padding-top: 0; }
+    .launch-button-stack { grid-template-columns: 1fr; grid-template-rows: auto; }
+    .launcher-lower-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .launcher-random-row { grid-column: 1 / -1; }
+    .collection-status-mount { max-width: 100%; }
+  }
+
   @media (max-width: 1400px) {
     .shell { grid-template-columns: 1fr; }
     .top-shell { grid-template-columns: 1fr; position: static; }
@@ -6149,6 +6270,19 @@ INDEX_HTML = r'''
     gap:12px;
  top: 0; }
     .sticky-board-tools { position: static; }
+    .inline-launch-group { grid-template-columns: 1fr; }
+    .launch-button-col { grid-column: auto; padding-top: 0; }
+    .launch-button-stack { grid-template-columns: 1fr; grid-template-rows: auto; }
+    .launcher-lower-row { grid-template-columns: 1fr; }
+    .launcher-random-row { grid-column: auto; }
+    .collection-status-mount { max-width: none; }
+  }
+
+  @media (max-width: 760px) {
+    .launch-button-stack { grid-template-columns: 1fr; }
+    .launcher-lower-row { align-items:flex-start; }
+    .launcher-checkbox-row .mode-option { white-space:normal; }
+    .collection-status-mount { min-width: 0; max-width: none; }
   }
 
   .inactive-all-badge {
@@ -6192,13 +6326,38 @@ INDEX_HTML = r'''
   }
   .meta-cell.components .v button, .meta-cell.components .v a { margin:2px 4px 2px 0; }
   .asset-undo-copy { margin-top:4px; background:#fff; border:1px solid #9cb8e8; color:#1f5fbf; border-radius:8px; font-size:11px; padding:3px 6px; cursor:pointer; }
-  .inline-launch-group { display:grid; grid-template-columns:minmax(180px,1fr) minmax(180px,1fr) 160px; gap:10px; align-items:start; }
-  .inline-launch-group .btn { width:100%; white-space:normal; line-height:1.12; padding:10px 12px; min-height:48px; display:flex; align-items:center; justify-content:center; text-align:center; overflow-wrap:anywhere; }
-  .launcher-lower-row { display:flex; align-items:center; gap:14px; margin-top:10px; }
-  .launcher-checkbox-row { margin-top:0; flex:0 0 auto; display:flex; align-items:center; }
+  .select-wrap { display:grid; gap:8px; align-content:start; }
+  .inline-launch-group {
+    display:grid;
+    grid-template-columns:minmax(165px,0.95fr) minmax(190px,1.08fr) minmax(152px,170px);
+    gap:10px;
+    align-items:end;
+  }
+  .launch-field { min-width:0; }
+  .launch-field label.small { margin-bottom:5px; }
+  .launch-button-col {
+    min-width:0;
+    display:flex;
+    align-items:flex-end;
+    padding-top:18px;
+  }
+  .inline-launch-group .btn { width:100%; white-space:normal; line-height:1.1; padding:10px 12px; min-height:46px; display:flex; align-items:center; justify-content:center; text-align:center; overflow-wrap:anywhere; }
+  .launch-button-stack { display:grid; grid-template-columns:1fr; grid-template-rows:auto; gap:8px; width:100%; align-self:end; }
+  .launch-button-stack .btn { min-height:46px; }
+  .launch-button-stack .btn.btn-compact { min-height:36px; padding:7px 10px; font-size:13px; }
+  .launcher-lower-row {
+    display:grid;
+    grid-template-columns:minmax(165px,0.95fr) minmax(190px,1.08fr) minmax(152px,170px);
+    align-items:center;
+    gap:10px;
+    margin-top:0;
+  }
+  .launcher-checkbox-row { margin-top:0; display:flex; align-items:center; min-height:0; }
   .launcher-checkbox-row .mode-option { margin:0; white-space:nowrap; }
-  .collection-status-mount { margin-top:0; min-height:0; flex:1 1 auto; }
-  .collection-status-pill { padding:12px 14px; border-radius:14px; border:1px solid #c6d8cf; background:#d8e4dd; color:#2f6b41; font-size:13px; line-height:1.35; font-weight:500; box-shadow: inset 0 1px 0 rgba(255,255,255,.45); }
+  .collection-status-mount { margin-top:0; min-height:0; min-width:0; max-width:none; width:100%; }
+  .collection-status-pill { padding:10px 12px; border-radius:14px; border:1px solid #c6d8cf; background:#d8e4dd; color:#2f6b41; font-size:13px; line-height:1.25; font-weight:500; box-shadow: inset 0 1px 0 rgba(255,255,255,.45); }
+  .launcher-random-row { min-width:0; display:flex; align-items:center; }
+  .launcher-random-row .btn { width:100%; }
   .collection-status-pill.notice { background:#eef2f6; border-color:#d9e2ec; color:#5c6670; }
   .collection-status-pill.error { background:#fdeceb; border-color:#f0c1bc; color:#a0463e; }
   .photo-collapsed-tease { display:grid; place-items:center; gap:8px; padding:18px 4px 8px; color:#4f8d5f; }
@@ -6308,17 +6467,18 @@ INDEX_HTML = r'''
     <div class="panel launcher" id="launcherPanel">
       <div class="select-wrap">
         <div class="inline-launch-group">
-          <div>
+          <div class="launch-field">
             <label class="small">Search Product Collection</label>
             <input type="text" id="collectionFilter" placeholder="Type any part of the collection name" />
           </div>
-          <div>
+          <div class="launch-field">
             <label class="small">Product Collection</label>
             <select id="collectionSelect" size="1"></select>
           </div>
-          <div>
-            <label class="small">&nbsp;</label>
-            <button type="button" class="btn btn-primary" id="launchBtn">Launch Collection</button>
+          <div class="launch-button-col">
+            <div class="launch-button-stack">
+              <button type="button" class="btn btn-primary" id="launchBtn">Launch Collection</button>
+            </div>
           </div>
         </div>
         <div class="launcher-lower-row">
@@ -6326,6 +6486,9 @@ INDEX_HTML = r'''
             <label class="mode-option" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="hideInactiveToggle" /> Hide inactive SKUs</label>
           </div>
           <div class="collection-status-mount" id="collectionStatusMount"></div>
+          <div class="launcher-random-row">
+            <button type="button" class="btn btn-secondary btn-compact" id="launchRandomBtn">Launch Random Collection</button>
+          </div>
         </div>
       </div>
     </div>
@@ -6823,6 +6986,10 @@ function applyBoardResponse(data, options={}) {
   state.collapsedColors = {};
   state.assetModeDirty = false;
   state.assetModeDirtyRows = {};
+  const select = document.getElementById('collectionSelect');
+  if (select && state.board && state.board.collection && state.board.collection.id) {
+    select.value = state.board.collection.id;
+  }
   if (!options.keepPhotography) {
     state.photography.items = [];
     state.photography.color = '';
@@ -6831,6 +6998,9 @@ function applyBoardResponse(data, options={}) {
   if (!options.keepNotices) state.appNotices = [];
   if (data.game) syncGameState(data.game);
   renderBoard();
+  if (!options.keepPhotography && data.photography_autoload) {
+    loadPhotographyPayloadToState(data.photography_autoload, (data.random_launch || {}).color || '');
+  }
   updateStickyOffsets();
   closeIdleModal();
 }
@@ -7673,8 +7843,8 @@ function activePhotoOffsetY(photoId) {
   const mode = prepModeFromState();
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
-  if (!srcW || !srcH || !mode.startsWith('crop_') || mode === 'crop_square') return 0;
-  if (mode === 'crop_swatch') {
+  if (!srcW || !srcH || !mode.startsWith('crop_') || mode === 'crop_square' || mode === 'crop_swatch') return 0;
+  if (mode === 'pick_swatch') {
     const cropH = Math.min(163, srcH);
     const maxOff = Math.max(0, srcH - cropH);
     if (overrides[photoId] === undefined || overrides[photoId] === null) return Math.round(maxOff / 2);
@@ -7694,8 +7864,8 @@ function activePhotoOffsetX(photoId) {
   const mode = prepModeFromState();
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
-  if (!srcW || !srcH || (mode !== 'crop_square' && mode !== 'crop_swatch')) return 0;
-  if (mode === 'crop_swatch') {
+  if (!srcW || !srcH || (mode !== 'crop_square' && mode !== 'crop_swatch' && mode !== 'pick_swatch')) return 0;
+  if (mode === 'pick_swatch') {
     const cropW = Math.min(163, srcW);
     const maxOff = Math.max(0, srcW - cropW);
     if (overrides[photoId] === undefined || overrides[photoId] === null) return Math.round(maxOff / 2);
@@ -7712,7 +7882,7 @@ function prepModeOutputSize(mode) {
   const m = String(mode || '');
   if (m === 'crop_2200' || m === 'pad_tb_2200') return '3000x2200';
   if (m === 'crop_square') return '2000x2000';
-  if (m === 'crop_swatch') return '163x163';
+  if (m === 'crop_swatch' || m === 'pick_swatch') return '163x163';
   return '3000x1688';
 }
 
@@ -7745,9 +7915,10 @@ function renderPhotoPrepDrawer() {
               <label title="Fits the full image inside a 3000x1688 canvas without cropping and fills the leftover side space with white."><input type="radio" name="prepMode" value="pad_lr_1688" ${mode==='pad_lr_1688'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white sides</label>
               <label title="Fits the full image inside a 3000x2200 canvas without cropping and fills the leftover top and bottom space with white."><input type="radio" name="prepMode" value="pad_tb_2200" ${mode==='pad_tb_2200'?'checked':''} onchange="setPrepMode(this.value)" /> 3000x1688 with white top/bottom</label>
               <label title="Takes the largest possible square crop from the source image and preserves only that square area."><input type="radio" name="prepMode" value="crop_square" ${mode==='crop_square'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to largest square</label>
-              <label title="Places a true 163x163 crop box on the source image so you can move it around and output a final 163x163 swatch."><input type="radio" name="prepMode" value="crop_swatch" ${mode==='crop_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Pick swatch</label>
+              <label title="Takes the largest possible square crop from the source image, then outputs it as a 163x163 swatch."><input type="radio" name="prepMode" value="crop_swatch" ${mode==='crop_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Crop swatch</label>
+              <label title="Places a true 163x163 crop box on the source image so you can move it around and output a final 163x163 swatch."><input type="radio" name="prepMode" value="pick_swatch" ${mode==='pick_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Pick swatch</label>
             </div>
-            ${((mode === 'crop_1688' || mode === 'crop_2200' || mode === 'crop_square' || mode === 'crop_swatch')) ? `<div class="photo-prep-focusbox">
+            ${((mode === 'crop_1688' || mode === 'crop_2200' || mode === 'crop_square' || mode === 'pick_swatch')) ? `<div class="photo-prep-focusbox">
               ${mode === 'crop_square' ? `<div class="photo-focus-pad" aria-label="Square crop nudger">
                 <button type="button" onclick="setCropToLeft()" title="Jump crop all the way left">&#8678;</button>
                 <button type="button" onclick="nudgeCropX(-1)" title="Move crop left">&#11164;</button>
@@ -7758,7 +7929,7 @@ function renderPhotoPrepDrawer() {
                 <span class="photo-prep-note">Use the left and right arrows to move the square crop box.</span>
                 <span class="photo-prep-note">Jump buttons move it all the way left or right.</span>
                 <span class="photo-prep-note">Click Add as new version to apply your modified image to this asset.</span>
-              </div>` : mode === 'crop_swatch' ? `<div class="photo-focus-pad" aria-label="Swatch crop nudger">
+              </div>` : mode === 'pick_swatch' ? `<div class="photo-focus-pad" aria-label="Swatch crop nudger">
                 <button type="button" onclick="setSwatchCropToTop()" title="Jump swatch to top">&#8679;</button>
                 <button type="button" onclick="setCropToLeft()" title="Jump swatch all the way left">&#8678;</button>
                 <button type="button" onclick="nudgeCropY(-1)" title="Move swatch up">&#8593;</button>
@@ -8069,7 +8240,7 @@ function cropStepYForActive() {
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return 100;
-  if (mode === 'crop_swatch') {
+  if (mode === 'pick_swatch') {
     return Math.max(10, Math.round(Math.max(0, srcH - Math.min(163, srcH)) * 0.08) || 24);
   }
   const outH = mode === 'crop_2200' ? 2200 : 1688;
@@ -8083,7 +8254,7 @@ function nudgeCropY(direction) {
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return;
-  if (mode === 'crop_swatch') {
+  if (mode === 'pick_swatch') {
     const cropH = Math.min(163, srcH);
     const maxOff = Math.max(0, srcH - cropH);
     const current = activePhotoOffsetY(active.id);
@@ -8102,7 +8273,7 @@ function nudgeCropY(direction) {
   refreshPhotoPreview();
 }
 function setCropToTop() { const active = currentActivePhoto(); if (!active) return; state.photography.prep.offsetYOverrides[active.id] = 0; refreshPhotoPreview(); }
-function setCropToBottom() { const active = currentActivePhoto(); if (!active) return; const mode = prepModeFromState(); const srcW = Number(active.width || 0) || 0; const srcH = Number(active.height || 0) || 0; if (!srcW || !srcH) return; if (mode === 'crop_swatch') { state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); refreshPhotoPreview(); return; } const outH = mode === 'crop_2200' ? 2200 : 1688; const scaledH = Math.round(srcH * (3000 / srcW)); state.photography.prep.offsetYOverrides[active.id] = Math.max(0, scaledH - outH); refreshPhotoPreview(); }
+function setCropToBottom() { const active = currentActivePhoto(); if (!active) return; const mode = prepModeFromState(); const srcW = Number(active.width || 0) || 0; const srcH = Number(active.height || 0) || 0; if (!srcW || !srcH) return; if (mode === 'pick_swatch') { state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); refreshPhotoPreview(); return; } const outH = mode === 'crop_2200' ? 2200 : 1688; const scaledH = Math.round(srcH * (3000 / srcW)); state.photography.prep.offsetYOverrides[active.id] = Math.max(0, scaledH - outH); refreshPhotoPreview(); }
 function setSwatchCropToTop() { const active = currentActivePhoto(); if (!active) return; state.photography.prep.offsetYOverrides[active.id] = 0; refreshPhotoPreview(); }
 function setSwatchCropToBottom() { const active = currentActivePhoto(); if (!active) return; const srcH = Number(active.height || 0) || 0; if (!srcH) return; state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); refreshPhotoPreview(); }
 function cropStepXForActive() {
@@ -8111,7 +8282,7 @@ function cropStepXForActive() {
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return 100;
-  if (prepModeFromState() === 'crop_swatch') {
+  if (prepModeFromState() === 'pick_swatch') {
     return Math.max(10, Math.round(Math.max(0, srcW - Math.min(163, srcW)) * 0.08) || 24);
   }
   const side = Math.min(srcW, srcH);
@@ -8120,12 +8291,12 @@ function cropStepXForActive() {
 function nudgeCropX(direction) {
   const active = currentActivePhoto();
   if (!active) return;
-  if (prepModeFromState() !== 'crop_square' && prepModeFromState() !== 'crop_swatch') return;
+  if (prepModeFromState() !== 'crop_square' && prepModeFromState() !== 'crop_swatch' && prepModeFromState() !== 'pick_swatch') return;
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return;
   const mode = prepModeFromState();
-  const maxOff = mode === 'crop_swatch'
+  const maxOff = mode === 'pick_swatch'
     ? Math.max(0, srcW - Math.min(163, srcW))
     : Math.max(0, srcW - Math.min(srcW, srcH));
   const current = activePhotoOffsetX(active.id);
@@ -8146,7 +8317,7 @@ function setCropToRight() {
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return;
   const mode = prepModeFromState();
-  const maxOff = mode === 'crop_swatch'
+  const maxOff = mode === 'pick_swatch'
     ? Math.max(0, srcW - Math.min(163, srcW))
     : Math.max(0, srcW - Math.min(srcW, srcH));
   state.photography.prep.offsetXOverrides[active.id] = maxOff;
@@ -8162,7 +8333,7 @@ function handlePhotoPrepArrowKeys(event) {
   }
   const mode = prepModeFromState();
   if (!mode) return;
-  if (mode === 'crop_swatch') {
+  if (mode === 'pick_swatch') {
     if (event.key === 'ArrowLeft') { event.preventDefault(); nudgeCropX(-1); return; }
     if (event.key === 'ArrowRight') { event.preventDefault(); nudgeCropX(1); return; }
     if (event.key === 'ArrowUp') { event.preventDefault(); nudgeCropY(-1); return; }
@@ -8295,6 +8466,33 @@ function togglePhotoSkuDrawer(assetId) {
   renderPhotographyPanel();
 }
 
+function loadPhotographyPayloadToState(data, fallbackColor='') {
+  const color = (data && data.color) || fallbackColor || '';
+  state.photography.items = (data && data.items) || [];
+  state.photography.color = color;
+  state.photography.expanded = true;
+  state.photography.activeSkuSet = [];
+  state.photography.selectedIds = [];
+  state.photography.activeId = '';
+  if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl);
+  state.photography.previewUrl = '';
+  state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
+  state.photography.hideFpo = false;
+  state.photography.hideReviewed = false;
+  state.photography.reviewingIds = {};
+  state.additionalPhotoAvailabilityBySku = {};
+  state.additionalPhotoCheckInFlight = {};
+  for (const section of state.board.color_sections || []) {
+    if (String(section.color) === String(color)) {
+      state.photography.activeSkuSet = (section.rows || []).map(r => String(r.sku || '')).filter(Boolean);
+      break;
+    }
+  }
+  state.photoSkuOpen = {};
+  renderPhotographyPanel();
+  ensureAdditionalPhotoAvailabilityForColor(color, true);
+}
+
 async function pullPhotographyForColor(event, color) {
   if (event) {
     event.preventDefault();
@@ -8312,28 +8510,7 @@ async function pullPhotographyForColor(event, color) {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Could not load photography');
-    state.photography.items = data.items || [];
-    state.photography.color = data.color || color;
-    state.photography.expanded = true;
-    state.photography.activeSkuSet = [];
-    state.photography.selectedIds = [];
-    state.photography.activeId = '';
-    state.photography.previewUrl = '';
-    state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
-    state.photography.hideFpo = false;
-    state.photography.hideReviewed = false;
-    state.photography.reviewingIds = {};
-    state.additionalPhotoAvailabilityBySku = {};
-    state.additionalPhotoCheckInFlight = {};
-    for (const section of state.board.color_sections || []) {
-      if (String(section.color) === String(color)) {
-        state.photography.activeSkuSet = (section.rows || []).map(r => String(r.sku || '')).filter(Boolean);
-        break;
-      }
-    }
-    state.photoSkuOpen = {};
-    renderPhotographyPanel();
-    ensureAdditionalPhotoAvailabilityForColor(color, true);
+    loadPhotographyPayloadToState(data, color);
   } catch (err) {
     alert(err.message || String(err));
   }
@@ -9251,24 +9428,27 @@ const launchLoadingMessages = [
   'A cute little board reveal is on the way...'
 ];
 
-function startLaunchLoadingTicker() {
-  stopLaunchLoadingTicker();
-  const btn = document.getElementById('launchBtn');
+function startLaunchLoadingTicker(buttonId='launchBtn') {
+  stopLaunchLoadingTicker(buttonId);
+  const btn = document.getElementById(buttonId);
   if (!btn) return;
   let idx = 0;
   btn.textContent = launchLoadingMessages[0];
-  state.launchLoadingTicker = window.setInterval(() => {
+  state.launchLoadingTicker = state.launchLoadingTicker || {};
+  state.launchLoadingTicker[buttonId] = window.setInterval(() => {
     if (!btn.disabled) return;
     idx = (idx + 1) % launchLoadingMessages.length;
     btn.textContent = launchLoadingMessages[idx];
   }, 4500);
 }
 
-function stopLaunchLoadingTicker() {
-  if (state.launchLoadingTicker) {
-    clearInterval(state.launchLoadingTicker);
-    state.launchLoadingTicker = null;
+function stopLaunchLoadingTicker(buttonId='launchBtn') {
+  const tickers = state.launchLoadingTicker || {};
+  if (tickers[buttonId]) {
+    clearInterval(tickers[buttonId]);
+    delete tickers[buttonId];
   }
+  state.launchLoadingTicker = tickers;
 }
 
 async function launchCollection(optionIdOverride=null, options={}) {
@@ -9320,6 +9500,45 @@ async function launchCollection(optionIdOverride=null, options={}) {
   }
 }
 
+
+async function launchRandomCollection() {
+  const launchBtn = document.getElementById('launchBtn');
+  const randomBtn = document.getElementById('launchRandomBtn');
+  if (launchBtn) launchBtn.disabled = true;
+  if (randomBtn) {
+    randomBtn.disabled = true;
+    startLaunchLoadingTicker('launchRandomBtn');
+  }
+  try {
+    const resp = await fetch('/api/launch_random_collection', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: 'random_launch'})
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Random launch failed');
+    state.game.active = false;
+    applyBoardResponse(data, {keepPhotography:false, keepNotices:false});
+    const launched = data.random_launch || {};
+    if (launched.collection && launched.color) {
+      addAppNotice(`Random collection loaded: ${launched.collection.label} / ${launched.color}. Photography is ready in the panel.`, 'success');
+    }
+    requestAnimationFrame(() => {
+      scrollBoardToFirstColorTop('auto');
+    });
+    return data;
+  } catch (err) {
+    alert(err.message || String(err));
+    return null;
+  } finally {
+    stopLaunchLoadingTicker('launchRandomBtn');
+    if (randomBtn) {
+      randomBtn.disabled = false;
+      randomBtn.textContent = 'Launch Random Collection';
+    }
+    if (launchBtn) launchBtn.disabled = false;
+  }
+}
 
 async function waitThenPollForRefresh(commitSummary=null) {
   const token = Date.now();
@@ -9499,6 +9718,7 @@ async function refreshMessages() {
 function bindStaticUI() {
   document.getElementById('collectionFilter').addEventListener('input', filterCollections);
   document.getElementById('launchBtn').addEventListener('click', () => launchCollection());
+  document.getElementById('launchRandomBtn').addEventListener('click', () => launchRandomCollection());
   document.getElementById('reloadBtn').addEventListener('click', async () => {
     const queuedCount = changedAssetIds().size;
     if (queuedCount > 0) {
