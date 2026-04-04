@@ -85,7 +85,9 @@ PHOTO_TO_PSA_IMAGE_TYPE_MAP = {
 PSA_IMAGE_TYPE_PROMPT_CHOICES = ["Detail", "Room_shot", "Silo", "Swatch_detail"]
 SWATCH_PSA_IMAGE_TYPE_LABEL = "Swatch"
 DIMENSIONS_PSA_IMAGE_TYPE_LABEL = "Dimensions_diagram_image"
+SQUARE_PSA_IMAGE_TYPE_LABEL = "Room_shot"
 SWATCH_OPTIONAL_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
+SWATCH_OPTIONAL_STEP_PATH_PREFIXES = ("RF_Root___Mattresses",)
 WALL_ART_SIZING_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
 # Defensive aliases for game/background scanners so these checks never explode if a future edit
 # accidentally renames one constant in one code path.
@@ -1179,6 +1181,8 @@ def effective_psa_image_type_for_target(target_lane: str, target_slot: str, curr
         return SWATCH_PSA_IMAGE_TYPE_LABEL
     if string_value(target_lane) == "special" and string_value(target_slot) == "SKU_dimension":
         return DIMENSIONS_PSA_IMAGE_TYPE_LABEL
+    if string_value(target_lane) == "special" and string_value(target_slot) == "SKU_square":
+        return SQUARE_PSA_IMAGE_TYPE_LABEL
     return ""
 
 
@@ -2609,6 +2613,7 @@ def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot
             "psa_image_type_override": (
                 SWATCH_PSA_IMAGE_TYPE_LABEL if target_slot == "SKU_swatch"
                 else DIMENSIONS_PSA_IMAGE_TYPE_LABEL if target_slot == "SKU_dimension"
+                else SQUARE_PSA_IMAGE_TYPE_LABEL if target_slot == "SKU_square"
                 else ""
             ),
             "target_name": force_jpg_filename(forced_stem, forced_stem),
@@ -4115,8 +4120,12 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                         payload[field_key] = field_value
 
 
-                if current_slot_key in {"SKU_swatch", "SKU_dimension"}:
-                    psa_label = SWATCH_PSA_IMAGE_TYPE_LABEL if current_slot_key == "SKU_swatch" else DIMENSIONS_PSA_IMAGE_TYPE_LABEL
+                if current_slot_key in {"SKU_swatch", "SKU_dimension", "SKU_square"}:
+                    psa_label = (
+                        SWATCH_PSA_IMAGE_TYPE_LABEL if current_slot_key == "SKU_swatch"
+                        else DIMENSIONS_PSA_IMAGE_TYPE_LABEL if current_slot_key == "SKU_dimension"
+                        else SQUARE_PSA_IMAGE_TYPE_LABEL
+                    )
                     psa_fields: List[Tuple[str, Any]] = []
                     append_psa_image_type_field(session, psa_fields, metaprops_by_dbname, psa_label)
                     for field_key, field_value in psa_fields:
@@ -4269,9 +4278,16 @@ def filter_board_to_colors(board: Dict[str, Any], color_names: List[str]) -> Dic
     return clone
 
 
+def is_swatch_optional_step_path(step_path: Any) -> bool:
+    step_path_text = string_value(step_path)
+    if step_path_text in CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS:
+        return True
+    return any(step_path_text.startswith(prefix) for prefix in SWATCH_OPTIONAL_STEP_PATH_PREFIXES)
+
+
 def row_requires_swatch(row: Dict[str, Any]) -> bool:
     step_path = string_value(row.get("step_path") or row.get("property_STEP_Path") or "")
-    return step_path not in CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS
+    return not is_swatch_optional_step_path(step_path)
 
 
 def row_requires_wall_art_sizing(row: Dict[str, Any]) -> bool:
@@ -4465,7 +4481,7 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
             row_summary = {
                 "missing_grid": 0 if lane["has_grid"] else 1,
                 "missing_100": 0 if lane["has_100"] else 1,
-                "missing_swatch": 0 if (lane["has_swatch"] or step_path in CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS) else 1,
+                "missing_swatch": 0 if (lane["has_swatch"] or is_swatch_optional_step_path(step_path)) else 1,
                 "missing_dimension": 0,
                 "missing_wall_art_sizing": 0 if (lane["has_8000"] or step_path not in CHALLENGE_WALL_ART_SIZING_STEP_PATHS) else 1,
                 "compilable_set_dim": 0,
@@ -6921,6 +6937,24 @@ INDEX_HTML = r'''
   .game-celebration-card { min-width:min(420px,90vw); background:rgba(79,36,94,.95); color:white; border-radius:20px; padding:22px 26px; box-shadow:0 24px 60px rgba(0,0,0,.22); text-align:center; animation:gameCelebrate .9s ease; }
   .game-celebration-card h3 { margin:0 0 8px; font-size:28px; }
   .game-celebration-card p { margin:0; opacity:.94; }
+  .issue-zero-burst { position:fixed; inset:0; pointer-events:none; overflow:hidden; z-index:10035; }
+  .issue-zero-burst::before { content:''; position:fixed; inset:0; opacity:0; background: radial-gradient(circle at var(--flash-x,50%) var(--flash-y,18%), rgba(122,213,140,.24), rgba(122,213,140,0) 34%), linear-gradient(180deg, rgba(255,255,255,.14), rgba(255,255,255,0)); animation: issueZeroFlash 5s ease forwards; }
+  .issue-zero-banner { position:fixed; left:50%; top:84px; transform:translateX(-50%); padding:14px 20px; border-radius:999px; background:rgba(26,104,53,.94); color:#fff; border:1px solid rgba(188,241,203,.7); box-shadow:0 16px 40px rgba(15,68,36,.22); font-weight:900; letter-spacing:.01em; font-size:15px; display:flex; align-items:center; gap:10px; animation: issueZeroBanner 5s cubic-bezier(.18,.84,.24,1) forwards; }
+  .issue-zero-banner .burst-emoji { font-size:18px; filter: drop-shadow(0 1px 0 rgba(255,255,255,.24)); }
+  .issue-zero-particle { position:fixed; left:0; top:0; opacity:0; will-change:transform, opacity; animation: issueZeroFall var(--dur,5s) cubic-bezier(.2,.76,.22,1) forwards; animation-delay: var(--delay,0s); }
+  .issue-zero-particle.confetti { border-radius: 3px; box-shadow: 0 1px 0 rgba(255,255,255,.3) inset; }
+  .issue-zero-particle.streamer { width: 7px; height: 24px; border-radius: 999px; box-shadow: 0 1px 0 rgba(255,255,255,.26) inset; }
+  .issue-zero-particle.furniture { font-size: var(--size,24px); line-height:1; filter: drop-shadow(0 3px 6px rgba(0,0,0,.14)); }
+  @keyframes issueZeroFlash { 0% { opacity:0; } 10% { opacity:1; } 34% { opacity:.82; } 100% { opacity:0; } }
+  @keyframes issueZeroBanner { 0% { opacity:0; transform:translateX(-50%) translateY(10px) scale(.92); } 12% { opacity:1; transform:translateX(-50%) translateY(0) scale(1); } 72% { opacity:1; transform:translateX(-50%) translateY(0) scale(1); } 100% { opacity:0; transform:translateX(-50%) translateY(-10px) scale(.98); } }
+  @keyframes issueZeroFall {
+    0% { opacity: 0; transform: translate3d(0,0,0) rotate(0deg) scale(.72); }
+    7% { opacity: 1; }
+    18% { opacity: 1; transform: translate3d(var(--burst-x,0px), var(--lift-y,-100px), 0) rotate(var(--burst-rot,50deg)) scale(1.08); }
+    55% { opacity: 1; transform: translate3d(calc(var(--tx,0px) * .52), calc(45vh + var(--mid-y,0px)), 0) rotate(calc(var(--rot,540deg) * .55)) scale(1); }
+    82% { opacity: 1; }
+    100% { opacity: 0; transform: translate3d(var(--tx,0px), calc(100vh + 160px), 0) rotate(var(--rot,540deg)) scale(.98); }
+  }
   @keyframes gameCelebrate { 0% { transform: scale(.82) translateY(22px); opacity:0; } 100% { transform: scale(1) translateY(0); opacity:1; } }
 
 
@@ -7036,6 +7070,7 @@ INDEX_HTML = r'''
       </div>
     </div>
     <div class="game-celebration" id="gameCelebration"></div>
+    <div class="issue-zero-burst" id="issueZeroBurst"></div>
 
     <div class="board-wrap" id="boardWrap">
       <div class="panel photo-shell collapsed" id="photoShell">
@@ -7192,6 +7227,7 @@ const state = {
     loading: false,
     launchOverlayOpen: false,
     lastEnsureAt: 0,
+    lastIssueCount: null,
   },
   waitFlow: {
     open: false,
@@ -9412,14 +9448,22 @@ const SWATCH_OPTIONAL_STEP_PATHS = new Set([
   'RF_Root___Home_Decor___Wall_Art',
   'RF_Root___Home_Decor___Wall_Decor'
 ]);
+const SWATCH_OPTIONAL_STEP_PATH_PREFIXES = [
+  'RF_Root___Mattresses'
+];
 const WALL_ART_SIZING_STEP_PATHS = new Set([
   'RF_Root___Home_Decor___Wall_Art',
   'RF_Root___Home_Decor___Wall_Decor'
 ]);
 
+function isSwatchOptionalStepPath(stepPath) {
+  const clean = String(stepPath || '').trim();
+  return SWATCH_OPTIONAL_STEP_PATHS.has(clean) || SWATCH_OPTIONAL_STEP_PATH_PREFIXES.some(prefix => clean.startsWith(prefix));
+}
+
 function rowRequiresSwatch(row) {
   const stepPath = String((row && (row.step_path || row.property_STEP_Path)) || '').trim();
-  return !SWATCH_OPTIONAL_STEP_PATHS.has(stepPath);
+  return !isSwatchOptionalStepPath(stepPath);
 }
 
 function rowRequiresWallArtSizing(row) {
@@ -9486,6 +9530,63 @@ function computeClientChallengeIssueCount() {
   return total;
 }
 
+function launchIssueZeroBurst(fromEl) {
+  const host = document.getElementById('issueZeroBurst');
+  if (!host || !fromEl) return;
+  host.innerHTML = '';
+  const rect = fromEl.getBoundingClientRect();
+  const startX = rect.left + (rect.width / 2);
+  const startY = rect.top + Math.min(rect.height * 0.55, 28);
+  host.style.setProperty('--flash-x', `${Math.round(startX)}px`);
+  host.style.setProperty('--flash-y', `${Math.round(startY)}px`);
+
+  const banner = document.createElement('div');
+  banner.className = 'issue-zero-banner';
+  banner.innerHTML = `<span class="burst-emoji">🛋️</span><span>Zero issues. Very satisfying.</span><span class="burst-emoji">✨</span>`;
+  host.appendChild(banner);
+
+  const furniture = ['🛋️','🪑','🛏️','🪴','🪞','🕯️','🖼️','🪟'];
+  const greenPalette = ['#62be74','#4fa85f','#7ad58c','#2f8d49','#9be7aa','#72c97d'];
+  const partyPalette = ['#ffd166','#ef476f','#5ec0ff','#c77dff','#ff9f1c','#06d6a0'];
+  const totalPieces = 116;
+  for (let i = 0; i < totalPieces; i += 1) {
+    const particle = document.createElement('span');
+    const isFurniture = i >= 88;
+    const isParty = !isFurniture && i >= 66;
+    if (isFurniture) {
+      particle.className = 'issue-zero-particle furniture';
+      particle.textContent = furniture[Math.floor(Math.random() * furniture.length)];
+      particle.style.setProperty('--size', `${22 + Math.round(Math.random() * 20)}px`);
+    } else {
+      const streamer = Math.random() < (isParty ? 0.36 : 0.16);
+      particle.className = `issue-zero-particle ${streamer ? 'streamer' : 'confetti'}`;
+      const colorPool = isParty ? partyPalette : greenPalette;
+      particle.style.background = colorPool[Math.floor(Math.random() * colorPool.length)];
+      particle.style.width = `${streamer ? 6 + Math.round(Math.random() * 4) : 8 + Math.round(Math.random() * 10)}px`;
+      particle.style.height = `${streamer ? 22 + Math.round(Math.random() * 20) : 8 + Math.round(Math.random() * 12)}px`;
+    }
+    const spreadX = (Math.random() - 0.5) * Math.min(window.innerWidth * 0.92, 1280);
+    const burstX = (Math.random() - 0.5) * 160;
+    const liftY = -(70 + Math.round(Math.random() * 130));
+    const midY = -80 + Math.round(Math.random() * 100);
+    const startJitterX = (Math.random() - 0.5) * Math.max(rect.width * 0.7, 42);
+    const startJitterY = (Math.random() - 0.5) * 12;
+    particle.style.left = `${startX + startJitterX}px`;
+    particle.style.top = `${startY + startJitterY}px`;
+    particle.style.setProperty('--burst-x', `${burstX}px`);
+    particle.style.setProperty('--lift-y', `${liftY}px`);
+    particle.style.setProperty('--mid-y', `${midY}px`);
+    particle.style.setProperty('--tx', `${spreadX}px`);
+    particle.style.setProperty('--burst-rot', `${(Math.random() < 0.5 ? -1 : 1) * (22 + Math.round(Math.random() * 70))}deg`);
+    particle.style.setProperty('--rot', `${(Math.random() < 0.5 ? -1 : 1) * (220 + Math.round(Math.random() * 520))}deg`);
+    particle.style.setProperty('--delay', `${Math.random() * 0.65}s`);
+    particle.style.setProperty('--dur', `${4.55 + Math.random() * 0.35}s`);
+    host.appendChild(particle);
+  }
+  clearTimeout(host._burstTimer);
+  host._burstTimer = setTimeout(() => { host.innerHTML = ''; }, 5200);
+}
+
 function renderChallengeIssuePill() {
   const pill = document.getElementById('challengeIssuePill');
   if (!pill) return;
@@ -9493,14 +9594,20 @@ function renderChallengeIssuePill() {
     pill.style.display = 'none';
     pill.classList.remove('good');
     pill.textContent = '';
+    if (state.game) state.game.lastIssueCount = null;
     return;
   }
   const clientCount = computeClientChallengeIssueCount();
   const backendCount = Number((((state.game || {}).current || {}).issue_total) || ((((state.game || {}).current || {}).issues || {}).total) || 0);
   const count = state.board ? clientCount : backendCount;
+  const previousCount = Number.isFinite(Number((state.game || {}).lastIssueCount)) ? Number((state.game || {}).lastIssueCount) : null;
   pill.style.display = 'inline-flex';
   pill.classList.toggle('good', count === 0);
   pill.textContent = `${count} issue${count === 1 ? '' : 's'} remaining`;
+  if (previousCount !== null && previousCount > 0 && count === 0) {
+    launchIssueZeroBurst(pill);
+  }
+  if (state.game) state.game.lastIssueCount = count;
 }
 
 
@@ -10659,6 +10766,10 @@ def open_browser_later() -> None:
 
 if __name__ == "__main__":
     log_message("Starting Content Refresher local server.")
+    if google_scoreboard_is_configured():
+        log_message(f"Google scoreboard enabled using credentials at {get_google_scoreboard_credentials_path()}")
+    else:
+        log_message(f"Google scoreboard disabled: credentials file not found at {get_google_scoreboard_credentials_path()}")
     start_server_side_game_queue_worker()
     open_browser_later()
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
