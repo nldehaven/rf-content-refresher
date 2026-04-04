@@ -12,20 +12,19 @@ import uuid
 import webbrowser
 import getpass
 import socket
-import subprocess
-import signal
 import sys
 from collections import defaultdict
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
 import requests
+import jwt
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 from flask import Flask, Response, jsonify, request, stream_with_context, send_file
 from werkzeug.utils import secure_filename
@@ -40,7 +39,7 @@ BYNDER_TOKEN_PATH = os.environ.get(
     r"C:\bynderAPI\byndercredentials_permanenttoken.json",
 )
 
-APP_VERSION = "dev68"
+APP_VERSION = "dev77"
 
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
@@ -84,6 +83,8 @@ PHOTO_TO_PSA_IMAGE_TYPE_MAP = {
     "Video_Shoot_Still": "Room_shot",
 }
 PSA_IMAGE_TYPE_PROMPT_CHOICES = ["Detail", "Room_shot", "Silo", "Swatch_detail"]
+SWATCH_PSA_IMAGE_TYPE_LABEL = "Swatch"
+DIMENSIONS_PSA_IMAGE_TYPE_LABEL = "Dimensions_diagram_image"
 SWATCH_OPTIONAL_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
 WALL_ART_SIZING_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
 # Defensive aliases for game/background scanners so these checks never explode if a future edit
@@ -121,6 +122,13 @@ COLLECTION_DERIVED_CACHE_MAX_AGE_SECONDS = 10 * 60
 COLLECTION_BOARD_CACHE_MAX_AGE_SECONDS = 5 * 60
 
 GAME_SCORE_PATH = Path.home() / ".content_refresher_game_scores.json"
+APP_LAUNCH_DIR = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__)).resolve().parent
+GOOGLE_SCOREBOARD_CREDENTIALS_FILENAME = "content-refresher-scoreboard-credentials.json"
+GOOGLE_SCOREBOARD_CREDENTIALS_PATH = APP_LAUNCH_DIR / GOOGLE_SCOREBOARD_CREDENTIALS_FILENAME
+GOOGLE_SCOREBOARD_SPREADSHEET_ID = "1ZzZp8C7ySVPPZQCoRz_RCn5N7iQfXaCOQBAd0GhAZOY"
+GOOGLE_SCOREBOARD_TAB_NAME = "scores"
+GOOGLE_SCOREBOARD_RANGE = f"{GOOGLE_SCOREBOARD_TAB_NAME}!A:C"
+GOOGLE_SCOREBOARD_REFRESH_SECONDS = 20
 GAME_QUEUE_TARGET = 10
 GAME_SCAN_BATCH = 14
 GAME_SCAN_MIN_GAP_SECONDS = 8
@@ -181,6 +189,9 @@ STATE["game"] = {
 
 METAPROPERTY_DBNAME_CACHE: Dict[str, str] = {}
 METAPROPERTY_OPTION_VALUE_CACHE: Dict[str, Dict[str, str]] = {}
+GOOGLE_SCOREBOARD_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "data": None}
+GOOGLE_SCOREBOARD_TOKEN_CACHE: Dict[str, Any] = {"access_token": "", "expires_at": 0.0}
+
 PROPERTY_DB_NAMES: Dict[str, str] = {
     "Product_SKU": "Product_SKU",
     "Product_SKU_Position": "Product_SKU_Position",
@@ -357,15 +368,152 @@ def get_local_username() -> str:
         return "player"
 
 
-def load_game_scores() -> Dict[str, Any]:
+def get_google_scoreboard_credentials_path() -> Path:
+    env_path = string_value(os.environ.get("CONTENT_REFRESHER_SCOREBOARD_CREDENTIALS_PATH"))
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    return GOOGLE_SCOREBOARD_CREDENTIALS_PATH
+
+
+def google_scoreboard_is_configured() -> bool:
+    try:
+        return get_google_scoreboard_credentials_path().exists()
+    except Exception:
+        return False
+
+
+def load_google_scoreboard_credentials() -> Dict[str, Any]:
+    creds_path = get_google_scoreboard_credentials_path()
+    if not creds_path.exists():
+        raise FileNotFoundError(f"Google scoreboard credentials file was not found at {creds_path}")
+    data = json.loads(creds_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Google scoreboard credentials file is not valid JSON.")
+    required = ["client_email", "private_key"]
+    missing = [key for key in required if not string_value(data.get(key))]
+    if missing:
+        raise ValueError(f"Google scoreboard credentials are missing required field(s): {', '.join(missing)}")
+    return data
+
+
+def get_google_scoreboard_access_token(force_refresh: bool = False) -> str:
+    now = time.time()
+    cached_token = string_value(GOOGLE_SCOREBOARD_TOKEN_CACHE.get("access_token"))
+    expires_at = float(GOOGLE_SCOREBOARD_TOKEN_CACHE.get("expires_at") or 0.0)
+    if cached_token and not force_refresh and now < max(0.0, expires_at - 60.0):
+        return cached_token
+
+    creds = load_google_scoreboard_credentials()
+    token_uri = string_value(creds.get("token_uri") or "https://oauth2.googleapis.com/token")
+    issued_at = int(now)
+    payload = {
+        "iss": creds["client_email"],
+        "scope": "https://www.googleapis.com/auth/spreadsheets",
+        "aud": token_uri,
+        "iat": issued_at,
+        "exp": issued_at + 3600,
+    }
+    assertion = jwt.encode(payload, creds["private_key"], algorithm="RS256")
+    response = requests.post(
+        token_uri,
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": assertion,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    token_payload = response.json()
+    access_token = string_value(token_payload.get("access_token"))
+    if not access_token:
+        raise RuntimeError("Google OAuth token response did not include an access token.")
+    expires_in = int(token_payload.get("expires_in") or 3600)
+    GOOGLE_SCOREBOARD_TOKEN_CACHE["access_token"] = access_token
+    GOOGLE_SCOREBOARD_TOKEN_CACHE["expires_at"] = now + expires_in
+    return access_token
+
+
+def google_sheets_request(method: str, url: str, *, params: Optional[Dict[str, Any]] = None, json_payload: Any = None, retry_on_401: bool = True) -> Dict[str, Any]:
+    token = get_google_scoreboard_access_token(force_refresh=False)
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=30)
+    if response.status_code == 401 and retry_on_401:
+        token = get_google_scoreboard_access_token(force_refresh=True)
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=30)
+    response.raise_for_status()
+    if not response.text.strip():
+        return {}
+    return response.json()
+
+
+def normalize_remote_score_rows(values: List[List[Any]]) -> Dict[str, Any]:
+    users: Dict[str, Dict[str, Any]] = {}
+    if not values:
+        return {"users": users}
+    for row in values[1:]:
+        if not isinstance(row, list) or not row:
+            continue
+        username = string_value(row[0]).strip()
+        if not username:
+            continue
+        score = 0
+        try:
+            score = max(0, int(float(string_value(row[1]) or "0")))
+        except Exception:
+            score = 0
+        users[username] = {
+            "score": score,
+            "last_updated": string_value(row[2]).strip(),
+        }
+    return {"users": users}
+
+
+def fetch_remote_game_scores(force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+    if not google_scoreboard_is_configured():
+        return None
+    now = time.time()
+    cached = GOOGLE_SCOREBOARD_CACHE.get("data")
+    fetched_at = float(GOOGLE_SCOREBOARD_CACHE.get("fetched_at") or 0.0)
+    if cached is not None and not force_refresh and (now - fetched_at) < GOOGLE_SCOREBOARD_REFRESH_SECONDS:
+        return deepcopy(cached)
+    try:
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SCOREBOARD_SPREADSHEET_ID}/values/{quote(GOOGLE_SCOREBOARD_RANGE, safe='!:\'')}"
+        payload = google_sheets_request("GET", url)
+        data = normalize_remote_score_rows(payload.get("values") or [])
+        GOOGLE_SCOREBOARD_CACHE["data"] = deepcopy(data)
+        GOOGLE_SCOREBOARD_CACHE["fetched_at"] = now
+        return data
+    except Exception as exc:
+        log_message(f"Could not refresh Google scoreboard sheet: {exc}")
+        return deepcopy(cached) if cached is not None else None
+
+
+def merge_score_sources(local_data: Dict[str, Any], remote_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = {"users": {}}
+    for source in [local_data or {"users": {}}, remote_data or {"users": {}}]:
+        for username, entry in (source.get("users") or {}).items():
+            prior = merged["users"].get(username) or {}
+            score = max(int(prior.get("score") or 0), int((entry or {}).get("score") or 0))
+            last_updated = string_value((entry or {}).get("last_updated") or prior.get("last_updated"))
+            merged["users"][username] = {"score": score, "last_updated": last_updated}
+    return merged
+
+
+def load_game_scores(force_refresh_remote: bool = False) -> Dict[str, Any]:
+    local_data: Dict[str, Any] = {"users": {}}
     try:
         if GAME_SCORE_PATH.exists():
             data = json.loads(GAME_SCORE_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                return data
+                local_data = data
     except Exception as exc:
         log_message(f"Could not read game scores: {exc}")
-    return {"users": {}}
+    remote_data = fetch_remote_game_scores(force_refresh=force_refresh_remote)
+    merged = merge_score_sources(local_data, remote_data)
+    if merged != local_data:
+        save_game_scores(merged)
+    return merged
 
 
 def save_game_scores(data: Dict[str, Any]) -> None:
@@ -375,24 +523,62 @@ def save_game_scores(data: Dict[str, Any]) -> None:
         log_message(f"Could not write game scores: {exc}")
 
 
-def get_game_score_snapshot() -> Dict[str, Any]:
-    data = load_game_scores()
+def upsert_remote_game_score(username: str, score: int, last_updated: str) -> None:
+    if not google_scoreboard_is_configured():
+        return
+    username = string_value(username).strip()
+    if not username:
+        return
+    values_url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SCOREBOARD_SPREADSHEET_ID}/values/{quote(GOOGLE_SCOREBOARD_RANGE, safe='!:\'')}"
+    payload = google_sheets_request("GET", values_url)
+    values = payload.get("values") or []
+    target_row = None
+    for idx, row in enumerate(values[1:], start=2):
+        if string_value(row[0]).strip().lower() == username.lower():
+            target_row = idx
+            break
+    row_values = [[username, int(score), last_updated]]
+    if target_row is None:
+        append_url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SCOREBOARD_SPREADSHEET_ID}/values/{quote(GOOGLE_SCOREBOARD_RANGE, safe='!:\'')}:append"
+        google_sheets_request("POST", append_url, params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"}, json_payload={"values": row_values})
+    else:
+        row_range = f"{GOOGLE_SCOREBOARD_TAB_NAME}!A{target_row}:C{target_row}"
+        update_url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SCOREBOARD_SPREADSHEET_ID}/values/{quote(row_range, safe='!:\'')}"
+        google_sheets_request("PUT", update_url, params={"valueInputOption": "USER_ENTERED"}, json_payload={"values": row_values})
+    GOOGLE_SCOREBOARD_CACHE["fetched_at"] = 0.0
+    refreshed = fetch_remote_game_scores(force_refresh=True)
+    if refreshed is not None:
+        save_game_scores(merge_score_sources(load_game_scores(force_refresh_remote=False), refreshed))
+
+
+def get_game_score_snapshot(force_refresh_remote: bool = False) -> Dict[str, Any]:
+    data = load_game_scores(force_refresh_remote=force_refresh_remote)
     users = data.setdefault("users", {})
     username = get_local_username()
     user = users.setdefault(username, {"score": 0})
     leaderboard = sorted(({"user": u, "score": int((v or {}).get("score") or 0)} for u, v in users.items()), key=lambda x: (-x["score"], x["user"].lower()))[:12]
-    return {"username": username, "score": int(user.get("score") or 0), "leaderboard": leaderboard}
+    return {
+        "username": username,
+        "score": int(user.get("score") or 0),
+        "leaderboard": leaderboard,
+        "remote_enabled": google_scoreboard_is_configured(),
+    }
 
 
 def update_game_score(delta: int) -> Dict[str, Any]:
     delta = int(delta or 0)
-    data = load_game_scores()
+    data = load_game_scores(force_refresh_remote=True)
     users = data.setdefault("users", {})
     username = get_local_username()
     user = users.setdefault(username, {"score": 0})
     user["score"] = max(0, int(user.get("score") or 0) + delta)
+    user["last_updated"] = datetime.now(timezone.utc).isoformat()
     save_game_scores(data)
-    snapshot = get_game_score_snapshot()
+    try:
+        upsert_remote_game_score(username, int(user["score"]), user["last_updated"])
+    except Exception as exc:
+        log_message(f"Google scoreboard update failed; local score was still saved. Error: {exc}")
+    snapshot = get_game_score_snapshot(force_refresh_remote=True)
     if GAME_LEADERBOARD_WEBHOOK_URL:
         try:
             requests.post(GAME_LEADERBOARD_WEBHOOK_URL, json={"user": snapshot["username"], "score": snapshot["score"]}, timeout=15)
@@ -979,6 +1165,23 @@ def open_image_from_media(session: requests.Session, media_id: str) -> Image.Ima
     return im
 
 
+def prep_square_output_size(src_w: int, src_h: int) -> tuple[int, int]:
+    side = max(1, min(int(src_w or 0), int(src_h or 0)))
+    output_side = 1000 if side < 1000 else side
+    return (output_side, output_side)
+
+
+def effective_psa_image_type_for_target(target_lane: str, target_slot: str, current_override: str = "") -> str:
+    override = string_value(current_override).strip()
+    if override:
+        return override
+    if string_value(target_lane) == "special" and string_value(target_slot) == "SKU_swatch":
+        return SWATCH_PSA_IMAGE_TYPE_LABEL
+    if string_value(target_lane) == "special" and string_value(target_slot) == "SKU_dimension":
+        return DIMENSIONS_PSA_IMAGE_TYPE_LABEL
+    return ""
+
+
 def parse_target_size(size_text: str) -> tuple[int, int]:
     m = re.match(r"^(\d+)x(\d+)$", string_value(size_text))
     if not m:
@@ -989,7 +1192,7 @@ def parse_target_size(size_text: str) -> tuple[int, int]:
 def prep_mode_to_size(mode: str) -> tuple[int, int]:
     mode = string_value(mode)
     if mode == "crop_square":
-        return (2000, 2000)
+        return (1000, 1000)
     if mode in {"crop_swatch", "pick_swatch"}:
         return (163, 163)
     if mode in ("crop_2200", "pad_tb_2200"):
@@ -1051,6 +1254,147 @@ def get_swatch_crop_bounds(
     return (left, top, left + crop_w, top + crop_h)
 
 
+def get_photo_prep_capability(mode: str, src_w: int, src_h: int) -> dict[str, Any]:
+    mode = string_value(mode) or "crop_1688"
+    src_w = int(src_w or 0)
+    src_h = int(src_h or 0)
+    result: dict[str, Any] = {
+        "kind": "good",
+        "title": "Ready",
+        "detail": "",
+        "can_true_crop": True,
+        "crop_box_width": 0,
+        "crop_box_height": 0,
+        "will_upscale": False,
+    }
+    if src_w <= 0 or src_h <= 0:
+        result.update({
+            "kind": "warn",
+            "title": "Preview unavailable",
+            "detail": "The source image dimensions could not be read.",
+            "can_true_crop": False,
+        })
+        return result
+
+    def warn(title: str, detail: str, crop_w: int = 0, crop_h: int = 0, will_upscale: bool = True) -> dict[str, Any]:
+        return {
+            "kind": "warn",
+            "title": title,
+            "detail": detail,
+            "can_true_crop": False,
+            "crop_box_width": int(crop_w or 0),
+            "crop_box_height": int(crop_h or 0),
+            "will_upscale": bool(will_upscale),
+        }
+
+    if mode == "crop_square":
+        side = min(src_w, src_h)
+        result["crop_box_width"] = side
+        result["crop_box_height"] = side
+        if side < 1000:
+            return warn(
+                "Square will be enlarged",
+                f"Largest true square is {side}x{side}. Output will be upscaled only to 1000x1000.",
+                side,
+                side,
+            )
+        result["detail"] = f"Largest native square crop: {side}x{side}. Output stays at that exact size."
+        return result
+
+    if mode == "crop_swatch":
+        side = min(src_w, src_h)
+        result["crop_box_width"] = side
+        result["crop_box_height"] = side
+        if side < 163:
+            return warn(
+                "Swatch will be enlarged",
+                f"Largest true square is {side}x{side}. Output will be upscaled to 163x163.",
+                side,
+                side,
+            )
+        result["detail"] = f"Largest native square crop: {side}x{side}; final output is 163x163."
+        return result
+
+    if mode == "pick_swatch":
+        crop_w = min(163, src_w)
+        crop_h = min(163, src_h)
+        result["crop_box_width"] = crop_w
+        result["crop_box_height"] = crop_h
+        if src_w < 163 or src_h < 163:
+            return warn(
+                "Swatch box is constrained",
+                f"Only {crop_w}x{crop_h} is available from this source. Output will be enlarged to 163x163.",
+                crop_w,
+                crop_h,
+            )
+        result["detail"] = "True 163x163 swatch crop is available."
+        return result
+
+    if mode == "crop_1688":
+        scaled_h = int(round(src_h * (3000 / max(1, src_w))))
+        result["crop_box_width"] = 3000
+        result["crop_box_height"] = 1688
+        if src_w < 3000 or scaled_h < 1688:
+            return warn(
+                "True crop is not available",
+                f"Source is {src_w}x{src_h}. A native 3000x1688 crop is not available without enlarging the image.",
+                min(3000, src_w),
+                min(1688, scaled_h),
+            )
+        result["detail"] = "True 3000x1688 crop is available."
+        return result
+
+    if mode == "crop_2200":
+        scaled_h = int(round(src_h * (3000 / max(1, src_w))))
+        result["crop_box_width"] = 3000
+        result["crop_box_height"] = 2200
+        if src_w < 3000 or scaled_h < 2200:
+            return warn(
+                "True crop is not available",
+                f"Source is {src_w}x{src_h}. A native 3000x2200 crop is not available without enlarging the image.",
+                min(3000, src_w),
+                min(2200, scaled_h),
+            )
+        result["detail"] = "True 3000x2200 crop is available."
+        return result
+
+    if mode == "crop_remove_sides_1688":
+        result["crop_box_width"] = 3000
+        result["crop_box_height"] = 1688
+        if src_h < 1688 or src_w < 3000:
+            return warn(
+                "True crop is not available",
+                f"Source is {src_w}x{src_h}. This mode will need to enlarge the image to reach 3000x1688.",
+                min(3000, src_w),
+                min(1688, src_h),
+            )
+        result["detail"] = "True 3000x1688 crop is available."
+        return result
+
+    if mode == "pad_lr_1688":
+        result.update({
+            "kind": "notice",
+            "title": "Padding mode",
+            "detail": "This mode keeps the full image and adds white sides instead of cropping.",
+            "can_true_crop": False,
+            "will_upscale": src_w < 3000 or src_h < 1688,
+        })
+        return result
+
+    if mode == "pad_tb_2200":
+        result.update({
+            "kind": "notice",
+            "title": "Padding mode",
+            "detail": "This mode keeps the full image and adds white top and bottom space instead of cropping.",
+            "can_true_crop": False,
+            "will_upscale": src_w < 3000 or src_h < 2200,
+        })
+        return result
+
+    result["detail"] = f"Source image: {src_w}x{src_h}."
+    return result
+
+
 def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offset_y: int | float | None = None, offset_x: int | float | None = None) -> Image.Image:
     mode = string_value(mode) or "crop_1688"
     out_w, out_h = prep_mode_to_size(mode)
@@ -1062,7 +1406,10 @@ def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offs
     if mode == "crop_square":
         bounds = get_square_crop_bounds(src_w, src_h, offset_x)
         square = im.crop(bounds)
-        return square.resize((out_w, out_h), Image.LANCZOS)
+        target_w, target_h = prep_square_output_size(src_w, src_h)
+        if square.size != (target_w, target_h):
+            square = square.resize((target_w, target_h), Image.LANCZOS)
+        return square
 
     if mode == "crop_swatch":
         bounds = get_square_crop_bounds(src_w, src_h, offset_x)
@@ -2052,9 +2399,10 @@ def apply_prepared_media_to_slot(
     offset_x: Any = None,
     psa_image_type_override: str = "",
 ) -> Dict[str, Any]:
+    psa_image_type_override = effective_psa_image_type_for_target(target_lane, target_slot, psa_image_type_override)
     img = open_image_from_media(session, media_id)
     result = prepare_photo_result(img, prep_mode, flip, offset_y, offset_x)
-    out_w, out_h = prep_mode_to_size(prep_mode)
+    out_w, out_h = result.size
     with tempfile.TemporaryDirectory(prefix="content_refresher_prepped_drop_") as td:
         temp_path = Path(td) / f"prepared_{out_w}x{out_h}{'_flip' if flip else ''}.jpg"
         result = result.convert("RGB")
@@ -2258,6 +2606,11 @@ def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot
             "exemplar": exemplar,
             "target_slot": target_slot,
             "deliverable_override": deliverable_override,
+            "psa_image_type_override": (
+                SWATCH_PSA_IMAGE_TYPE_LABEL if target_slot == "SKU_swatch"
+                else DIMENSIONS_PSA_IMAGE_TYPE_LABEL if target_slot == "SKU_dimension"
+                else ""
+            ),
             "target_name": force_jpg_filename(forced_stem, forced_stem),
         }
 
@@ -2376,6 +2729,7 @@ def build_uploaded_new_asset_placeholder(source_asset: Dict[str, Any], target_sk
 
 
 def apply_uploaded_file_to_slot(session: requests.Session, board: Dict[str, Any], row_id: str, target_lane: str, target_slot: str, uploaded_file_storage, psa_image_type_override: str = "") -> str:
+    psa_image_type_override = effective_psa_image_type_for_target(target_lane, target_slot, psa_image_type_override)
     row = get_row_by_id(board, row_id)
     if not row:
         raise RuntimeError("Target row not found.")
@@ -2747,6 +3101,8 @@ def compute_dimension_warning(asset: Dict[str, Any]) -> str:
 def refresh_row_asset_flags(row: Dict[str, Any]) -> None:
     for asset in row.get("assets", []):
         asset["size_warning"] = compute_dimension_warning(asset)
+    row["square_make_recommended"] = bool(row_needs_make_square(row))
+    row["square_make_tooltip"] = "This SKU has at least one room shot. You might be able to make a nice square image out of it." if row.get("square_make_recommended") else ""
 
 
 def asset_to_client_model(asset: Dict[str, Any], sku: str, position_override: Optional[str] = None, lane_override: Optional[str] = None, slot_key_override: Optional[str] = None) -> Dict[str, Any]:
@@ -2771,6 +3127,7 @@ def asset_to_client_model(asset: Dict[str, Any], sku: str, position_override: Op
         "original": original,
         "transformBaseUrl": string_value(asset.get("transformBaseUrl")),
         "deliverable": prop(asset, "Deliverable", "Deliverable"),
+        "psa_image_type": get_existing_psa_image_type_label(asset),
         "current_position": position,
         "last_nontrash_position": position,
         "slot_key": slot_key,
@@ -2789,6 +3146,7 @@ def asset_to_client_model(asset: Dict[str, Any], sku: str, position_override: Op
             "position": position,
             "is_marked_for_deletion": deleted,
             "deliverable": prop(asset, "Deliverable", "Deliverable"),
+        "psa_image_type": get_existing_psa_image_type_label(asset),
         },
         "meta": {
             "productSkuPosition": position,
@@ -3720,7 +4078,7 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                                 "source_media_id": asset.get("copy_source_media_id") or asset.get("id"),
                                 "source_sku": asset.get("copy_source_sku") or asset.get("source_sku") or "",
                                 "deliverable_override": asset.get("deliverable_override") or "",
-                                "psa_image_type_override": asset.get("psa_image_type_override") or get_existing_psa_image_type_label(asset) or "",
+                                "psa_image_type_override": effective_psa_image_type_for_target(asset.get("lane") or "", normalize_position_for_row(current_position, row.get("sku") or ""), asset.get("psa_image_type_override") or get_existing_psa_image_type_label(asset) or ""),
                             }
                         )
                     else:
@@ -3736,11 +4094,13 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                                 "source_media_id": asset.get("copy_source_media_id") or asset.get("id"),
                                 "source_sku": asset.get("copy_source_sku") or asset.get("source_sku") or "",
                                 "target_position": current_position,
+                                "psa_image_type_override": effective_psa_image_type_for_target(asset.get("lane") or "", normalize_position_for_row(current_position, row.get("sku") or ""), asset.get("psa_image_type_override") or get_existing_psa_image_type_label(asset) or ""),
                             }
                         )
                     continue
 
                 payload = {}
+                current_slot_key = normalize_position_for_row(current_position, row.get("sku") or "")
                 if current_position != original_position:
                     payload[f"metaproperty.{PRODUCT_SKU_POSITION_METAPROPERTY_ID}"] = current_position
                 if current_deleted != original_deleted:
@@ -3752,6 +4112,14 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                     deliverable_fields: List[Tuple[str, Any]] = []
                     append_deliverable_field(session, deliverable_fields, metaprops_by_dbname, current_deliverable)
                     for field_key, field_value in deliverable_fields:
+                        payload[field_key] = field_value
+
+
+                if current_slot_key in {"SKU_swatch", "SKU_dimension"}:
+                    psa_label = SWATCH_PSA_IMAGE_TYPE_LABEL if current_slot_key == "SKU_swatch" else DIMENSIONS_PSA_IMAGE_TYPE_LABEL
+                    psa_fields: List[Tuple[str, Any]] = []
+                    append_psa_image_type_field(session, psa_fields, metaprops_by_dbname, psa_label)
+                    for field_key, field_value in psa_fields:
                         payload[field_key] = field_value
 
                 if payload:
@@ -3779,6 +4147,7 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
                 job["target_position"],
                 job.get("asset_name") or "",
                 job.get("deliverable_override") or "",
+                job.get("psa_image_type_override") or "",
             )
             results.append({**job, "success": True, "response": response, "job_type": "copy"})
             new_media_id = string_value(((response or {}).get("new_media_id") if isinstance(response, dict) else "") or ((response or {}).get("id") if isinstance(response, dict) else ""))
@@ -3802,6 +4171,8 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
             if job.get("job_type") == "new_version":
                 staged_path = Path(job.get("staged_file_path") or "")
                 response = upload_new_version_to_media(session, job["media_id"], staged_path, job["asset_name"])
+                if string_value(job.get("psa_image_type_override")):
+                    set_media_psa_image_type(session, job["media_id"], job.get("psa_image_type_override") or "")
                 cleanup_staged_file(str(staged_path))
                 results.append({**job, "success": True, "response": response})
                 success_count += 1
@@ -3851,10 +4222,17 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
     }
     log_path = write_commit_log(log_payload)
 
+    successful_row_ids = sorted({
+        string_value(item.get("row_id"))
+        for item in results
+        if item.get("success") and string_value(item.get("row_id"))
+    })
+
     return {
         "success_count": success_count,
         "failure_count": failure_count,
         "results": results,
+        "success_row_ids": successful_row_ids,
         "log_path": log_path,
         "all_succeeded": failure_count == 0,
     }
@@ -3901,6 +4279,59 @@ def row_requires_wall_art_sizing(row: Dict[str, Any]) -> bool:
     return step_path in CHALLENGE_WALL_ART_SIZING_STEP_PATHS
 
 
+def compact_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", string_value(value).strip().lower())
+
+
+def sales_channel_has_full_line(value: Any) -> bool:
+    return "fullline" in compact_text(value)
+
+
+def row_needs_make_square(row: Dict[str, Any]) -> bool:
+    if string_value(row.get("product_status")).strip().lower() != "active":
+        return False
+    if not sales_channel_has_full_line(row.get("sales_channel")):
+        return False
+    live_assets = [a for a in (row.get("assets") or []) if not a.get("is_marked_for_deletion")]
+    has_room_shot_carousel = any(
+        string_value(a.get("lane")) == "core" and compact_text(a.get("psa_image_type")) == "roomshot"
+        for a in live_assets
+    )
+    if not has_room_shot_carousel:
+        return False
+    square_assets = [
+        a for a in live_assets
+        if string_value(a.get("slot_key") or normalize_position_for_row(a.get("current_position"), row.get("sku") or "")) == "SKU_square"
+    ]
+    if not square_assets:
+        return True
+    square_types = [compact_text(a.get("psa_image_type")) for a in square_assets]
+    if any(t and t != "silo" for t in square_types):
+        return False
+    return any(t == "silo" for t in square_types)
+
+
+def raw_assets_need_make_square(anchor: Dict[str, Any], sku_assets: List[Dict[str, Any]], sku: str) -> bool:
+    if string_value(get_status_from_grid_asset(anchor)).strip().lower() != "active":
+        return False
+    if not sales_channel_has_full_line(prop(anchor, "Sales_Channel", "Sales_Channel")):
+        return False
+    live_assets = [a for a in (sku_assets or []) if not is_marked_for_deletion(a)]
+    has_room_shot_carousel = any(
+        get_lane_and_slot_for_row(get_asset_position(a), sku)[0] == "core" and compact_text(get_existing_psa_image_type_label(a)) == "roomshot"
+        for a in live_assets
+    )
+    if not has_room_shot_carousel:
+        return False
+    square_assets = [a for a in live_assets if normalize_position_for_row(get_asset_position(a), sku) == "SKU_square"]
+    if not square_assets:
+        return True
+    square_types = [compact_text(get_existing_psa_image_type_label(a)) for a in square_assets]
+    if any(t and t != "silo" for t in square_types):
+        return False
+    return any(t == "silo" for t in square_types)
+
+
 def candidate_sort_key(candidate: Dict[str, Any]) -> Tuple[int, float]:
     return (
         -int(candidate.get("issue_total") or 0),
@@ -3934,6 +4365,7 @@ def compute_row_issue_summary(row: Dict[str, Any], include_missing_dims: bool = 
         "missing_dimension": 0 if has_dim else 1,
         "missing_wall_art_sizing": 0 if (has_8000 or not row_requires_wall_art_sizing(row)) else 1,
         "compilable_set_dim": 1 if (not has_dim and bool(row.get("set_dim_compile_ready"))) else 0,
+        "make_square": 1 if bool(row.get("square_make_recommended")) else 0,
         "off_pattern": off_pattern,
         "duplicate_slot": sum(1 for v in dup_counts.values() if v > 1),
         "wrong_deliverable": sum(1 for a in live_assets if string_value(a.get("lane")) not in {"off_pattern", "trash"} and string_value(a.get("deliverable") or a.get("deliverable_override") or "") != expected_deliverable_for_asset(a, string_value(row.get("sku")))),
@@ -3948,7 +4380,7 @@ def compute_row_issue_summary(row: Dict[str, Any], include_missing_dims: bool = 
 def compute_board_issue_summary(board: Dict[str, Any], include_missing_dims: bool = True) -> Dict[str, Any]:
     summary = {
         "missing_grid": 0, "missing_100": 0, "missing_swatch": 0, "missing_dimension": 0,
-        "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "wrong_deliverable": 0, "size_warnings": 0, "total": 0,
+        "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "make_square": 0, "off_pattern": 0, "duplicate_slot": 0, "wrong_deliverable": 0, "size_warnings": 0, "total": 0,
         "rows": {},
     }
     for section in board.get("color_sections", []):
@@ -3958,9 +4390,9 @@ def compute_board_issue_summary(board: Dict[str, Any], include_missing_dims: boo
             row_summary = compute_row_issue_summary(row, include_missing_dims=include_missing_dims)
             if row_summary["total"]:
                 summary["rows"][string_value(row.get("row_id") or row.get("sku"))] = row_summary
-            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"]:
+            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "make_square", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"]:
                 summary[key] += int(row_summary.get(key) or 0)
-    summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"])
+    summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_dimension", "missing_wall_art_sizing", "compilable_set_dim", "make_square", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"])
     return summary
 
 
@@ -4004,7 +4436,7 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
     for color_name, sku_map in by_color_sku.items():
         summary = {
             "missing_grid": 0, "missing_100": 0, "missing_swatch": 0, "missing_dimension": 0,
-            "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "off_pattern": 0, "duplicate_slot": 0, "wrong_deliverable": 0, "size_warnings": 0, "total": 0,
+            "missing_wall_art_sizing": 0, "compilable_set_dim": 0, "make_square": 0, "off_pattern": 0, "duplicate_slot": 0, "wrong_deliverable": 0, "size_warnings": 0, "total": 0,
             "rows": {},
         }
         for sku, sku_assets in sku_map.items():
@@ -4037,6 +4469,7 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
                 "missing_dimension": 0,
                 "missing_wall_art_sizing": 0 if (lane["has_8000"] or step_path not in CHALLENGE_WALL_ART_SIZING_STEP_PATHS) else 1,
                 "compilable_set_dim": 0,
+                "make_square": 1 if raw_assets_need_make_square(anchor, sku_assets, sku) else 0,
                 "off_pattern": off_pattern_count,
                 "duplicate_slot": sum(1 for v in dup_counts.values() if v > 1),
                 "wrong_deliverable": wrong_deliverable_count,
@@ -4045,9 +4478,9 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
             row_summary["total"] = sum(int(v or 0) for k, v in row_summary.items() if k != "total")
             if row_summary["total"]:
                 summary["rows"][sku] = row_summary
-            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"]:
+            for key in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing", "compilable_set_dim", "make_square", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"]:
                 summary[key] += int(row_summary.get(key) or 0)
-        summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing", "compilable_set_dim", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"])
+        summary["total"] = sum(summary[k] for k in ["missing_grid", "missing_100", "missing_swatch", "missing_wall_art_sizing", "compilable_set_dim", "make_square", "off_pattern", "duplicate_slot", "wrong_deliverable", "size_warnings"])
         if int(summary.get("total") or 0) > 0:
             candidates.append(build_game_candidate_from_color(collection_option, color_name, summary))
     candidates.sort(key=candidate_sort_key)
@@ -4232,7 +4665,7 @@ def get_next_hydrated_game_board(force_fill: bool = True, max_attempts: int = 24
 
 
 def game_status_payload() -> Dict[str, Any]:
-    snapshot = get_game_score_snapshot()
+    snapshot = get_game_score_snapshot(force_refresh_remote=True)
     game = STATE["game"]
     with game["lock"]:
         current = deepcopy(game.get("current")) if game.get("current") else None
@@ -4250,7 +4683,7 @@ def game_status_payload() -> Dict[str, Any]:
         "score": snapshot["score"],
         "username": snapshot["username"],
         "leaderboard": snapshot["leaderboard"],
-        "leaderboard_remote": bool(GAME_LEADERBOARD_WEBHOOK_URL),
+        "leaderboard_remote": bool(snapshot.get("remote_enabled")),
     }
 
 
@@ -4852,7 +5285,7 @@ def api_set_dim_compile_apply() -> Response:
                 "special",
                 "SKU_dimension",
                 temp_path,
-                psa_image_type_override="Dimensions_diagram_image",
+                psa_image_type_override=DIMENSIONS_PSA_IMAGE_TYPE_LABEL,
             )
         message = result.get("message") if isinstance(result, dict) else string_value(result)
         notice_html = 'Compiled set dim was added. <button type="button" class="inline-link" data-reload-board>Reload</button> to see it!'
@@ -5551,6 +5984,7 @@ INDEX_HTML = r'''
     background: var(--rf-blue-soft);
     color: var(--rf-navy);
   }
+  .btn-disabled-mode { opacity:.52; filter: grayscale(.25); cursor:not-allowed; }
   .btn-commit {
     background: linear-gradient(90deg, #0f7b4c, #3aa66a);
     color: white;
@@ -5713,7 +6147,7 @@ INDEX_HTML = r'''
   .photo-pull-btn-checking { animation: photoPullCheckingPulse 1.2s ease-in-out infinite; }
   .photo-toolbar { padding: 10px 14px; border-bottom:1px solid #d8e7da; background:#f7fbf7; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
   .photo-body { flex:1; overflow:auto; padding: 12px; }
-  .photo-prep-drawer { position: sticky; top: 0; z-index: 30; isolation:isolate; border:1px solid #cddfd0; background: linear-gradient(180deg,#f8fcf8,#eef7ef); border-radius:16px; padding:10px; margin-bottom:12px; box-shadow:0 8px 18px rgba(65,98,71,.08); }
+  .photo-prep-drawer { position: sticky; top: 0; z-index: 30; isolation:isolate; border:1px solid #cddfd0; background: linear-gradient(180deg,#f8fcf8,#eef7ef); border-radius:16px; padding:8px; margin-bottom:10px; box-shadow:0 8px 18px rgba(65,98,71,.08); }
   .photo-prep-drawer h4 { margin:0 0 4px; font-size:14px; color:#2f5134; }
 
   .set-dim-drawer {
@@ -5744,12 +6178,26 @@ INDEX_HTML = r'''
   .empty-slot-actions { margin-top:6px; display:flex; justify-content:flex-start; }
   .photo-prep-top { display:flex; justify-content:space-between; align-items:center; gap:12px; }
   .photo-prep-sub { font-size:12px; color:#55705a; line-height:1.35; }
-  .photo-prep-controls { display:grid; gap:10px; margin-top:8px; }
+  .photo-prep-controls { display:grid; gap:8px; margin-top:6px; }
   .photo-prep-row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
   .photo-prep-row label { font-size:12px; color:#415346; display:flex; align-items:center; gap:6px; }
-  .photo-prep-preview-wrap { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; align-items:start; }
-  .photo-prep-preview { border:1px solid #d7e6da; background:white; border-radius:14px; min-height:170px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
-  .photo-prep-preview img { width:100%; height:auto; display:block; max-height:270px; object-fit:contain; }
+  .photo-prep-preview-wrap { display:grid; grid-template-columns:minmax(0,1fr); gap:8px; align-items:start; }
+  .photo-prep-preview-meta { display:grid; gap:6px; }
+  .photo-prep-status { display:flex; align-items:flex-start; gap:8px; border-radius:12px; padding:8px 10px; border:1px solid #cfe1d4; background:#f7fcf8; color:#315037; }
+  .photo-prep-status.warn { background:#fff5f2; border-color:#f0c5b8; color:#8a4630; }
+  .photo-prep-status.notice { background:#f7f4ff; border-color:#ddd0ef; color:#5a4684; }
+  .photo-prep-status-icon { width:24px; height:24px; border-radius:999px; display:grid; place-items:center; flex:0 0 auto; font-size:14px; font-weight:900; background:rgba(49,80,55,.1); }
+  .photo-prep-status.warn .photo-prep-status-icon { background:rgba(138,70,48,.12); }
+  .photo-prep-status.notice .photo-prep-status-icon { background:rgba(90,70,132,.12); }
+  .photo-prep-status-title { font-size:12px; font-weight:900; line-height:1.2; }
+  .photo-prep-status-detail { font-size:11px; line-height:1.35; margin-top:2px; }
+  .photo-prep-preview { border:1px solid #d7e6da; background:white; border-radius:14px; min-height:145px; display:flex; align-items:center; justify-content:center; overflow:hidden; position:relative; }
+  .photo-prep-preview.warn { border-color:#efc2b4; box-shadow: inset 0 0 0 2px rgba(232,128,91,.12); }
+  .photo-prep-preview.notice { border-color:#ddd0ef; }
+  .photo-prep-preview-badge { position:absolute; top:10px; left:10px; z-index:2; display:inline-flex; align-items:center; gap:6px; padding:7px 10px; border-radius:999px; background:rgba(49,80,55,.94); color:#fff; font-size:11px; font-weight:900; letter-spacing:.01em; box-shadow:0 8px 18px rgba(49,80,55,.18); }
+  .photo-prep-preview.warn .photo-prep-preview-badge { background:rgba(168,78,42,.96); }
+  .photo-prep-preview.notice .photo-prep-preview-badge { background:rgba(90,70,132,.96); }
+  .photo-prep-preview img { width:100%; height:auto; display:block; max-height:220px; object-fit:contain; }
   .photo-prep-preview-drag { width:100%; display:flex; align-items:center; justify-content:center; cursor:grab; }
   .photo-prep-preview-drag.dragging { cursor:grabbing; opacity:.96; }
   .photo-prep-filmstrip { display:none; }
@@ -5757,18 +6205,24 @@ INDEX_HTML = r'''
   .photo-prep-film-btn.active { border-color:#5ea870; box-shadow:0 0 0 2px rgba(94,168,112,.18); }
   .photo-prep-film-btn img { width:42px; height:42px; object-fit:contain; background:#f4f7f4; border-radius:8px; }
   .photo-prep-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; align-items:center; }
-  .photo-prep-toolbar { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; align-items:start; }
-  .photo-prep-left { display:grid; gap:8px; }
-  .photo-prep-focusbox { display:flex; flex-wrap:nowrap; gap:12px; align-items:center; border:1px solid #d7e6da; background:#fff; border-radius:12px; padding:10px 12px; max-width:520px; }
+  .photo-prep-toolbar { display:grid; grid-template-columns:minmax(0,1fr); gap:8px; align-items:start; }
+  .photo-prep-left { display:grid; gap:6px; }
+  .photo-prep-focusbox { display:flex; flex-wrap:wrap; gap:10px; align-items:center; border:1px solid #d7e6da; background:#fff; border-radius:12px; padding:8px 10px; max-width:560px; }
   .photo-focus-pad { display:flex; flex-wrap:nowrap; gap:6px; align-items:center; justify-content:flex-start; }
-  .photo-focus-pad button { width:30px; height:30px; border-radius:8px; border:1px solid #cddfd0; background:#f7fbf7; color:#315037; cursor:pointer; font-size:16px; line-height:1; }
+  .photo-focus-pad-stack { display:grid; gap:8px; }
+  .photo-focus-row { display:flex; gap:6px; align-items:center; justify-content:flex-start; }
+  .photo-focus-pad button { width:34px; height:34px; border-radius:10px; border:1px solid #cddfd0; background:linear-gradient(180deg,#ffffff 0%, #f2faf3 100%); color:#315037; cursor:pointer; line-height:1; display:grid; place-items:center; box-shadow:0 4px 10px rgba(49,80,55,.08); transition:transform .12s ease, box-shadow .12s ease, border-color .12s ease; }
+  .photo-focus-pad button:hover { transform:translateY(-1px); box-shadow:0 6px 12px rgba(49,80,55,.12); border-color:#b6d0bb; }
+  .photo-focus-pad button:active { transform:translateY(0); }
+  .photo-focus-pad svg { width:18px; height:18px; stroke:currentColor; fill:none; stroke-width:1.85; stroke-linecap:round; stroke-linejoin:round; }
+  .photo-focus-pad button.jump { background:linear-gradient(180deg,#f4fbf5 0%, #e8f5ea 100%); }
   .photo-focus-pad .blank { display:none; }
   .photo-focus-meta { display:grid; gap:4px; font-size:12px; color:#4f6355; }
   .photo-focus-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius:999px; background:#eef6ef; border:1px solid #d7e6da; font-size:12px; color:#35543b; }
   .photo-prep-active { display:none; }
-  .photo-prep-options { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
-  .photo-prep-options label { font-size:12px; color:#415346; display:flex; align-items:center; gap:6px; }
-  .photo-prep-note { font-size:11px; color:#5d7463; }
+  .photo-prep-options { display:grid; grid-template-columns:repeat(2, minmax(180px, 1fr)); gap:8px 12px; align-items:start; }
+  .photo-prep-options label { font-size:11px; color:#415346; display:flex; align-items:flex-start; gap:6px; line-height:1.2; }
+  .photo-prep-note { font-size:10.5px; color:#5d7463; line-height:1.25; }
   .photo-shell.collapsed #photoToggleBtn {
     width: 44px;
     height: 44px;
@@ -5996,6 +6450,22 @@ INDEX_HTML = r'''
   .slot.slot-missing-critical .slot-label,
   .slot.slot-missing-critical .empty {
     color: #fff1ef;
+  }
+  .slot.slot-make-square {
+    background: #fff5f5;
+    border-color: #d95c5c;
+    box-shadow: inset 0 0 0 1px rgba(217, 92, 92, 0.14);
+  }
+  .slot.slot-make-square .slot-label {
+    color: #9b1c1c;
+  }
+  .make-square-hint {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 800;
+    color: #b42318;
+    cursor: help;
   }
   .slot-label {
     font-size: 11px;
@@ -6373,7 +6843,19 @@ INDEX_HTML = r'''
   .game-modes-panel { padding: 4px 12px 6px; border-top: 1px solid #efe5f6; display: grid; gap: 6px; }
   .game-mode-card { border: 1px solid var(--rf-border); border-radius: 14px; padding: 10px; background: linear-gradient(180deg,#fbf8ff,#f3ebfb); }
   .game-mode-launch { display:flex; gap:10px; align-items:flex-start; cursor:pointer; }
-  .game-mode-icon { width: 44px; height: 44px; border-radius: 14px; display:flex; align-items:center; justify-content:center; background: linear-gradient(135deg,#4f245e,#8a5bb0); color:white; font-size:22px; box-shadow: 0 8px 20px rgba(79,36,94,.18); }
+  .game-mode-icon { width: 44px; height: 44px; border-radius: 14px; display:flex; align-items:center; justify-content:center; position:relative; overflow:hidden; background: linear-gradient(135deg,#4f245e,#8a5bb0); color:white; font-size:22px; box-shadow: 0 8px 20px rgba(79,36,94,.18); }
+  .game-mode-icon .tool-duo { position:relative; width:24px; height:24px; display:block; }
+  .game-mode-icon .tool-duo .tool { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; transform-origin:center; transition: transform .18s ease, filter .22s ease, opacity .22s ease; }
+  .game-mode-icon .tool-duo .hammer { transform: rotate(-20deg) translate(-3px, -1px); filter: grayscale(1) saturate(.55) brightness(.8); opacity:.72; }
+  .game-mode-icon .tool-duo .wrench { transform: rotate(25deg) translate(3px, 1px); filter: grayscale(1) saturate(.55) brightness(.8); opacity:.72; }
+  .game-mode-icon.ready { background: linear-gradient(135deg,#4f245e 0%,#7d3bc0 42%,#b46cff 100%); box-shadow: 0 10px 24px rgba(123,44,191,.26); }
+  .game-mode-icon.ready::after { content:''; position:absolute; inset:-20%; background: radial-gradient(circle at center, rgba(255,255,255,.32), rgba(255,255,255,0) 56%); animation: gameIconPulse 1.8s ease-in-out infinite; pointer-events:none; }
+  .game-mode-icon.ready .tool-duo .hammer { filter: none; opacity:1; transform: rotate(-20deg) translate(-3px, -1px) scale(1.06); }
+  .game-mode-icon.ready .tool-duo .wrench { filter: none; opacity:1; transform: rotate(25deg) translate(3px, 1px) scale(1.06); }
+  .game-mode-icon.empty { background: linear-gradient(135deg,#6f6377,#8a7f92); box-shadow:none; }
+  .game-mode-icon.empty .tool-duo .hammer,
+  .game-mode-icon.empty .tool-duo .wrench { filter: grayscale(1) saturate(.18) brightness(.72); opacity:.42; }
+  @keyframes gameIconPulse { 0%,100% { transform: scale(.85); opacity:.2; } 50% { transform: scale(1.15); opacity:.6; } }
   .game-mode-title { font-weight: 800; color: var(--rf-navy); margin: 0 0 4px; }
   .game-mode-sub { color:#6d5a77; font-size:12px; line-height:1.35; }
   .game-scoreboard { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
@@ -6390,6 +6872,10 @@ INDEX_HTML = r'''
   .game-mode-icon-only { display:flex; align-items:center; justify-content:flex-start; padding:2px 0 0; }
   .game-mode-icon-only button { border:0; background:transparent; padding:0; cursor:pointer; display:flex; align-items:flex-start; justify-content:flex-start; }
   .game-mode-icon-only .game-mode-icon { width:29px; height:29px; font-size:14px; border-radius:10px; }
+  .game-mode-icon-only .game-mode-icon .tool-duo { width:16px; height:16px; }
+  .game-mode-icon-only .game-mode-icon .tool-duo .hammer { transform: rotate(-20deg) translate(-2px, -1px); }
+  .game-mode-icon-only .game-mode-icon .tool-duo .wrench { transform: rotate(24deg) translate(2px, 1px); }
+  .brand-mini-top .game-mode-icon .tool-duo { width:18px; height:18px; }
   .brand-panel.game-active { padding: 10px 12px; }
   .brand-mini-game { display:grid; grid-template-columns: 1fr; gap:6px; color:#fff; }
   .brand-mini-top { display:flex; align-items:center; gap:8px; }
@@ -6404,13 +6890,32 @@ INDEX_HTML = r'''
   .brand-mini-pill .k { font-size:8px; line-height:1; text-transform:uppercase; letter-spacing:.08em; font-weight:800; opacity:.84; }
   .brand-mini-pill .v { font-size:13px; line-height:1.05; font-weight:900; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .brand-mini-pill .s { font-size:9px; line-height:1.15; opacity:.9; margin-top:3px; }
-  .brand-mini-actions { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
-  .brand-mini-actions .game-mini-btn { padding:5px 8px; font-size:10px; }
+  .brand-mini-actions { display:grid; grid-template-columns:1fr 1fr 1fr; gap:4px; align-items:center; margin-top:2px; }
+  .brand-mini-actions .game-mini-btn { padding:4px 6px; font-size:10px; line-height:1.1; min-height:28px; }
   .brand-mini-actions .game-mini-btn.primary { filter:saturate(1.12) brightness(1.03); }
-  .brand-mini-actions .game-mini-btn.primary { grid-column:1 / -1; }
-  .brand-mini-leader { display:grid; gap:3px; }
+  .brand-mini-leader { display:grid; gap:5px; }
+  .brand-mini-leader-toggle { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; border:1px solid rgba(255,255,255,.16); background:rgba(255,255,255,.08); color:#fff; border-radius:10px; padding:6px 8px; cursor:pointer; font:inherit; }
   .brand-mini-leader-title { font-size:8px; line-height:1; text-transform:uppercase; letter-spacing:.1em; font-weight:800; opacity:.84; }
+  .brand-mini-leader-caret { font-size:11px; opacity:.9; }
+  .brand-mini-leader-rows { display:grid; gap:3px; }
   .brand-mini-leader-row { display:flex; justify-content:space-between; gap:6px; padding:3px 5px; border-radius:8px; background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.16); font-size:9px; line-height:1.1; }
+
+  .wait-mini-game { margin-top: 14px; padding: 14px; border-radius: 16px; border: 1px solid #eadcf8; background: linear-gradient(180deg,#fcf9ff,#f5eefc); display:none; }
+  .wait-mini-game.open { display:block; }
+  .wait-mini-top { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }
+  .wait-mini-title { font-weight:800; color:var(--rf-navy); font-size:16px; }
+  .wait-mini-score { font-size:13px; color:#6d5a77; }
+  .wait-mini-score strong { color:var(--rf-purple); font-size:18px; }
+  .wait-mini-sub { margin:0 0 10px; font-size:12px; color:#7a6884; }
+  .wait-mini-board { position:relative; height:300px; border-radius:16px; border:1px dashed #dcc7f0; background:
+      radial-gradient(circle at 18% 20%, rgba(255,255,255,.85), rgba(255,255,255,0) 24%),
+      linear-gradient(180deg,#fffaf3 0%,#f8f1ff 100%);
+      overflow:hidden; }
+  .wait-mini-bunny { position:absolute; width:92px; height:92px; border-radius:999px; border:1px solid #dcbef5; background: linear-gradient(180deg,#ffffff,#f4e7ff); box-shadow:0 10px 24px rgba(123,44,191,.18); display:flex; align-items:center; justify-content:center; cursor:pointer; user-select:none; font-size:42px; transition: left .34s ease, top .34s ease, transform .12s ease, box-shadow .12s ease; touch-action: manipulation; }
+  .wait-mini-bunny:hover { transform: scale(1.05) rotate(-4deg); box-shadow:0 12px 28px rgba(123,44,191,.22); }
+  .wait-mini-bunny:active { transform: scale(.95); }
+  .wait-mini-hint { margin-top:8px; font-size:12px; color:#8a7794; min-height:18px; }
+
   .game-celebration { position:fixed; inset:0; pointer-events:none; display:none; align-items:center; justify-content:center; z-index:10030; }
   .game-celebration.show { display:flex; }
   .game-celebration-card { min-width:min(420px,90vw); background:rgba(79,36,94,.95); color:white; border-radius:20px; padding:22px 26px; box-shadow:0 24px 60px rgba(0,0,0,.22); text-align:center; animation:gameCelebrate .9s ease; }
@@ -6592,6 +7097,17 @@ INDEX_HTML = r'''
       <h3>Giving Bynder a moment...</h3>
       <p>Your updates went through. Waiting 30 seconds before checking for refreshed metadata.</p>
       <div class="wait-status" id="waitStatus">Standing by...</div>
+      <div class="wait-mini-game" id="waitMiniGame">
+        <div class="wait-mini-top">
+          <div class="wait-mini-title">Boop the dust bunny</div>
+          <div class="wait-mini-score">Boops: <strong id="waitMiniScore">0</strong></div>
+        </div>
+        <p class="wait-mini-sub">Boop the floof while Bynder does its little metadata paperwork.</p>
+        <div class="wait-mini-board" id="waitMiniBoard">
+          <button type="button" class="wait-mini-bunny" id="waitMiniBunny" onpointerdown="boopWaitMiniBunny(event)" aria-label="Boop the dust bunny">🐇</button>
+        </div>
+        <div class="wait-mini-hint" id="waitMiniHint">A larger bunny. A kinder pace. Considerably more boopable.</div>
+      </div>
     </div>
   </div>
   <div class="idle-overlay" id="idleOverlay">
@@ -6671,14 +7187,19 @@ const state = {
     score: 0,
     username: '',
     leaderboard: [],
+    leaderboardOpen: false,
     current: null,
     loading: false,
+    launchOverlayOpen: false,
     lastEnsureAt: 0,
   },
   waitFlow: {
     open: false,
     baselineFingerprint: '',
     activeToken: 0,
+    miniGameOpen: false,
+    miniGameScore: 0,
+    miniGameTimer: null,
   },
   messagePollTimer: null,
   idle: {
@@ -6833,12 +7354,17 @@ function boardFingerprint(board) {
   return parts.join('|');
 }
 
-function setWaitOverlay(open, statusText='') {
+function setWaitOverlay(open, statusText='', options={}) {
   state.waitFlow.open = !!open;
   const overlay = document.getElementById('waitOverlay');
   const status = document.getElementById('waitStatus');
   if (overlay) overlay.classList.toggle('open', !!open);
   if (status && statusText) status.textContent = statusText;
+  if (open && options && options.miniGame) {
+    if (!state.waitFlow.miniGameOpen) startWaitMiniGame();
+  } else {
+    stopWaitMiniGame();
+  }
 }
 
 function setReloadButtonFlashing(isFlashing) {
@@ -6910,6 +7436,81 @@ async function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+
+function getGameIconMarkup(ready=false, compact=false) {
+  const cls = ready ? 'ready' : 'empty';
+  const title = ready ? 'Cleanup Challenge candidates ready' : 'Cleanup Challenge queue is still empty';
+  return `<div class="game-mode-icon ${cls}" title="${escapeHtml(title)}"><span class="tool-duo"><span class="tool hammer">🔨</span><span class="tool wrench">🔧</span></span></div>`;
+}
+
+function stopWaitMiniGame() {
+  const gameEl = document.getElementById('waitMiniGame');
+  if (gameEl) gameEl.classList.remove('open');
+  if (state.waitFlow.miniGameTimer) {
+    clearInterval(state.waitFlow.miniGameTimer);
+    state.waitFlow.miniGameTimer = null;
+  }
+  state.waitFlow.miniGameOpen = false;
+}
+
+function moveWaitMiniBunny() {
+  const board = document.getElementById('waitMiniBoard');
+  const bunny = document.getElementById('waitMiniBunny');
+  if (!board || !bunny) return;
+  const pad = 12;
+  const maxLeft = Math.max(0, board.clientWidth - bunny.offsetWidth - (pad * 2));
+  const maxTop = Math.max(0, board.clientHeight - bunny.offsetHeight - (pad * 2));
+  const left = Math.round(Math.random() * maxLeft) + pad;
+  const top = Math.round(Math.random() * maxTop) + pad;
+  bunny.style.left = `${left}px`;
+  bunny.style.top = `${top}px`;
+}
+
+function startWaitMiniGame() {
+  const gameEl = document.getElementById('waitMiniGame');
+  const scoreEl = document.getElementById('waitMiniScore');
+  const hintEl = document.getElementById('waitMiniHint');
+  if (!gameEl || !scoreEl) return;
+  stopWaitMiniGame();
+  state.waitFlow.miniGameOpen = true;
+  state.waitFlow.miniGameScore = 0;
+  scoreEl.textContent = '0';
+  if (hintEl) hintEl.textContent = 'Big floof on deck. Slow enough to boop. Emotionally available.';
+  gameEl.classList.add('open');
+  moveWaitMiniBunny();
+  state.waitFlow.miniGameTimer = window.setInterval(moveWaitMiniBunny, 2400);
+}
+
+function boopWaitMiniBunny(evt) {
+  if (evt) {
+    evt.stopPropagation();
+    evt.preventDefault();
+  }
+  if (!state.waitFlow.miniGameOpen) return;
+  state.waitFlow.miniGameScore = Number(state.waitFlow.miniGameScore || 0) + 1;
+  const scoreEl = document.getElementById('waitMiniScore');
+  const hintEl = document.getElementById('waitMiniHint');
+  const bunny = document.getElementById('waitMiniBunny');
+  if (scoreEl) scoreEl.textContent = String(state.waitFlow.miniGameScore);
+  if (bunny) bunny.style.transform = 'scale(0.92)';
+  if (hintEl) {
+    if (state.waitFlow.miniGameScore >= 15) hintEl.textContent = 'Legendary floof wrangler. Extremely boop-forward.';
+    else if (state.waitFlow.miniGameScore >= 10) hintEl.textContent = 'Honestly? Clinical levels of boop accuracy.';
+    else if (state.waitFlow.miniGameScore >= 6) hintEl.textContent = 'You are absolutely handling this floof.';
+    else if (state.waitFlow.miniGameScore >= 3) hintEl.textContent = 'Nice. Very boopable.';
+    else hintEl.textContent = 'Confirmed boop. Morale is excellent.';
+  }
+  window.setTimeout(() => {
+    if (bunny) bunny.style.transform = '';
+    if (state.waitFlow.miniGameOpen) moveWaitMiniBunny();
+  }, 520);
+}
+
+function toggleGameLeaderboard() {
+  state.game.leaderboardOpen = !state.game.leaderboardOpen;
+  renderBrandPanel();
+}
+
 function renderBrandPanel() {
   const panel = document.getElementById('brandPanel');
   const host = document.getElementById('brandPanelMount');
@@ -6926,11 +7527,12 @@ function renderBrandPanel() {
   panel.classList.add('game-active');
   const currentLabel = escapeHtml((((g.current || {}).collection || {}).label || ''));
   const currentColor = escapeHtml((g.current || {}).color || '');
-  const leaderboardRows = (g.leaderboard || []).slice(0,3).map((entry, idx) => `<div class="brand-mini-leader-row"><span>${idx + 1}. ${escapeHtml(entry.user || 'player')}</span><strong>${Number(entry.score || 0)}</strong></div>`).join('');
+  const leaderboardRows = (g.leaderboard || []).slice(0,12).map((entry, idx) => `<div class="brand-mini-leader-row"><span>${idx + 1}. ${escapeHtml(entry.user || 'player')}</span><strong>${Number(entry.score || 0)}</strong></div>`).join('');
+  const leaderboardOpen = !!g.leaderboardOpen;
   host.innerHTML = `
     <div class="brand-mini-game">
       <div class="brand-mini-top">
-        <div class="game-mode-icon">🛠️</div>
+        ${getGameIconMarkup(Number(g.queueLength || 0) > 0)}
         <div class="brand-mini-title-wrap">
           <div class="brand-mini-kicker">Game mode</div>
           <div class="brand-mini-title">Cleanup Challenge</div>
@@ -6944,13 +7546,16 @@ function renderBrandPanel() {
         <div class="brand-mini-pill wide"><div class="k">Current challenge</div><div class="v">${currentLabel || 'Loading...'}</div><div class="s">${currentColor || 'Finding a colorway with work to tackle'}</div></div>
       </div>
       <div class="brand-mini-actions">
-        <button type="button" class="game-mini-btn primary" onclick="launchCleanupChallenge()">Show next board</button>
+        <button type="button" class="game-mini-btn primary" onclick="launchCleanupChallenge()">Next</button>
         <button type="button" class="game-mini-btn pass" onclick="passCleanupChallenge()">Pass</button>
-        <button type="button" class="game-mini-btn exit" onclick="exitCleanupChallenge()">Leave mode</button>
+        <button type="button" class="game-mini-btn exit" onclick="exitCleanupChallenge()">Leave</button>
       </div>
       <div class="brand-mini-leader">
-        <div class="brand-mini-leader-title">Workshop leaderboard</div>
-        ${leaderboardRows || `<div class="brand-mini-leader-row"><span>No scores yet</span><strong>0</strong></div>`}
+        <button type="button" class="brand-mini-leader-toggle" onclick="toggleGameLeaderboard()">
+          <span class="brand-mini-leader-title">Workshop leaderboard</span>
+          <span class="brand-mini-leader-caret">${leaderboardOpen ? '&#9662;' : '&#9656;'}</span>
+        </button>
+        ${leaderboardOpen ? `<div class="brand-mini-leader-rows">${leaderboardRows || `<div class="brand-mini-leader-row"><span>No scores yet</span><strong>0</strong></div>`}</div>` : ''}
       </div>
     </div>
   `;
@@ -6959,10 +7564,13 @@ function renderBrandPanel() {
 function renderGameModesPanel() {
   const host = document.getElementById('gameModesPanel');
   if (!host) return;
+  const g = state.game || {};
+  const ready = Number(g.queueLength || 0) > 0;
+  const title = g.loading ? 'Cleanup Challenge is loading' : (ready ? 'Cleanup Challenge candidates ready' : 'Cleanup Challenge is scanning for candidates');
   host.innerHTML = `
     <div class="game-mode-icon-only">
-      <button type="button" onclick="launchCleanupChallenge()" title="Launch Cleanup Challenge" aria-label="Launch Cleanup Challenge">
-        <div class="game-mode-icon">🛠️</div>
+      <button type="button" onclick="launchCleanupChallenge()" title="${escapeHtml(title)}" aria-label="Launch Cleanup Challenge">
+        ${getGameIconMarkup(ready)}
       </button>
     </div>
   `;
@@ -6976,6 +7584,7 @@ function syncGameState(game) {
   state.game.username = String(game.username || state.game.username || '');
   state.game.current = game.current || null;
   state.game.leaderboard = game.leaderboard || state.game.leaderboard || [];
+  state.game.leaderboardOpen = !!state.game.leaderboardOpen;
   renderGameModesPanel();
   renderBrandPanel();
 }
@@ -7027,6 +7636,10 @@ async function launchCleanupChallenge() {
     const okay = confirm('Launch Cleanup Challenge? You will leave the regular workspace and jump into a workshop-style board with real content issues to fix, live scoring, and fresh challenge boards queued in the background.');
     if (!okay) return;
   }
+  state.game.loading = true;
+  renderGameModesPanel();
+  renderBrandPanel();
+  setWaitOverlay(true, g.active ? 'Finding the next Cleanup Challenge board...' : 'Loading your first Cleanup Challenge board...', {miniGame:true});
   try {
     const url = g.active ? '/api/game/next' : '/api/game/launch';
     const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'launch'})});
@@ -7036,11 +7649,21 @@ async function launchCleanupChallenge() {
     showGameCelebration('Cleanup Challenge', 'Fresh board loaded. Go score some fixes.');
     scheduleGameQueueEnsure();
   } catch (err) { alert(err.message || String(err)); }
+  finally {
+    state.game.loading = false;
+    setWaitOverlay(false);
+    renderGameModesPanel();
+    renderBrandPanel();
+  }
 }
 
 async function passCleanupChallenge() {
   if (!state.game.active) return;
   if (!confirm('Pass on this challenge and load a new one?')) return;
+  state.game.loading = true;
+  renderGameModesPanel();
+  renderBrandPanel();
+  setWaitOverlay(true, 'Skipping this one and loading the next Cleanup Challenge board...', {miniGame:true});
   try {
     const resp = await fetch('/api/game/next', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'pass'})});
     const data = await resp.json();
@@ -7049,6 +7672,12 @@ async function passCleanupChallenge() {
     showGameCelebration('Passed', 'Showing the next board.');
     scheduleGameQueueEnsure();
   } catch (err) { alert(err.message || String(err)); }
+  finally {
+    state.game.loading = false;
+    setWaitOverlay(false);
+    renderGameModesPanel();
+    renderBrandPanel();
+  }
 }
 
 async function exitCleanupChallenge() {
@@ -7076,6 +7705,7 @@ function scheduleGameQueueEnsure() {
 function renderModeUI() {
   const help = document.getElementById('modeHelp');
   const modePanel = document.getElementById('modePanel');
+  const commitBtn = document.getElementById('commitBtn');
   document.querySelectorAll('input[name="appMode"]').forEach(el => {
     el.checked = el.value === state.mode;
   });
@@ -7084,8 +7714,18 @@ function renderModeUI() {
   if (modePanel) modePanel.classList.toggle('assets-mode', state.mode === 'assets');
   if (state.mode === 'assets') {
     help.innerHTML = 'Update assets disables reordering and lets you drop files onto slots to create new assets or upload new versions. Asset uploads happen <strong>immediately</strong> in this mode.';
+    if (commitBtn) {
+      commitBtn.disabled = true;
+      commitBtn.title = 'Update in Bynder is only used in Update positions mode.';
+      commitBtn.classList.add('btn-disabled-mode');
+    }
   } else {
     help.textContent = 'Update positions stages reorder, trash, restore, and cross-SKU copy changes. File uploads are disabled in this mode.';
+    if (commitBtn && !state.commitInFlight) {
+      commitBtn.disabled = false;
+      commitBtn.title = '';
+      commitBtn.classList.remove('btn-disabled-mode');
+    }
   }
 }
 
@@ -7622,13 +8262,23 @@ function renderEmptySlotActions(row, lane, slotName, items) {
   return '';
 }
 
+function renderSquareOpportunityHint(row, slotName) {
+  if (!row || slotName !== 'SKU_square' || !row.square_make_recommended) return '';
+  const tip = row.square_make_tooltip || 'This SKU has at least one room shot. You might be able to make a nice square image out of it.';
+  return `<div class="empty-slot-actions"><span class="make-square-hint" title="${escapeHtml(tip)}">Make a square</span></div>`;
+}
+
 function renderSlot(rowId, lane, slotName, items, label, changedSet, extraClass='') {
   const row = getRowById(rowId);
   const isCriticalMissing = slotNeedsCriticalHighlight(row, slotName, items);
+  const needsMakeSquare = !!(row && slotName === 'SKU_square' && row.square_make_recommended);
   const emptyActions = renderEmptySlotActions(row, lane, slotName, items);
-  const cards = items.length ? items.map(a => renderAssetCard(a, changedSet.has(a.id))).join('') : `<div class="empty">${isCriticalMissing ? 'Missing required image' : 'Drop here'}</div>${emptyActions}`;
+  const squareHint = renderSquareOpportunityHint(row, slotName);
+  const cards = items.length
+    ? `${items.map(a => renderAssetCard(a, changedSet.has(a.id))).join('')}${squareHint}`
+    : `<div class="empty">${isCriticalMissing ? 'Missing required image' : 'Drop here'}</div>${emptyActions}${squareHint}`;
   return `
-    <div class="slot ${extraClass} ${isCriticalMissing ? 'slot-missing-critical' : ''}" data-row-id="${escapeHtml(rowId)}" data-lane="${escapeHtml(lane)}" data-slot="${escapeHtml(slotName)}">
+    <div class="slot ${extraClass} ${isCriticalMissing ? 'slot-missing-critical' : ''} ${needsMakeSquare ? 'slot-make-square' : ''}" data-row-id="${escapeHtml(rowId)}" data-lane="${escapeHtml(lane)}" data-slot="${escapeHtml(slotName)}">
       <div class="slot-label">${escapeHtml(label)}</div>
       ${cards}
     </div>
@@ -7843,13 +8493,14 @@ function activePhotoOffsetY(photoId) {
   const mode = prepModeFromState();
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
-  if (!srcW || !srcH || !mode.startsWith('crop_') || mode === 'crop_square' || mode === 'crop_swatch') return 0;
+  if (!srcW || !srcH) return 0;
   if (mode === 'pick_swatch') {
     const cropH = Math.min(163, srcH);
     const maxOff = Math.max(0, srcH - cropH);
     if (overrides[photoId] === undefined || overrides[photoId] === null) return Math.round(maxOff / 2);
     return Math.max(0, Math.min(maxOff, Number(overrides[photoId] || 0)));
   }
+  if (!mode.startsWith('crop_') || mode === 'crop_square' || mode === 'crop_swatch') return 0;
   const outH = mode === 'crop_2200' ? 2200 : 1688;
   const scaledH = Math.round(srcH * (3000 / srcW));
   const maxOff = Math.max(0, scaledH - outH);
@@ -7878,21 +8529,132 @@ function activePhotoOffsetX(photoId) {
 }
 
 
-function prepModeOutputSize(mode) {
+function prepModeOutputSize(mode, active=null) {
   const m = String(mode || '');
+  const photo = active || currentActivePhoto();
+  const srcW = Number(photo?.width || 0) || 0;
+  const srcH = Number(photo?.height || 0) || 0;
   if (m === 'crop_2200' || m === 'pad_tb_2200') return '3000x2200';
-  if (m === 'crop_square') return '2000x2000';
+  if (m === 'crop_square') {
+    const side = Math.min(srcW || 1000, srcH || 1000) || 1000;
+    const out = side < 1000 ? 1000 : side;
+    return `${out}x${out}`;
+  }
   if (m === 'crop_swatch' || m === 'pick_swatch') return '163x163';
   return '3000x1688';
+}
+
+function prepArrowIcon(direction, jump=false) {
+  const dir = String(direction || '').toLowerCase();
+  const arrows = {
+    left: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 10H5.5"></path><path d="M9 6.5L5.5 10L9 13.5"></path></svg>',
+    right: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 10H14.5"></path><path d="M11 6.5L14.5 10L11 13.5"></path></svg>',
+    up: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15.5V5.5"></path><path d="M6.5 9L10 5.5L13.5 9"></path></svg>',
+    down: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4.5V14.5"></path><path d="M6.5 11L10 14.5L13.5 11"></path></svg>'
+  };
+  const jumps = {
+    left: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 10H7"></path><path d="M10.5 6.5L7 10L10.5 13.5"></path><path d="M4.5 5.5V14.5"></path></svg>',
+    right: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 10H13"></path><path d="M9.5 6.5L13 10L9.5 13.5"></path><path d="M15.5 5.5V14.5"></path></svg>',
+    up: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15.5V7"></path><path d="M6.5 10.5L10 7L13.5 10.5"></path><path d="M5.5 4.5H14.5"></path></svg>',
+    down: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4.5V13"></path><path d="M6.5 9.5L10 13L13.5 9.5"></path><path d="M5.5 15.5H14.5"></path></svg>'
+  };
+  return jump ? (jumps[dir] || arrows[dir] || '') : (arrows[dir] || '');
+}
+
+function prepFeasibilityInfo(photo, mode) {
+  const srcW = Number(photo?.width || 0) || 0;
+  const srcH = Number(photo?.height || 0) || 0;
+  const info = { kind:'good', title:'Ready', detail:'', badge:'Native crop', previewClass:'', icon:'OK' };
+  if (!srcW || !srcH) {
+    return { kind:'warn', title:'Source size unavailable', detail:'The image dimensions are missing, so crop reliability cannot be confirmed.', badge:'Check source', previewClass:'warn', icon:'!' };
+  }
+  if (mode === 'crop_square') {
+    const side = Math.min(srcW, srcH);
+    if (side < 1000) return { kind:'warn', title:'Square will upscale', detail:`Largest real square is ${side}x${side}. Output will be enlarged only to 1000x1000.`, badge:'Upscaling', previewClass:'warn', icon:'!' };
+    return { ...info, detail:`Largest real square crop: ${side}x${side}. Output stays at that exact size.`, badge:`${side} square` };
+  }
+  if (mode === 'crop_swatch') {
+    const side = Math.min(srcW, srcH);
+    if (side < 163) return { kind:'warn', title:'Swatch will upscale', detail:`Largest real square is ${side}x${side}. Output will be enlarged to 163x163.`, badge:'Upscaling', previewClass:'warn', icon:'!' };
+    return { ...info, detail:`Largest real square crop: ${side}x${side}; final output is 163x163.`, badge:'Native swatch' };
+  }
+  if (mode === 'pick_swatch') {
+    const boxW = Math.min(163, srcW);
+    const boxH = Math.min(163, srcH);
+    if (srcW < 163 || srcH < 163) return { kind:'warn', title:'Swatch box is constrained', detail:`Only ${boxW}x${boxH} is available from this source. The output preview is enlarged to 163x163.`, badge:'Constrained', previewClass:'warn', icon:'!' };
+    return { ...info, detail:'A true 163x163 movable swatch crop is available.', badge:'163x163 ready' };
+  }
+  if (mode === 'crop_1688') {
+    const scaledH = Math.round(srcH * (3000 / Math.max(1, srcW)));
+    if (srcW < 3000 || scaledH < 1688) return { kind:'warn', title:'True crop is not available', detail:`Source is ${srcW}x${srcH}. This mode has to enlarge the image to reach 3000x1688.`, badge:'Upscaling', previewClass:'warn', icon:'!' };
+    return { ...info, detail:'A true 3000x1688 crop is available.', badge:'Native crop' };
+  }
+  if (mode === 'crop_2200') {
+    const scaledH = Math.round(srcH * (3000 / Math.max(1, srcW)));
+    if (srcW < 3000 || scaledH < 2200) return { kind:'warn', title:'True crop is not available', detail:`Source is ${srcW}x${srcH}. This mode has to enlarge the image to reach 3000x2200.`, badge:'Upscaling', previewClass:'warn', icon:'!' };
+    return { ...info, detail:'A true 3000x2200 crop is available.', badge:'Native crop' };
+  }
+  if (mode === 'crop_remove_sides_1688') {
+    if (srcW < 3000 || srcH < 1688) return { kind:'warn', title:'True crop is not available', detail:`Source is ${srcW}x${srcH}. This mode has to enlarge the image to reach 3000x1688.`, badge:'Upscaling', previewClass:'warn', icon:'!' };
+    return { ...info, detail:'A true 3000x1688 crop is available after trimming the sides.', badge:'Native crop' };
+  }
+  if (mode === 'pad_lr_1688') {
+    return { kind:'notice', title:'Padding mode', detail:'This mode keeps the full image and adds white sides instead of cropping.', badge:'Padding', previewClass:'notice', icon:'i' };
+  }
+  if (mode === 'pad_tb_2200') {
+    return { kind:'notice', title:'Padding mode', detail:'This mode keeps the full image and adds white top and bottom space instead of cropping.', badge:'Padding', previewClass:'notice', icon:'i' };
+  }
+  return info;
+}
+
+function renderPrepFeasibility(active, mode) {
+  const info = prepFeasibilityInfo(active, mode);
+  return {
+    info,
+    header: `<div class="photo-prep-status ${info.kind}"><div class="photo-prep-status-icon">${escapeHtml(info.icon)}</div><div><div class="photo-prep-status-title">${escapeHtml(info.title)}</div><div class="photo-prep-status-detail">${escapeHtml(info.detail)}</div></div></div>`,
+    badge: `<div class="photo-prep-preview-badge">${escapeHtml(info.badge)}</div>`
+  };
 }
 
 function renderPhotoPrepDrawer() {
   const active = currentActivePhoto();
   if (!active) return '';
   const mode = prepModeFromState();
+  const prepStatus = renderPrepFeasibility(active, mode);
   const preview = state.photography.previewUrl
-    ? `<div class="photo-prep-preview-drag" draggable="${state.mode === 'assets' ? 'true' : 'false'}" ondragstart="startPreparedPreviewDrag(event)" ondragend="endPreparedPreviewDrag(event)"><img src="${escapeHtml(state.photography.previewUrl)}" alt="Preview" draggable="false" /></div>`
+    ? `<div class="photo-prep-preview-drag" draggable="${state.mode === 'assets' ? 'true' : 'false'}" ondragstart="startPreparedPreviewDrag(event)" ondragend="endPreparedPreviewDrag(event)">${prepStatus.badge}<img src="${escapeHtml(state.photography.previewUrl)}" alt="Preview" draggable="false" /></div>`
     : `<div class="photo-empty">Preview loading...</div>`;
+  const swatchControls = `
+    <div class="photo-focus-pad photo-focus-pad-stack" aria-label="Swatch crop nudger">
+      <div class="photo-focus-row">
+        <button type="button" class="jump" onclick="setSwatchCropToTop()" title="Jump swatch to top">${prepArrowIcon('up', true)}</button>
+        <button type="button" onclick="nudgeCropY(-1)" title="Move swatch up">${prepArrowIcon('up')}</button>
+      </div>
+      <div class="photo-focus-row">
+        <button type="button" class="jump" onclick="setCropToLeft()" title="Jump swatch all the way left">${prepArrowIcon('left', true)}</button>
+        <button type="button" onclick="nudgeCropX(-1)" title="Move swatch left">${prepArrowIcon('left')}</button>
+        <button type="button" onclick="nudgeCropX(1)" title="Move swatch right">${prepArrowIcon('right')}</button>
+        <button type="button" class="jump" onclick="setCropToRight()" title="Jump swatch all the way right">${prepArrowIcon('right', true)}</button>
+      </div>
+      <div class="photo-focus-row">
+        <button type="button" onclick="nudgeCropY(1)" title="Move swatch down">${prepArrowIcon('down')}</button>
+        <button type="button" class="jump" onclick="setSwatchCropToBottom()" title="Jump swatch to bottom">${prepArrowIcon('down', true)}</button>
+      </div>
+    </div>`;
+  const squareControls = `
+    <div class="photo-focus-pad" aria-label="Square crop nudger">
+      <button type="button" class="jump" onclick="setCropToLeft()" title="Jump crop all the way left">${prepArrowIcon('left', true)}</button>
+      <button type="button" onclick="nudgeCropX(-1)" title="Move crop left">${prepArrowIcon('left')}</button>
+      <button type="button" onclick="nudgeCropX(1)" title="Move crop right">${prepArrowIcon('right')}</button>
+      <button type="button" class="jump" onclick="setCropToRight()" title="Jump crop all the way right">${prepArrowIcon('right', true)}</button>
+    </div>`;
+  const verticalControls = `
+    <div class="photo-focus-pad" aria-label="Crop nudger">
+      <button type="button" class="jump" onclick="setCropToTop()" title="Jump crop to top">${prepArrowIcon('up', true)}</button>
+      <button type="button" onclick="nudgeCropY(-1)" title="Move crop up">${prepArrowIcon('up')}</button>
+      <button type="button" onclick="nudgeCropY(1)" title="Move crop down">${prepArrowIcon('down')}</button>
+      <button type="button" class="jump" onclick="setCropToBottom()" title="Jump crop to bottom">${prepArrowIcon('down', true)}</button>
+    </div>`;
   return `
     <div class="photo-prep-drawer">
       <div class="photo-prep-top">
@@ -7905,7 +8667,7 @@ function renderPhotoPrepDrawer() {
       </div>
       <div class="photo-prep-controls">
         <div class="photo-prep-toolbar">
-          <div class="photo-prep-note"><strong>Output size:</strong> ${escapeHtml(prepModeOutputSize(mode))}</div>
+          <div class="photo-prep-note"><strong>Output size:</strong> ${escapeHtml(prepModeOutputSize(mode, active))}</div>
           <div class="photo-prep-left">
             <div class="photo-prep-options">
               <label title="Mirrors the image left-to-right before any crop or padding is applied. Use this to reverse orientation while preserving scale and aspect ratio."><input type="checkbox" ${state.photography.prep.flip ? 'checked' : ''} onchange="setPrepFlip(this.checked)" /> Flip horizontally</label>
@@ -7919,36 +8681,17 @@ function renderPhotoPrepDrawer() {
               <label title="Places a true 163x163 crop box on the source image so you can move it around and output a final 163x163 swatch."><input type="radio" name="prepMode" value="pick_swatch" ${mode==='pick_swatch'?'checked':''} onchange="setPrepMode(this.value)" /> Pick swatch</label>
             </div>
             ${((mode === 'crop_1688' || mode === 'crop_2200' || mode === 'crop_square' || mode === 'pick_swatch')) ? `<div class="photo-prep-focusbox">
-              ${mode === 'crop_square' ? `<div class="photo-focus-pad" aria-label="Square crop nudger">
-                <button type="button" onclick="setCropToLeft()" title="Jump crop all the way left">&#8678;</button>
-                <button type="button" onclick="nudgeCropX(-1)" title="Move crop left">&#11164;</button>
-                <button type="button" onclick="nudgeCropX(1)" title="Move crop right">&#11166;</button>
-                <button type="button" onclick="setCropToRight()" title="Jump crop all the way right">&#8680;</button>
-              </div>
+              ${mode === 'crop_square' ? `${squareControls}
               <div class="photo-focus-meta">
                 <span class="photo-prep-note">Use the left and right arrows to move the square crop box.</span>
                 <span class="photo-prep-note">Jump buttons move it all the way left or right.</span>
                 <span class="photo-prep-note">Click Add as new version to apply your modified image to this asset.</span>
-              </div>` : mode === 'pick_swatch' ? `<div class="photo-focus-pad" aria-label="Swatch crop nudger">
-                <button type="button" onclick="setSwatchCropToTop()" title="Jump swatch to top">&#8679;</button>
-                <button type="button" onclick="setCropToLeft()" title="Jump swatch all the way left">&#8678;</button>
-                <button type="button" onclick="nudgeCropY(-1)" title="Move swatch up">&#8593;</button>
-                <button type="button" onclick="nudgeCropX(-1)" title="Move swatch left">&#11164;</button>
-                <button type="button" onclick="nudgeCropX(1)" title="Move swatch right">&#11166;</button>
-                <button type="button" onclick="nudgeCropY(1)" title="Move swatch down">&#8595;</button>
-                <button type="button" onclick="setCropToRight()" title="Jump swatch all the way right">&#8680;</button>
-                <button type="button" onclick="setSwatchCropToBottom()" title="Jump swatch to bottom">&#8681;</button>
-              </div>
+              </div>` : mode === 'pick_swatch' ? `${swatchControls}
               <div class="photo-focus-meta">
                 <span class="photo-prep-note">Use the arrows to move the 163x163 swatch crop box.</span>
-                <span class="photo-prep-note">Jump buttons snap it to each edge.</span>
+                <span class="photo-prep-note">Top row controls vertical movement. Middle row controls horizontal movement.</span>
                 <span class="photo-prep-note">Click Add as new version to apply your modified image to this asset.</span>
-              </div>` : `<div class="photo-focus-pad" aria-label="Crop nudger">
-                <button type="button" onclick="setCropToTop()" title="Jump crop to top">&#8679;</button>
-                <button type="button" onclick="nudgeCropY(-1)" title="Move crop up">&#8593;</button>
-                <button type="button" onclick="nudgeCropY(1)" title="Move crop down">&#8595;</button>
-                <button type="button" onclick="setCropToBottom()" title="Jump crop to bottom">&#8681;</button>
-              </div>
+              </div>` : `${verticalControls}
               <div class="photo-focus-meta">
                 <span class="photo-prep-note">Use the up and down arrows to move the crop box a little.</span>
                 <span class="photo-prep-note">Jump buttons move it all the way to the top or bottom.</span>
@@ -7958,7 +8701,8 @@ function renderPhotoPrepDrawer() {
           </div>
         </div>
         <div class="photo-prep-preview-wrap">
-          <div class="photo-prep-preview">${preview}</div>
+          <div class="photo-prep-preview-meta">${prepStatus.header}</div>
+          <div class="photo-prep-preview ${prepStatus.info.previewClass}">${preview}</div>
         </div>
       </div>
     </div>`;
@@ -8731,6 +9475,7 @@ function computeClientChallengeIssueCount() {
       if (rowRequiresSwatch(row) && !hasSwatch) total += 1;
       if (rowRequiresWallArtSizing(row) && !has8000) total += 1;
       if (!hasDimension && row.set_dim_compile_ready) total += 1;
+      if (row.square_make_recommended) total += 1;
       if (offPatternAssets.length) total += 1;
       if (hasDuplicate) total += 1;
       total += wrongDeliverableCount;
@@ -8768,6 +9513,7 @@ function computeMissingNotices() {
   let firstMissingDimension = null;
   let firstMissingWallArtSizing = null;
   let firstCompilableSetDim = null;
+  let firstMakeSquare = null;
   let firstOffPattern = null;
   let firstDuplicateSlot = null;
   let firstWrongDeliverable = null;
@@ -8801,6 +9547,7 @@ function computeMissingNotices() {
       if (!hasDimension && !firstMissingDimension) firstMissingDimension = {rowId: row.row_id, color: section.color, slot: 'SKU_dimension'};
       if (rowRequiresWallArtSizing(row) && !has8000 && !firstMissingWallArtSizing) firstMissingWallArtSizing = {rowId: row.row_id, color: section.color, slot: 'SKU_8000'};
       if (!hasDimension && row.set_dim_compile_ready && !firstCompilableSetDim) firstCompilableSetDim = {rowId: row.row_id, color: section.color, slot: 'SKU_dimension'};
+      if (row.square_make_recommended && !firstMakeSquare) firstMakeSquare = {rowId: row.row_id, color: section.color, slot: 'SKU_square'};
       if (offPatternAssets.length && !firstOffPattern) {
         firstOffPattern = {
           rowId: row.row_id,
@@ -8824,6 +9571,7 @@ function computeMissingNotices() {
   if (firstMissingWallArtSizing) notices.push({id:'missing-wall-art-sizing', kind:'notice', text:'Missing wall art sizing guide: Jump to the first active SKU missing its SKU_8000 wall art sizing guide.', rowId:firstMissingWallArtSizing.rowId, color:firstMissingWallArtSizing.color, slot:firstMissingWallArtSizing.slot});
   if (firstMissingDimension && !state.game.active) notices.push({id:'missing-dimension', kind:'notice', text:'Missing dimensions: Jump to the first active SKU missing a dimensions asset.', rowId:firstMissingDimension.rowId, color:firstMissingDimension.color, slot:firstMissingDimension.slot});
   if (firstCompilableSetDim) notices.push({id:'missing-set-dim', kind:'notice', text:'Missing set dim: Jump to the first active SKU where a set dim could be compiled.', rowId:firstCompilableSetDim.rowId, color:firstCompilableSetDim.color, slot:firstCompilableSetDim.slot});
+  if (firstMakeSquare) notices.push({id:'make-square', kind:'notice', text:'Make a square: Jump to the first active SKU where a square room-shot image could probably be made.', rowId:firstMakeSquare.rowId, color:firstMakeSquare.color, slot:firstMakeSquare.slot});
   if (firstOffPattern) notices.push({id:'off-pattern', kind:'notice', text:'Off-pattern assets found: Jump to the first active SKU with off-pattern assets.', rowId:firstOffPattern.rowId, color:firstOffPattern.color, slot:firstOffPattern.slot});
   if (firstDuplicateSlot) notices.push({id:'duplicate-slot', kind:'notice', text:'Duplicate-slot assets found: Jump to the first active SKU with multiple assets sharing a slot.', rowId:firstDuplicateSlot.rowId, color:firstDuplicateSlot.color, slot:firstDuplicateSlot.slot});
   if (firstWrongDeliverable) notices.push({id:'wrong-deliverable', kind:'notice', text:'Wrong deliverable for lane: Jump to the first active SKU with an asset whose Deliverable does not match its lane.', rowId:firstWrongDeliverable.rowId, color:firstWrongDeliverable.color, slot:firstWrongDeliverable.slot});
@@ -9521,7 +10269,7 @@ async function launchRandomCollection() {
     applyBoardResponse(data, {keepPhotography:false, keepNotices:false});
     const launched = data.random_launch || {};
     if (launched.collection && launched.color) {
-      addAppNotice(`Random collection loaded: ${launched.collection.label} / ${launched.color}. Photography is ready in the panel.`, 'success');
+      addAppNotice(`Random collection loaded: ${launched.collection.label} / ${launched.color}. Photography is ready in the panel. Large collections can still take longer while matching that colorway across the board.`, 'success');
     }
     requestAnimationFrame(() => {
       scrollBoardToFirstColorTop('auto');
@@ -9540,6 +10288,33 @@ async function launchRandomCollection() {
   }
 }
 
+function getSuccessfulCommitRowIds(commitSummary=null) {
+  const explicit = Array.isArray(commitSummary && commitSummary.success_row_ids)
+    ? commitSummary.success_row_ids.map(x => String(x || '').trim()).filter(Boolean)
+    : [];
+  if (explicit.length) return [...new Set(explicit)];
+  const derived = Array.isArray(commitSummary && commitSummary.results)
+    ? commitSummary.results
+        .filter(item => item && item.success && item.row_id)
+        .map(item => String(item.row_id || '').trim())
+        .filter(Boolean)
+    : [];
+  return [...new Set(derived)];
+}
+
+async function refreshCommittedRows(rowIds) {
+  const cleanRowIds = Array.isArray(rowIds) ? [...new Set(rowIds.map(x => String(x || '').trim()).filter(Boolean))] : [];
+  if (!cleanRowIds.length) return null;
+  const resp = await fetch('/api/refresh_rows', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({row_ids: cleanRowIds})
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || 'Row refresh failed');
+  return data;
+}
+
 async function waitThenPollForRefresh(commitSummary=null) {
   const token = Date.now();
   state.waitFlow.activeToken = token;
@@ -9548,17 +10323,42 @@ async function waitThenPollForRefresh(commitSummary=null) {
   const priorScrollTop = boardMain ? boardMain.scrollTop : 0;
   const successCount = Number((commitSummary && commitSummary.success_count) || 0);
   const failureCount = Number((commitSummary && commitSummary.failure_count) || 0);
+  const successfulRowIds = getSuccessfulCommitRowIds(commitSummary);
   if (successCount <= 0 && failureCount <= 0) {
     setWaitOverlay(false, '');
     addAppNotice('No queued metadata changes were sent to Bynder.', 'notice');
     closeIdleModal();
     return false;
   }
-  setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed metadata...');
+  setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed metadata...', {miniGame:true});
   await delay(30000);
   if (state.waitFlow.activeToken !== token) return false;
 
-  setWaitOverlay(true, 'Loading refreshed board from Bynder...');
+  try {
+    if (successfulRowIds.length) {
+      const rowWord = successfulRowIds.length === 1 ? 'row' : 'rows';
+      setWaitOverlay(true, `Refreshing ${successfulRowIds.length} changed SKU ${rowWord} from Bynder...`, {miniGame:true});
+      const data = await refreshCommittedRows(successfulRowIds);
+      if (state.waitFlow.activeToken !== token) return false;
+      setWaitOverlay(false, '');
+      if (data && data.board) {
+        applyBoardResponse(data, {keepPhotography:true, keepNotices:true});
+        state.collapsedColors = priorCollapsed;
+        renderBoard();
+        requestAnimationFrame(() => {
+          const boardMainNow = document.getElementById('boardMain');
+          if (boardMainNow) boardMainNow.scrollTop = priorScrollTop;
+        });
+        addAppNotice(`Refreshed ${successfulRowIds.length} changed SKU ${rowWord} from Bynder without reloading the full board.`, 'success');
+        closeIdleModal();
+        return true;
+      }
+    }
+  } catch (err) {
+    console.warn('Targeted row refresh failed, falling back to full board reload.', err);
+  }
+
+  setWaitOverlay(true, 'Loading refreshed board from Bynder...', {miniGame:true});
   const resp = await fetch('/api/load_collection', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -9589,7 +10389,7 @@ async function waitThenPollForChallengeRefresh() {
   const token = Date.now();
   state.waitFlow.activeToken = token;
   const baseline = state.waitFlow.baselineFingerprint || boardFingerprint(state.board);
-  setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed challenge metadata...');
+  setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed challenge metadata...', {miniGame:true});
   await delay(30000);
   if (state.waitFlow.activeToken !== token) return false;
 
@@ -9597,7 +10397,7 @@ async function waitThenPollForChallengeRefresh() {
   const maxAttempts = 18;
   while (attempts < maxAttempts) {
     attempts += 1;
-    setWaitOverlay(true, `Checking Bynder for refreshed challenge metadata... Attempt ${attempts} of ${maxAttempts}.`);
+    setWaitOverlay(true, `Checking Bynder for refreshed challenge metadata... Attempt ${attempts} of ${maxAttempts}.`, {miniGame:true});
     const resp = await fetch('/api/game/reload_current', {method:'POST'});
     const data = await resp.json().catch(() => ({}));
     if (state.waitFlow.activeToken !== token) return false;
@@ -9658,11 +10458,13 @@ async function discardChanges() {
 
 async function commitChanges(skipConfirm=false) {
   if (!state.board) return false;
+  if (state.mode === 'assets') return false;
   if (!skipConfirm && !confirm('Are you sure you want to commit these changes to Bynder?')) return false;
   const btn = document.getElementById('commitBtn');
   btn.disabled = true;
   btn.textContent = 'Updating...';
   state.commitInFlight = true;
+  setWaitOverlay(true, 'Sending updates to Bynder...', {miniGame:true});
   try {
     state.waitFlow.baselineFingerprint = boardFingerprint(state.board);
     const resp = await fetch('/api/commit', {method: 'POST'});
@@ -9679,12 +10481,14 @@ async function commitChanges(skipConfirm=false) {
       }
       return true;
     } else {
+      setWaitOverlay(false, '');
       applyBoardResponse(data, {keepPhotography:true, keepNotices:true});
       const msg = `Some changes failed. ${c.success_count} succeeded and ${c.failure_count} failed. The board was not refreshed so you can keep working. A log was saved to ${c.log_path}.`;
       addAppNotice(msg, 'error');
       return false;
     }
   } catch (err) {
+    setWaitOverlay(false, '');
     alert(err.message || String(err));
     return false;
   } finally {
@@ -9842,108 +10646,6 @@ setTimeout(updateStickyOffsets, 300);
 # ============================================================
 # LAUNCHER
 # ============================================================
-def is_port_in_use(host: str, port: int) -> bool:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.35)
-            return sock.connect_ex((host, int(port))) == 0
-    except Exception:
-        return False
-
-
-def wait_for_port_state(host: str, port: int, should_be_in_use: bool, timeout_seconds: float = 5.0) -> bool:
-    deadline = time.time() + max(0.1, float(timeout_seconds or 0.1))
-    while time.time() < deadline:
-        in_use = is_port_in_use(host, port)
-        if in_use == should_be_in_use:
-            return True
-        time.sleep(0.2)
-    return is_port_in_use(host, port) == should_be_in_use
-
-
-def find_listening_pids_on_port(port: int) -> list[int]:
-    pids: list[int] = []
-    try:
-        if os.name == 'nt':
-            cmd = ['netstat', '-ano', '-p', 'tcp']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            target = f':{int(port)}'
-            for line in (result.stdout or '').splitlines():
-                line = line.strip()
-                if not line or 'LISTENING' not in line.upper():
-                    continue
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-                local_addr = parts[1]
-                state = parts[3].upper() if len(parts) >= 4 else ''
-                pid_text = parts[-1]
-                if not local_addr.endswith(target) or state != 'LISTENING':
-                    continue
-                try:
-                    pid = int(pid_text)
-                except Exception:
-                    continue
-                if pid > 0 and pid != os.getpid():
-                    pids.append(pid)
-        else:
-            cmd = ['lsof', '-nP', f'-iTCP:{int(port)}', '-sTCP:LISTEN', '-t']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            for line in (result.stdout or '').splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    pid = int(line)
-                except Exception:
-                    continue
-                if pid > 0 and pid != os.getpid():
-                    pids.append(pid)
-    except Exception as exc:
-        log_message(f'Could not inspect port {port} usage: {exc}')
-    return sorted(set(pids))
-
-
-def terminate_pid(pid: int, force: bool = False) -> None:
-    try:
-        if os.name == 'nt':
-            cmd = ['taskkill', '/PID', str(pid)] + (['/F'] if force else [])
-            subprocess.run(cmd, capture_output=True, text=True, check=False)
-        else:
-            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except Exception as exc:
-        log_message(f'Could not terminate PID {pid}: {exc}')
-
-
-def try_close_existing_instance(host: str, port: int) -> bool:
-    if not is_port_in_use(host, port):
-        return True
-
-    pids = find_listening_pids_on_port(port)
-    if pids:
-        log_message(f'Port {port} is already in use. Attempting to stop existing Content Refresher process(es): {", ".join(str(x) for x in pids)}')
-        for pid in pids:
-            terminate_pid(pid, force=False)
-        if wait_for_port_state(host, port, should_be_in_use=False, timeout_seconds=3.0):
-            log_message(f'Freed port {port} after graceful termination.')
-            return True
-        stubborn = find_listening_pids_on_port(port)
-        for pid in stubborn:
-            terminate_pid(pid, force=True)
-        if wait_for_port_state(host, port, should_be_in_use=False, timeout_seconds=2.5):
-            log_message(f'Freed port {port} after force termination.')
-            return True
-        log_message(f'Port {port} is still busy after termination attempts.')
-        return False
-
-    # Port is busy but we could not identify a PID. On macOS this can happen briefly
-    # while the old process is winding down. Give it a short grace period.
-    log_message(f'Port {port} appears busy, but no listening PID was found. Waiting briefly for it to clear...')
-    if wait_for_port_state(host, port, should_be_in_use=False, timeout_seconds=3.0):
-        return True
-    return False
 
 
 def open_browser_later() -> None:
@@ -9956,9 +10658,6 @@ def open_browser_later() -> None:
 
 
 if __name__ == "__main__":
-    if not try_close_existing_instance(HOST, PORT):
-        print(f'Could not free port {PORT}. Please fully close the existing Content Refresher instance and try again.', file=sys.stderr)
-        sys.exit(1)
     log_message("Starting Content Refresher local server.")
     start_server_side_game_queue_worker()
     open_browser_later()
