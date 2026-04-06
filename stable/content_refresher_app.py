@@ -86,8 +86,8 @@ PSA_IMAGE_TYPE_PROMPT_CHOICES = ["Detail", "Room_shot", "Silo", "Swatch_detail"]
 SWATCH_PSA_IMAGE_TYPE_LABEL = "Swatch"
 DIMENSIONS_PSA_IMAGE_TYPE_LABEL = "Dimensions_diagram_image"
 SQUARE_PSA_IMAGE_TYPE_LABEL = "Room_shot"
-SWATCH_OPTIONAL_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
-SWATCH_OPTIONAL_STEP_PATH_PREFIXES = ("RF_Root___Mattresses",)
+SWATCH_OPTIONAL_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor", "RF_Root___Home_Decor___Hanging_Lights", "RF Root | Home Decor | Hanging Lights"}
+SWATCH_OPTIONAL_STEP_PATH_PREFIXES = ("RF_Root___Mattresses", "RF Root | Mattresses")
 WALL_ART_SIZING_STEP_PATHS = {"RF_Root___Home_Decor___Wall_Art", "RF_Root___Home_Decor___Wall_Decor"}
 # Defensive aliases for game/background scanners so these checks never explode if a future edit
 # accidentally renames one constant in one code path.
@@ -202,6 +202,11 @@ PROPERTY_DB_NAMES: Dict[str, str] = {
     "Product_Color": "Product_Color",
     "Product_URL": "Product_URL",
 }
+
+TOTAL_FILL_CHECK_CACHE: Dict[str, bool] = {}
+TOTAL_FILL_CHECK_TIMEOUT = 20
+TOTAL_FILL_CHECK_SAMPLE_OFFSET = 10
+TOTAL_FILL_CHECK_WHITE_THRESHOLD = 245
 
 
 # ============================================================
@@ -3075,6 +3080,80 @@ def get_slot_family(position: str) -> str:
     return "off_pattern"
 
 
+
+def get_cached_total_fill_issue(asset: Dict[str, Any]) -> bool:
+    media_id = string_value(asset.get("id"))
+    if media_id and media_id in TOTAL_FILL_CHECK_CACHE:
+        return bool(TOTAL_FILL_CHECK_CACHE.get(media_id))
+
+    psa_type = compact_text(get_existing_psa_image_type_label(asset) or asset.get("property_" + PSA_IMAGE_TYPE_DBNAME) or asset.get("psa_image_type"))
+    if psa_type != "roomshot":
+        if media_id:
+            TOTAL_FILL_CHECK_CACHE[media_id] = False
+        return False
+
+    transform_url = string_value(asset.get("transformBaseUrl"))
+    if not transform_url:
+        if media_id:
+            TOTAL_FILL_CHECK_CACHE[media_id] = False
+        return False
+
+    check_url = transform_url
+    if "?" in check_url:
+        check_url += "&io=transform:scale,width:320&quality=70"
+    else:
+        check_url += "?io=transform:scale,width:320&quality=70"
+
+    result = False
+    try:
+        resp = requests.get(check_url, timeout=TOTAL_FILL_CHECK_TIMEOUT)
+        resp.raise_for_status()
+        with Image.open(BytesIO(resp.content)) as im:
+            rgb = im.convert("RGB")
+            w, h = rgb.size
+            if w > 22 and h > 22:
+                off = min(TOTAL_FILL_CHECK_SAMPLE_OFFSET, max(1, (min(w, h) // 4)))
+                pts = [
+                    (off, off),
+                    (w - off - 1, off),
+                    (off, h - off - 1),
+                    (w - off - 1, h - off - 1),
+                ]
+                result = all(all(channel >= TOTAL_FILL_CHECK_WHITE_THRESHOLD for channel in rgb.getpixel(pt)) for pt in pts)
+    except Exception:
+        result = False
+
+    if media_id:
+        TOTAL_FILL_CHECK_CACHE[media_id] = result
+    return result
+
+
+def get_total_fill_warning(asset: Dict[str, Any]) -> str:
+    if get_cached_total_fill_issue(asset):
+        return "Needs total fill: room shot has white corners 10px from each edge."
+    return ""
+
+
+def is_total_fill_warning_text(text: Any) -> bool:
+    return "needstotalfill" in compact_text(text)
+
+
+def asset_is_cleanup_total_fill_candidate(asset: Dict[str, Any], row: Optional[Dict[str, Any]] = None) -> bool:
+    if not is_total_fill_warning_text(asset.get("size_warning")):
+        return False
+    slot_key = string_value(
+        asset.get("slot_key")
+        or normalize_position_for_row(
+            asset.get("current_position"),
+            string_value((row or {}).get("sku") or asset.get("sku") or ""),
+        )
+    )
+    if slot_key not in {"SKU_grid", "SKU_100", "SKU_200"}:
+        return False
+    sales_channel = row.get("sales_channel") if isinstance(row, dict) else asset.get("sales_channel")
+    return sales_channel_has_full_line(sales_channel)
+
+
 def expected_dimensions_for_slot(slot_key: str) -> Tuple[int, int]:
     if slot_key == "SKU_grid":
         return (3000, 2200)
@@ -3091,16 +3170,18 @@ def compute_dimension_warning(asset: Dict[str, Any]) -> str:
         return ""
     width = int(asset.get("width") or 0)
     height = int(asset.get("height") or 0)
-    if width <= 0 or height <= 0:
-        return ""
+    total_fill_warning = get_total_fill_warning(asset)
     if slot_key == "SKU_square":
-        if width == height and width >= 1000:
-            return ""
-        return f"Size {width}x{height}; expected square and at least 1000x1000"
+        dimension_warning = ""
+        if width > 0 and height > 0:
+            if not (width == height and width >= 1000):
+                dimension_warning = f"Size {width}x{height}; expected square and at least 1000x1000"
+        return "; ".join(part for part in [dimension_warning, total_fill_warning] if part)
+    if width <= 0 or height <= 0:
+        return total_fill_warning
     expected_w, expected_h = expected_dimensions_for_slot(slot_key)
-    if width == expected_w and height == expected_h:
-        return ""
-    return f"Size {width}x{height}; expected {expected_w}x{expected_h}"
+    dimension_warning = "" if (width == expected_w and height == expected_h) else f"Size {width}x{height}; expected {expected_w}x{expected_h}"
+    return "; ".join(part for part in [dimension_warning, total_fill_warning] if part)
 
 
 def refresh_row_asset_flags(row: Dict[str, Any]) -> None:
@@ -4279,10 +4360,11 @@ def filter_board_to_colors(board: Dict[str, Any], color_names: List[str]) -> Dic
 
 
 def is_swatch_optional_step_path(step_path: Any) -> bool:
-    step_path_text = string_value(step_path)
-    if step_path_text in CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS:
+    step_path_text = string_value(step_path).strip()
+    normalized = step_path_text.replace(" | ", "___").replace("|", "___").replace(" ", "_")
+    if step_path_text in CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS or normalized in CHALLENGE_SWATCH_OPTIONAL_STEP_PATHS:
         return True
-    return any(step_path_text.startswith(prefix) for prefix in SWATCH_OPTIONAL_STEP_PATH_PREFIXES)
+    return any(step_path_text.startswith(prefix) or normalized.startswith(prefix.replace(" | ", "___").replace("|", "___").replace(" ", "_")) for prefix in SWATCH_OPTIONAL_STEP_PATH_PREFIXES)
 
 
 def row_requires_swatch(row: Dict[str, Any]) -> bool:
@@ -4360,7 +4442,8 @@ def compute_row_issue_summary(row: Dict[str, Any], include_missing_dims: bool = 
     dup_counts: Dict[str, int] = {}
     size_issue_count = 0
     for asset in live_assets:
-        if string_value(asset.get("size_warning")):
+        warning_text = string_value(asset.get("size_warning"))
+        if warning_text and (not is_total_fill_warning_text(warning_text) or asset_is_cleanup_total_fill_candidate(asset, row)):
             size_issue_count += 1
         lane = string_value(asset.get("lane"))
         if lane in {"off_pattern", "trash"}:
@@ -4489,7 +4572,19 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
                 "off_pattern": off_pattern_count,
                 "duplicate_slot": sum(1 for v in dup_counts.values() if v > 1),
                 "wrong_deliverable": wrong_deliverable_count,
-                "size_warnings": 0,
+                "size_warnings": sum(
+                    1
+                    for a in [x for x in sku_assets if not is_marked_for_deletion(x)]
+                    for modeled in [asset_to_client_model(a, sku, position_override=get_asset_position(a))]
+                    if string_value(compute_dimension_warning(modeled))
+                    and (
+                        not is_total_fill_warning_text(compute_dimension_warning(modeled))
+                        or asset_is_cleanup_total_fill_candidate(modeled, {
+                            "sku": sku,
+                            "sales_channel": prop(anchor, "Sales_Channel", "Sales_Channel"),
+                        })
+                    )
+                ),
             }
             row_summary["total"] = sum(int(v or 0) for k, v in row_summary.items() if k != "total")
             if row_summary["total"]:
@@ -7129,8 +7224,8 @@ INDEX_HTML = r'''
     </div>
     <div class="wait-overlay" id="waitOverlay">
     <div class="wait-card">
-      <h3>Giving Bynder a moment...</h3>
-      <p>Your updates went through. Waiting 30 seconds before checking for refreshed metadata.</p>
+      <h3 id="waitOverlayTitle">Giving Bynder a moment...</h3>
+      <p id="waitOverlayBody">Your updates went through. Waiting 30 seconds before checking for refreshed metadata.</p>
       <div class="wait-status" id="waitStatus">Standing by...</div>
       <div class="wait-mini-game" id="waitMiniGame">
         <div class="wait-mini-top">
@@ -7394,7 +7489,13 @@ function setWaitOverlay(open, statusText='', options={}) {
   state.waitFlow.open = !!open;
   const overlay = document.getElementById('waitOverlay');
   const status = document.getElementById('waitStatus');
+  const titleEl = document.getElementById('waitOverlayTitle');
+  const bodyEl = document.getElementById('waitOverlayBody');
+  const titleText = (options && options.title) ? String(options.title) : 'Giving Bynder a moment...';
+  const bodyText = (options && options.body) ? String(options.body) : 'Your updates went through. Waiting 30 seconds before checking for refreshed metadata.';
   if (overlay) overlay.classList.toggle('open', !!open);
+  if (titleEl) titleEl.textContent = titleText;
+  if (bodyEl) bodyEl.textContent = bodyText;
   if (status && statusText) status.textContent = statusText;
   if (open && options && options.miniGame) {
     if (!state.waitFlow.miniGameOpen) startWaitMiniGame();
@@ -7530,7 +7631,11 @@ function boopWaitMiniBunny(evt) {
   if (scoreEl) scoreEl.textContent = String(state.waitFlow.miniGameScore);
   if (bunny) bunny.style.transform = 'scale(0.92)';
   if (hintEl) {
-    if (state.waitFlow.miniGameScore >= 15) hintEl.textContent = 'Legendary floof wrangler. Extremely boop-forward.';
+    if (state.waitFlow.miniGameScore >= 40) hintEl.textContent = 'At this point the floof reports to you.';
+    else if (state.waitFlow.miniGameScore >= 32) hintEl.textContent = 'Unhinged boop stamina. Historic work.';
+    else if (state.waitFlow.miniGameScore >= 26) hintEl.textContent = 'The bunny union is drafting a strongly worded memo.';
+    else if (state.waitFlow.miniGameScore >= 21) hintEl.textContent = 'This is now performance art. Very floof-forward.';
+    else if (state.waitFlow.miniGameScore >= 15) hintEl.textContent = 'Legendary floof wrangler. Extremely boop-forward.';
     else if (state.waitFlow.miniGameScore >= 10) hintEl.textContent = 'Honestly? Clinical levels of boop accuracy.';
     else if (state.waitFlow.miniGameScore >= 6) hintEl.textContent = 'You are absolutely handling this floof.';
     else if (state.waitFlow.miniGameScore >= 3) hintEl.textContent = 'Nice. Very boopable.';
@@ -7675,8 +7780,16 @@ async function launchCleanupChallenge() {
   state.game.loading = true;
   renderGameModesPanel();
   renderBrandPanel();
-  setWaitOverlay(true, g.active ? 'Finding the next Cleanup Challenge board...' : 'Loading your first Cleanup Challenge board...', {miniGame:true});
+  setWaitOverlay(true, g.active ? 'Checking this board and loading the next Cleanup Challenge...' : 'Loading your first Cleanup Challenge board...', {miniGame:true, title:'Loading Cleanup Challenge...', body: g.active ? 'First we will score this board against the latest Bynder state, then we will grab the next challenge board.' : 'Hang tight while we spin up your first Cleanup Challenge board and get it ready.'});
   try {
+    if (g.active) {
+      const reloadResp = await fetch('/api/game/reload_current', {method:'POST'});
+      const reloadData = await reloadResp.json().catch(() => ({}));
+      if (reloadResp.ok) {
+        const rg = reloadData.game || {};
+        if (Number(rg.resolved || 0) > 0) addAppNotice(`Nice. ${rg.resolved} issue${Number(rg.resolved) === 1 ? '' : 's'} resolved and scored before loading the next board.`, 'success');
+      }
+    }
     const url = g.active ? '/api/game/next' : '/api/game/launch';
     const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'launch'})});
     const data = await resp.json();
@@ -7699,7 +7812,11 @@ async function passCleanupChallenge() {
   state.game.loading = true;
   renderGameModesPanel();
   renderBrandPanel();
-  setWaitOverlay(true, 'Skipping this one and loading the next Cleanup Challenge board...', {miniGame:true});
+  setWaitOverlay(true, 'Skipping this board and loading the next Cleanup Challenge...', {
+    miniGame:true,
+    title:'Passing this Cleanup Challenge...',
+    body:'We are skipping this board, leaving your score as-is, and grabbing the next challenge.'
+  });
   try {
     const resp = await fetch('/api/game/next', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'pass'})});
     const data = await resp.json();
@@ -7998,6 +8115,9 @@ function formatAssetSizeWarning(asset) {
   if (m) {
     return `<div class="asset-size-warning">Size: ${escapeHtml(m[1])}<br>Expected: ${escapeHtml(m[2])}</div>`;
   }
+  if (/needs total fill/i.test(text)) {
+    return `<div class="asset-size-warning">Needs total fill<br><span style="font-weight:500;">White corners detected in this room shot.</span></div>`;
+  }
   return `<div class="asset-size-warning">${escapeHtml(text)}</div>`;
 }
 
@@ -8035,7 +8155,8 @@ function renderAssetCard(asset, changed) {
   const wrongDeliverable = assetHasWrongDeliverable(asset);
   const sharedSlot = assetSharesSlot(asset);
   if (asset.size_warning) {
-    if (state.mode === 'assets' && !asset.pending_upload) {
+    const totalFillWarning = /needs total fill/i.test(String(asset.size_warning || ''));
+    if (state.mode === 'assets' && !asset.pending_upload && !totalFillWarning) {
       if (asset.slot_key === 'SKU_swatch' && Number(asset.width || 0) > 0 && Number(asset.width || 0) === Number(asset.height || 0)) {
         fixActions.push(`<a href="#" class="asset-fix-action" onclick="fixAssetVersion(event, '${escapeHtml(asset.id || '')}', 'swatch')">Fix swatch</a>`);
       } else if (asset.slot_key === 'SKU_dimension') {
@@ -9015,17 +9136,17 @@ function setPrepMode(v) {
 }
 function cropStepYForActive() {
   const active = currentActivePhoto();
-  if (!active) return 100;
+  if (!active) return 50;
   const mode = prepModeFromState();
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
-  if (!srcW || !srcH) return 100;
+  if (!srcW || !srcH) return 50;
   if (mode === 'pick_swatch') {
-    return Math.max(10, Math.round(Math.max(0, srcH - Math.min(163, srcH)) * 0.08) || 24);
+    return Math.max(5, Math.round(Math.max(0, srcH - Math.min(163, srcH)) * 0.04) || 12);
   }
   const outH = mode === 'crop_2200' ? 2200 : 1688;
   const scaledH = Math.round(srcH * (3000 / srcW));
-  return Math.max(40, Math.round(Math.max(0, scaledH - outH) * 0.1) || 80);
+  return Math.max(20, Math.round(Math.max(0, scaledH - outH) * 0.05) || 40);
 }
 function nudgeCropY(direction) {
   const active = currentActivePhoto();
@@ -9058,15 +9179,15 @@ function setSwatchCropToTop() { const active = currentActivePhoto(); if (!active
 function setSwatchCropToBottom() { const active = currentActivePhoto(); if (!active) return; const srcH = Number(active.height || 0) || 0; if (!srcH) return; state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); refreshPhotoPreview(); }
 function cropStepXForActive() {
   const active = currentActivePhoto();
-  if (!active) return 100;
+  if (!active) return 50;
   const srcW = Number(active.width || 0) || 0;
   const srcH = Number(active.height || 0) || 0;
-  if (!srcW || !srcH) return 100;
+  if (!srcW || !srcH) return 50;
   if (prepModeFromState() === 'pick_swatch') {
-    return Math.max(10, Math.round(Math.max(0, srcW - Math.min(163, srcW)) * 0.08) || 24);
+    return Math.max(5, Math.round(Math.max(0, srcW - Math.min(163, srcW)) * 0.04) || 12);
   }
   const side = Math.min(srcW, srcH);
-  return Math.max(40, Math.round(Math.max(0, srcW - side) * 0.1) || 80);
+  return Math.max(20, Math.round(Math.max(0, srcW - side) * 0.05) || 40);
 }
 function nudgeCropX(direction) {
   const active = currentActivePhoto();
@@ -9446,10 +9567,13 @@ function renderBoard() {
 
 const SWATCH_OPTIONAL_STEP_PATHS = new Set([
   'RF_Root___Home_Decor___Wall_Art',
-  'RF_Root___Home_Decor___Wall_Decor'
+  'RF_Root___Home_Decor___Wall_Decor',
+  'RF_Root___Home_Decor___Hanging_Lights',
+  'RF Root | Home Decor | Hanging Lights'
 ]);
 const SWATCH_OPTIONAL_STEP_PATH_PREFIXES = [
-  'RF_Root___Mattresses'
+  'RF_Root___Mattresses',
+  'RF Root | Mattresses'
 ];
 const WALL_ART_SIZING_STEP_PATHS = new Set([
   'RF_Root___Home_Decor___Wall_Art',
@@ -9458,7 +9582,8 @@ const WALL_ART_SIZING_STEP_PATHS = new Set([
 
 function isSwatchOptionalStepPath(stepPath) {
   const clean = String(stepPath || '').trim();
-  return SWATCH_OPTIONAL_STEP_PATHS.has(clean) || SWATCH_OPTIONAL_STEP_PATH_PREFIXES.some(prefix => clean.startsWith(prefix));
+  const normalized = clean.replace(/\s*\|\s*/g, '___').replace(/\s+/g, '_');
+  return SWATCH_OPTIONAL_STEP_PATHS.has(clean) || SWATCH_OPTIONAL_STEP_PATHS.has(normalized) || SWATCH_OPTIONAL_STEP_PATH_PREFIXES.some(prefix => clean.startsWith(prefix) || normalized.startsWith(String(prefix || '').replace(/\s*\|\s*/g, '___').replace(/\s+/g, '_')));
 }
 
 function rowRequiresSwatch(row) {
@@ -9489,6 +9614,15 @@ function assetHasWrongDeliverable(asset) {
   if (!expected) return false;
   const current = String(asset.deliverable_override || asset.deliverable || '').trim();
   return current !== expected;
+}
+
+function assetIsCleanupTotalFillCandidate(asset, row) {
+  const warningText = String((asset && asset.size_warning) || '').trim();
+  if (!/needs total fill/i.test(warningText)) return false;
+  const slotKey = String((asset && (asset.slot_key || asset.current_position)) || '').trim();
+  if (!['SKU_grid', 'SKU_100', 'SKU_200'].includes(slotKey)) return false;
+  const salesChannel = String(((row && row.sales_channel) || (asset && asset.sales_channel) || '')).trim().toLowerCase();
+  return salesChannel === 'full_line';
 }
 
 function computeClientChallengeIssueCount() {
@@ -9523,7 +9657,13 @@ function computeClientChallengeIssueCount() {
       if (offPatternAssets.length) total += 1;
       if (hasDuplicate) total += 1;
       total += wrongDeliverableCount;
-      const sizeWarnings = (row.assets || []).filter(a => !a.is_marked_for_deletion && (!!a.has_size_warning || !!String(a.size_warning || '').trim())).length;
+      const sizeWarnings = (row.assets || []).filter(a => {
+        if (a.is_marked_for_deletion) return false;
+        const warningText = String(a.size_warning || '').trim();
+        if (!a.has_size_warning && !warningText) return false;
+        if (!/needs total fill/i.test(warningText)) return true;
+        return assetIsCleanupTotalFillCandidate(a, row);
+      }).length;
       total += sizeWarnings;
     }
   }
@@ -10189,6 +10329,8 @@ document.addEventListener('dragover', (e) => {
     const rect = boardMain.getBoundingClientRect();
     if (e.clientY - rect.top < margin) boardMain.scrollBy(0, -step);
     else if (rect.bottom - e.clientY < margin) boardMain.scrollBy(0, step);
+    if (e.clientX - rect.left < margin) boardMain.scrollBy(-step * 2, 0);
+    else if (rect.right - e.clientX < margin) boardMain.scrollBy(step * 2, 0);
   }
 });
 
@@ -10437,7 +10579,7 @@ async function waitThenPollForRefresh(commitSummary=null) {
     closeIdleModal();
     return false;
   }
-  setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed metadata...', {miniGame:true});
+  setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed metadata...', {miniGame:true, title:'Giving Bynder a moment...', body:'Your updates went through. Waiting 30 seconds before checking for refreshed metadata.'});
   await delay(30000);
   if (state.waitFlow.activeToken !== token) return false;
 
@@ -10496,7 +10638,7 @@ async function waitThenPollForChallengeRefresh() {
   const token = Date.now();
   state.waitFlow.activeToken = token;
   const baseline = state.waitFlow.baselineFingerprint || boardFingerprint(state.board);
-  setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed challenge metadata...', {miniGame:true});
+  setWaitOverlay(true, 'Waiting 30 seconds before checking for refreshed challenge metadata...', {miniGame:true, title:'Checking your challenge board...', body:'Your updates went through. Waiting 30 seconds before checking for refreshed challenge metadata.'});
   await delay(30000);
   if (state.waitFlow.activeToken !== token) return false;
 
