@@ -39,7 +39,7 @@ BYNDER_TOKEN_PATH = os.environ.get(
     r"C:\bynderAPI\byndercredentials_permanenttoken.json",
 )
 
-APP_VERSION = "dev77"
+APP_VERSION = "dev132"
 
 # Required for updates. Fill these in before committing changes.
 PRODUCT_SKU_POSITION_METAPROPERTY_ID = "3DD8E8E1-3986-4D8E-BC13EC3E19A10725"
@@ -122,6 +122,7 @@ COLLECTION_OPTIONS_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 COLLECTION_ASSET_CACHE_MAX_AGE_SECONDS = 10 * 60
 COLLECTION_DERIVED_CACHE_MAX_AGE_SECONDS = 10 * 60
 COLLECTION_BOARD_CACHE_MAX_AGE_SECONDS = 5 * 60
+BYNDER_COLLECTION_CACHE_MAX_AGE_SECONDS = 10 * 60
 
 GAME_SCORE_PATH = Path.home() / ".content_refresher_game_scores.json"
 APP_LAUNCH_DIR = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__)).resolve().parent
@@ -131,11 +132,13 @@ GOOGLE_SCOREBOARD_SPREADSHEET_ID = "1ZzZp8C7ySVPPZQCoRz_RCn5N7iQfXaCOQBAd0GhAZOY
 GOOGLE_SCOREBOARD_TAB_NAME = "scores"
 GOOGLE_SCOREBOARD_RANGE = f"{GOOGLE_SCOREBOARD_TAB_NAME}!A:C"
 GOOGLE_SCOREBOARD_REFRESH_SECONDS = 20
-GAME_QUEUE_TARGET = 10
-GAME_SCAN_BATCH = 14
-GAME_SCAN_MIN_GAP_SECONDS = 8
+GAME_QUEUE_PRELOAD_TARGET = 1
+GAME_QUEUE_TARGET = 2
+GAME_QUEUE_ACTIVE_TOTAL_TARGET = 3
+GAME_SCAN_BATCH = 8
+GAME_SCAN_MIN_GAP_SECONDS = 45
 GAME_LEADERBOARD_WEBHOOK_URL = os.environ.get("CONTENT_REFRESHER_LEADERBOARD_WEBHOOK_URL", "")
-GAME_SERVER_QUEUE_WORKER_INTERVAL_SECONDS = 5.0
+GAME_SERVER_QUEUE_WORKER_INTERVAL_SECONDS = 60.0
 RECENT_POSITION_OVERRIDE_TTL_SECONDS = 72 * 60 * 60
 
 PHOTO_WATERMARK_ALPHA = 0.46
@@ -144,6 +147,26 @@ PHOTO_WATERMARK_WIDTH_RATIO = 0.86
 PHOTO_WATERMARK_HEIGHT_RATIO = 0.80
 PHOTO_WATERMARK_LINE_GAP_RATIO = 0.10
 SET_DIM_MAX_COMPONENTS = 6
+
+# Product Imagery Onboarding workspace constants
+WORKSPACE_CONTENT_REFRESHER = "content_refresher"
+WORKSPACE_PIO = "product_imagery_onboarding"
+PIO_PLACEHOLDER_GRID_URL = "https://www.bynder.raymourflanigan.com/asset/573a060f-3833-47bf-95f8-4b1e6673860d/XXXX_666666666_3000.jpg"
+PIO_CREDENTIALS_FILENAME = "content-refresher-scoreboard-credentials.json"
+PIO_WORKFLOW_VALUE = "App_Product_Imagery_Onboarding"
+PIO_WORKFLOW_OPTION_ID = "911BFC7C-970F-4AA3-AC2BFA7D3B67E9E0"
+PIO_STATUS_LAUNCHED = "App_Launched"
+PIO_STATUS_STAGED = "App_Staged"
+PIO_STATUS_LIVE = "App_Live"
+PIO_SYNC_DO_NOT = "Do_not_sync_to_site"
+PIO_SYNC_DO = "Do_sync_to_site"
+PIO_DEFAULT_CAROUSEL_SLOTS = [f"SKU_{n}" for n in range(100, 600, 100)]
+PIO_DEFAULT_SWATCH_DETAIL_SLOTS = ["SKU_5000", "SKU_5100"]
+PIO_ALLOWED_SALES_CHANNELS = {"Full_line", "Online_only", "Outlet__stocked_", "Outlet__online_only_"}
+PIO_REQUIRED_IMPORT_HEADERS = ["SKU", "Product Name"]
+PIO_OPTIONAL_IMPORT_HEADERS = ["Components", "Length", "Width", "Height", "Features"]
+PIO_STEP_HEADER_ROW = "SKU	Product Name	Components	Product Color	Length	Width	Height	Sales Channel	Features"
+PIO_BYNDER_SALES_CHANNEL_VALUES = ["Full_line", "Online_only", "Outlet__stocked_", "Outlet__online_only_"]
 
 app = Flask(__name__)
 
@@ -201,6 +224,19 @@ PROPERTY_DB_NAMES: Dict[str, str] = {
     "Deliverable": "Deliverable",
     "Product_Color": "Product_Color",
     "Product_URL": "Product_URL",
+    "Product_Collection": "product_collection",
+    "product_collection": "product_collection",
+    "Workflow": "Workflow",
+    "Workflow_Status": "Workflow_Status",
+    "Sync_to_Site": "Sync_to_Site",
+    "Sales_Channel": "Sales_Channel",
+    "Product_Name__STEP_": "Product_Name__STEP_",
+    "Component_SKUs": "Component_SKUs",
+    "Asset_Type": "Asset_Type",
+    "Asset_Sub_Type": "Asset_Sub_Type",
+    "dim_Length": "dim_Length",
+    "dim_Width": "dim_Width",
+    "dim_Height": "dim_Height",
 }
 
 TOTAL_FILL_CHECK_CACHE: Dict[str, bool] = {}
@@ -240,6 +276,20 @@ def string_value(value: Any) -> str:
         return ", ".join(parts)
     return str(value).strip()
 
+
+
+def natural_sort_key(value: Any) -> Tuple[Any, ...]:
+    text = string_value(value)
+    parts = re.split(r'(\d+)', text)
+    out: List[Any] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            out.append((0, int(part)))
+        else:
+            out.append((1, part.lower()))
+    return tuple(out)
 
 def boolish(value: Any) -> bool:
     value_str = string_value(value).strip().lower()
@@ -330,6 +380,21 @@ def save_collection_options_to_disk_cache(items: List[Dict[str, str]]) -> None:
     except Exception as exc:
         log_message(f"Could not write collection options cache: {exc}")
     return None
+
+
+def load_collection_options(session: requests.Session, force_refresh: bool = False) -> List[Dict[str, str]]:
+    if not force_refresh:
+        cached_state = STATE.get("collections")
+        if isinstance(cached_state, list) and cached_state:
+            return cached_state
+        cached_disk = load_collection_options_from_disk_cache()
+        if cached_disk:
+            STATE["collections"] = cached_disk
+            return cached_disk
+    collections = fetch_metaproperty_options(session, PRODUCT_COLLECTION_METAPROPERTY_ID)
+    STATE["collections"] = collections
+    save_collection_options_to_disk_cache(collections)
+    return collections
 
 
 def get_recent_position_override(media_id: Any) -> str:
@@ -737,6 +802,637 @@ def slugify_filename(name: str) -> str:
     return clean or "content_refresher_log.json"
 
 
+
+def option_label_to_id_map(session: requests.Session, metaproperty_id: str) -> Dict[str, str]:
+    items = fetch_metaproperty_options(session, metaproperty_id)
+    out: Dict[str, str] = {}
+    for item in items:
+        label = string_value(item.get("label")).strip()
+        if label:
+            out[label] = string_value(item.get("id"))
+        dbn = string_value(item.get("databaseName")).strip()
+        if dbn:
+            out[dbn] = string_value(item.get("id"))
+    return out
+
+
+def make_option_database_name(label: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9]+", "_", string_value(label).strip())
+    base = re.sub(r"_+", "_", base).strip("_")
+    return base or f"AppOption_{uuid.uuid4().hex[:8]}"
+
+
+def create_metaproperty_option(session: requests.Session, metaproperty_id: str, label: str) -> Dict[str, str]:
+    clean_label = string_value(label).strip()
+    if not clean_label:
+        raise RuntimeError("Cannot create a blank metaproperty option.")
+    database_name = make_option_database_name(clean_label).lower()
+    url = f"{BYNDER_BASE_URL}/api/v4/metaproperties/{metaproperty_id}/options/"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    payload = {
+        "data": json.dumps({
+            "name": database_name,
+            "label": clean_label,
+            "isSelectable": True,
+            "zindex": 1,
+            "labels": {},
+            "externalReference": None,
+        })
+    }
+    errors: List[str] = []
+    for attempt in range(1, 4):
+        try:
+            RATELIMITER.wait()
+            response = session.post(url, headers=headers, data=payload, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 201:
+                try:
+                    body = response.json()
+                except Exception:
+                    body = {}
+                option_id = string_value((body or {}).get("id") or (body or {}).get("ID"))
+                if option_id:
+                    METAPROPERTY_OPTION_VALUE_CACHE.pop(normalize_uuid(metaproperty_id), None)
+                    return {"id": option_id, "label": clean_label, "databaseName": database_name}
+                refreshed = fetch_metaproperty_options(session, metaproperty_id)
+                for item in refreshed:
+                    if string_value(item.get("label")).strip().lower() == clean_label.lower():
+                        METAPROPERTY_OPTION_VALUE_CACHE.pop(normalize_uuid(metaproperty_id), None)
+                        return {
+                            "id": string_value(item.get("id")),
+                            "label": string_value(item.get("label") or clean_label),
+                            "databaseName": string_value(item.get("databaseName") or database_name),
+                        }
+            if response.status_code == 400:
+                try:
+                    error_payload = response.json()
+                except Exception:
+                    error_payload = {}
+                message = string_value(error_payload.get("message") or response.text)
+                if "already exists" in message.lower():
+                    refreshed = fetch_metaproperty_options(session, metaproperty_id)
+                    for item in refreshed:
+                        if string_value(item.get("label")).strip().lower() == clean_label.lower():
+                            METAPROPERTY_OPTION_VALUE_CACHE.pop(normalize_uuid(metaproperty_id), None)
+                            return {
+                                "id": string_value(item.get("id")),
+                                "label": string_value(item.get("label") or clean_label),
+                                "databaseName": string_value(item.get("databaseName") or database_name),
+                            }
+                errors.append(f"{url} [{response.status_code}] {response.text[:240]}")
+                continue
+            errors.append(f"{url} [{response.status_code}] {response.text[:240]}")
+        except Exception as exc:
+            errors.append(f"{url} [{type(exc).__name__}] {exc}")
+    raise RuntimeError(f"Could not create metaproperty option '{clean_label}'. Details: {' | '.join(errors[-6:])}")
+
+
+def ensure_metaproperty_option(session: requests.Session, metaproperty_id: str, label: str) -> Dict[str, str]:
+    clean_label = string_value(label).strip()
+    if not clean_label:
+        raise RuntimeError("A metaproperty option label is required.")
+    existing = fetch_metaproperty_options(session, metaproperty_id)
+    for item in existing:
+        if string_value(item.get("label")).strip().lower() == clean_label.lower():
+            return {
+                "id": string_value(item.get("id")),
+                "label": string_value(item.get("label") or clean_label),
+                "databaseName": string_value(item.get("databaseName")),
+            }
+    return create_metaproperty_option(session, metaproperty_id, clean_label)
+
+
+def parse_component_sku_value(raw_value: Any) -> Tuple[List[str], List[str]]:
+    text = string_value(raw_value)
+    if not text:
+        return [], []
+    normalized = text.replace("\n", ";").replace("\r", ";")
+    normalized = normalized.replace(",", ";")
+    normalized = normalized.replace("; ", ";")
+    raw_parts = [p.strip() for p in normalized.split(";")]
+    values: List[str] = []
+    warnings: List[str] = []
+    for idx, part in enumerate(raw_parts):
+        if not part:
+            warnings.append("Components field contains an empty item.")
+            continue
+        values.append(part)
+    return values, warnings
+
+def group_component_counts(component_skus: List[str]) -> List[Dict[str, Any]]:
+    counts: Dict[str, int] = {}
+    order: List[str] = []
+    for sku in component_skus:
+        key = string_value(sku)
+        if not key:
+            continue
+        if key not in counts:
+            counts[key] = 0
+            order.append(key)
+        counts[key] += 1
+    return [{"sku": sku, "count": counts[sku]} for sku in order]
+
+
+def parse_onboarding_paste_rows(raw_text: str, sales_channel_map: Optional[Dict[str, str]] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
+    rows: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not text.strip():
+        raise RuntimeError("Paste STEP Form rows to create a Product Imagery Onboarding board.")
+    lines = [line for line in text.split("\n")]
+    parsed = [line.split("\t") for line in lines]
+    headers = [string_value(x).strip() for x in parsed[0]]
+    if not headers:
+        raise RuntimeError("Could not read STEP Form header row.")
+    header_index = {h: i for i, h in enumerate(headers) if h}
+    for req in PIO_REQUIRED_IMPORT_HEADERS:
+        if req not in header_index:
+            raise RuntimeError(f"Missing required STEP Form column: {req}")
+    def cell(parts, col):
+        idx = header_index.get(col, -1)
+        return string_value(parts[idx]).strip() if 0 <= idx < len(parts) else ""
+    sales_channel_map = sales_channel_map or {}
+    normalized_sales_map = {string_value(k).strip().lower(): string_value(v).strip() for k, v in sales_channel_map.items() if string_value(k).strip() and string_value(v).strip()}
+    for line_no, parts in enumerate(parsed[1:], start=2):
+        row = {h: cell(parts, h) for h in headers}
+        if not any(string_value(v) for v in row.values()):
+            continue
+        sku = row.get("SKU", "").strip()
+        product_name = row.get("Product Name", "").strip()
+        product_color = row.get("Product Color", "").strip()
+        raw_sales_channel = row.get("Sales Channel", "").strip()
+        sales_channel = normalized_sales_map.get(raw_sales_channel.lower(), raw_sales_channel)
+        if not sku or not product_name:
+            warnings.append(f"Row {line_no} is missing required values and was skipped.")
+            continue
+        if sales_channel and sales_channel not in PIO_ALLOWED_SALES_CHANNELS:
+            warnings.append(f"Row {line_no} has Sales Channel '{raw_sales_channel}' mapped to invalid Bynder value '{sales_channel}'.")
+            continue
+        components_raw = row.get("Components", "")
+        component_skus, component_warnings = parse_component_sku_value(components_raw)
+        for w in component_warnings:
+            warnings.append(f"Row {line_no}: {w}")
+        rows.append({
+            "sku": sku,
+            "components_raw": components_raw,
+            "component_skus": component_skus,
+            "product_name": product_name,
+            "product_color": product_color,
+            "dim_width": row.get("Width", "").strip(),
+            "dim_length": row.get("Length", "").strip(),
+            "dim_height": row.get("Height", "").strip(),
+            "sales_channel": sales_channel,
+            "features": row.get("Features", "").strip(),
+        })
+    if not rows:
+        raise RuntimeError("No valid STEP Form rows were found in the pasted data.")
+    return rows, warnings
+
+
+def pio_base_asset_name(sku: str, slot_key: str, ordinal: int = 1) -> str:
+    sku = string_value(sku)
+    slot = string_value(slot_key)
+    if slot == "SKU_grid":
+        lane_name = "grid"
+    elif slot == "SKU_dimension":
+        lane_name = "dimension"
+    elif slot == "SKU_swatch":
+        lane_name = "swatch"
+    elif slot == "SKU_square":
+        lane_name = "square"
+    elif re.match(r'^SKU_5\d\d\d$', slot):
+        lane_name = "swatchdetail"
+    else:
+        lane_name = "carousel"
+    return f"PIO_{sku}_{lane_name}_{ordinal:02d}"
+
+
+
+
+def pio_slot_ordinal(slot_key: str) -> int:
+    slot = string_value(slot_key)
+    if slot == 'SKU_grid':
+        return 1
+    if slot == 'SKU_dimension':
+        return 1
+    if slot == 'SKU_swatch':
+        return 1
+    if slot == 'SKU_square':
+        return 1
+    m = re.match(r'^SKU_(\d+)$', slot)
+    if m:
+        num = int(m.group(1))
+        if 100 <= num < 5000:
+            return max(1, num // 100)
+        if 5000 <= num < 6000:
+            return max(1, ((num - 5000) // 100) + 1)
+    return 1
+
+def pio_target_asset_name(sku: str, slot_key: str) -> str:
+    stem = pio_base_asset_name(sku, slot_key, pio_slot_ordinal(slot_key))
+    return force_jpg_filename(stem, stem)
+
+def create_pio_placeholder_grid_asset(
+    session: requests.Session,
+    collection_option: Dict[str, str],
+    row: Dict[str, Any],
+) -> str:
+    with tempfile.TemporaryDirectory(prefix="content_refresher_pio_grid_") as td:
+        ext = Path(PIO_PLACEHOLDER_GRID_URL.split("?")[0]).suffix or ".jpg"
+        temp_path = Path(td) / f"{row['sku']}{ext}"
+        resp = requests.get(PIO_PLACEHOLDER_GRID_URL, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        temp_path.write_bytes(resp.content)
+        asset_name = pio_base_asset_name(row["sku"], "SKU_grid", 1)
+        media_id = upload_new_asset_group_upload(session, temp_path, asset_name)
+    metaprops = fetch_metaproperties_map(session)
+    fields: List[Tuple[str, Any]] = []
+    def set_std(db_name: str, value: Any):
+        value_str = string_value(value)
+        if not value_str:
+            return
+        mp = metaprops.get(db_name)
+        if not mp:
+            return
+        mp_id = string_value(mp.get("id"))
+        if not mp_id:
+            return
+        fields.append((f"metaproperty.{mp_id}", value_str))
+    def set_opt(db_name: str, value_label: str):
+        label = string_value(value_label)
+        if not label:
+            return
+        mp = get_metaproperty_by_candidates(metaprops, db_name, f"property_{db_name}", db_name.lower())
+        if not mp:
+            return
+        mp_id = string_value(mp.get("id"))
+        option_id = get_metaproperty_option_value(session, mp_id, label)
+        if option_id:
+            fields.append((f"metaproperty.{mp_id}", option_id))
+    set_std("Product_SKU", row["sku"])
+    set_std("Product_Name__STEP_", row["product_name"])
+    set_std("Product_Color", row["product_color"])
+    set_std("Component_SKUs", ",".join([string_value(x) for x in (row.get("component_skus") or []) if string_value(x)]))
+    set_std("dim_Width", row.get("dim_width", ""))
+    set_std("dim_Length", row.get("dim_length", ""))
+    set_std("dim_Height", row.get("dim_height", ""))
+    set_std("Features", row.get("features", ""))
+    set_opt("Asset_Type", "Photos")
+    set_opt("Asset_Sub-Type", ASSET_SUBTYPE_REQUIRED)
+    set_opt("Deliverable", "Product_Grid_Image")
+    product_collection_mp = get_metaproperty_by_candidates(metaprops, "product_collection", "Product_Collection", "property_product_collection")
+    if product_collection_mp and string_value(collection_option.get("id")):
+        fields.append((f"metaproperty.{string_value(product_collection_mp.get('id'))}", string_value(collection_option.get("id"))))
+    else:
+        set_opt("product_collection", collection_option["label"])
+    set_opt("Sales_Channel", row["sales_channel"])
+    set_opt("Sync_to_Site", PIO_SYNC_DO_NOT)
+    set_opt("Workflow", PIO_WORKFLOW_VALUE)
+    set_opt("Workflow_Status", PIO_STATUS_LAUNCHED)
+    set_std("Product_SKU_Position", f"{row['sku']}_grid")
+    if fields:
+        post_media_fields(session, media_id, fields)
+    return media_id
+
+
+def append_pio_board_fields(
+    session: requests.Session,
+    fields: List[Tuple[str, Any]],
+    metaprops_by_dbname: Dict[str, Dict[str, Any]],
+    row: Dict[str, Any],
+    target_position: str,
+) -> None:
+    def _set_std(*db_candidates: str, value: Any):
+        value_str = string_value(value)
+        if not value_str:
+            return
+        mp = get_metaproperty_by_candidates(metaprops_by_dbname, *db_candidates)
+        if not mp:
+            return
+        mp_id = string_value(mp.get("id"))
+        if mp_id:
+            fields.append((f"metaproperty.{mp_id}", value_str))
+
+    def _set_opt(value_label: str, *db_candidates: str):
+        label = string_value(value_label)
+        if not label:
+            return
+        mp = get_metaproperty_by_candidates(metaprops_by_dbname, *db_candidates)
+        if not mp:
+            return
+        mp_id = string_value(mp.get("id"))
+        if not mp_id:
+            return
+        option_id = get_metaproperty_option_value(session, mp_id, label)
+        if option_id:
+            fields.append((f"metaproperty.{mp_id}", option_id))
+
+    _set_opt("Photos", "Asset_Type", "property_Asset_Type")
+    _set_opt(ASSET_SUBTYPE_REQUIRED, "Asset_Sub-Type", "Asset_Sub_Type", "property_Asset_Sub-Type")
+    _set_opt(PIO_WORKFLOW_VALUE, "Workflow", "property_Workflow")
+    _set_opt(row.get("workflow_status") or PIO_STATUS_LAUNCHED, "Workflow_Status", "property_Workflow_Status")
+    _set_opt(row.get("sync_to_site") or PIO_SYNC_DO_NOT, "Sync_to_Site", "property_Sync_to_Site")
+    collection_label = row.get("product_collection") or row.get("collection") or ''
+    product_collection_mp = get_metaproperty_by_candidates(metaprops_by_dbname, "product_collection", "Product_Collection", "property_product_collection")
+    if product_collection_mp and string_value(collection_label):
+        mp_id = string_value(product_collection_mp.get("id"))
+        option_id = get_metaproperty_option_value(session, mp_id, collection_label)
+        if option_id:
+            fields.append((f"metaproperty.{mp_id}", option_id))
+    _set_std("Product_SKU", target_sku := string_value(row.get("sku")))
+    _set_std("Product_SKU_Position", target_position)
+    _set_std("Product_Name__STEP_", row.get("product_name"))
+    _set_std("Product_Color", row.get("product_color"))
+    _set_std("Component_SKUs", row.get("components_raw") or ",".join([string_value(x) for x in safe_list(row.get("component_skus")) if string_value(x)]))
+    _set_std("dim_Length", row.get("dim_length"))
+    _set_std("dim_Width", row.get("dim_width"))
+    _set_std("dim_Height", row.get("dim_height"))
+    _set_std("Features", row.get("features"))
+    _set_opt(row.get("sales_channel"), "Sales_Channel", "property_Sales_Channel")
+
+
+def wait_for_pio_placeholder_ready(session: requests.Session, media_id: str, row_sku: str, collection_label: str, attempts: int = 12, sleep_seconds: float = 2.0) -> Dict[str, Any]:
+    expected_position = f"{row_sku}_grid"
+    last_media: Dict[str, Any] = {}
+    for attempt in range(1, attempts + 1):
+        media = fetch_media_by_id(session, media_id)
+        last_media = media
+        if (
+            is_product_site_asset(media)
+            and string_value(prop(media, "Product_SKU", "Product_SKU")) == string_value(row_sku)
+            and string_value(prop(media, "Product_SKU_Position", "Product_SKU_Position")) == expected_position
+            and string_value(prop(media, "Product_Collection", "product_collection") or "").strip().lower() == string_value(collection_label).strip().lower()
+        ):
+            return media
+        if attempt < attempts:
+            time.sleep(sleep_seconds)
+    return last_media
+
+
+def fetch_pio_grid_assets(session: requests.Session) -> List[Dict[str, Any]]:
+    workflow_option_id = PIO_WORKFLOW_OPTION_ID
+    if not workflow_option_id:
+        return []
+    try:
+        workflow_items = fetch_all_media_for_option(session, workflow_option_id)
+    except Exception:
+        workflow_items = []
+    results = []
+    for asset in workflow_items:
+        if not is_product_site_asset(asset):
+            continue
+        deliverable_value = compact_text(prop(asset, "Deliverable", "Deliverable"))
+        if deliverable_value not in {compact_text("Product_Grid_Image"), compact_text("Product Grid Image")}:
+            continue
+        workflow_value = compact_text(prop(asset, "Workflow", "Workflow"))
+        if workflow_value and workflow_value != compact_text(PIO_WORKFLOW_VALUE):
+            continue
+        results.append(asset)
+    return results
+
+
+def build_onboarding_collection_summaries(session: requests.Session) -> List[Dict[str, Any]]:
+    workflow_items = fetch_pio_grid_assets(session)
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for asset in workflow_items:
+        collection_value = string_value(prop(asset, "Product_Collection", "product_collection") or prop(asset, "product_collection", "product_collection"))
+        label = string_value(collection_value)
+        if not label:
+            continue
+        grouped[label].append(asset)
+    summaries: List[Dict[str, Any]] = []
+    for label, grid_assets in grouped.items():
+        statuses = sorted({prop(a, "Workflow_Status", "Workflow_Status") for a in grid_assets if prop(a, "Workflow_Status", "Workflow_Status")})
+        sync_states = sorted({prop(a, "Sync_to_Site", "Sync_to_Site") for a in grid_assets if prop(a, "Sync_to_Site", "Sync_to_Site")})
+        latest_dt = max((parse_datetime(a.get("dateCreated")) or datetime.min) for a in grid_assets)
+        colors = sorted({string_value(prop(a, 'Product_Color', 'Product_Color')) for a in grid_assets if string_value(prop(a, 'Product_Color', 'Product_Color'))})
+        label_display = label + (f" ({', '.join(colors)})" if colors else '')
+        summaries.append({
+            "id": label,
+            "label": label,
+            "label_display": label_display,
+            "colors": colors,
+            "row_count": len({prop(a, "Product_SKU", "Product_SKU") for a in grid_assets if prop(a, "Product_SKU", "Product_SKU")}),
+            "workflow_statuses": statuses,
+            "sync_states": sync_states,
+            "latest": latest_dt.isoformat() if latest_dt != datetime.min else "",
+        })
+    summaries.sort(key=lambda x: x["label"].lower())
+    return summaries
+
+
+
+
+def ensure_row_has_minimum_slots(row: Dict[str, Any], core_slots: List[str], swatch_slots: List[str]) -> None:
+    buckets = bucket_assets(row)
+    existing_positions = {normalize_position_for_row(a.get('current_position') or a.get('position') or get_asset_position(a), row.get('sku') or '') for a in row.get('assets', [])}
+    for slot in core_slots:
+        if slot not in existing_positions:
+            row.setdefault('assets', []).append(build_empty_slot_placeholder(row, 'core', slot))
+    for slot in swatch_slots:
+        if slot not in existing_positions:
+            row.setdefault('assets', []).append(build_empty_slot_placeholder(row, 'swatch_detail', slot))
+
+def build_empty_slot_placeholder(row: Dict[str, Any], lane: str, slot: str) -> Dict[str, Any]:
+    return {'id': f"empty::{row.get('sku')}::{slot}", 'row_id': row.get('row_id'), 'sku': row.get('sku'), 'lane': lane, 'slot_key': slot, 'current_position': exact_position_for_row(string_value(row.get('sku')), slot), 'position': exact_position_for_row(string_value(row.get('sku')), slot), 'file_name':'', 'name':'', 'is_empty_slot':True, 'is_marked_for_deletion':False, 'original_state': {'position':'', 'is_marked_for_deletion':False}}
+
+def build_onboarding_board_for_collection(session: requests.Session, collection_option: Dict[str, str], force_refresh: bool = False) -> Dict[str, Any]:
+    collection_option_id = product_collection_option_id = string_value(collection_option.get("id"))
+    collection_label = string_value(collection_option.get("label"))
+
+    board_cache = STATE.setdefault("collection_board_cache", {})
+    cache_key = f"pio::{collection_option_id or collection_label}"
+    if force_refresh:
+        board_cache.pop(cache_key, None)
+    else:
+        cached_board = get_fresh_cached_value(
+            board_cache,
+            cache_key,
+            COLLECTION_BOARD_CACHE_MAX_AGE_SECONDS,
+            cache_label="collection board",
+        )
+        if cached_board is not None:
+            log_message(f"Using cached board for {collection_label}.")
+            return cached_board
+
+    workflow_grid_assets = fetch_pio_grid_assets(session)
+    grid_candidates = []
+    for asset in workflow_grid_assets:
+        asset_collection = string_value(prop(asset, "Product_Collection", "product_collection") or prop(asset, "product_collection", "product_collection"))
+        asset_collection_label = string_value(asset_collection)
+        if compact_text(asset_collection_label) == compact_text(collection_label) or compact_text(asset_collection) == compact_text(collection_option_id):
+            grid_candidates.append(asset)
+
+    grid_assets_by_sku = defaultdict(list)
+    for asset in grid_candidates:
+        sku = prop(asset, "Product_SKU", "Product_SKU")
+        if sku:
+            grid_assets_by_sku[sku].append(asset)
+
+    unique_skus = sorted(grid_assets_by_sku.keys(), key=natural_sort_key)
+    log_message(f"Grid anchor SKU count for {collection_label}: {len(unique_skus)}")
+
+    all_assets_by_sku: Dict[str, List[Dict[str, Any]]] = {}
+    def asset_worker(sku: str) -> Tuple[str, List[Dict[str, Any]]]:
+        items = fetch_assets_for_product_sku(session, "Product_SKU", sku)
+        filtered = [a for a in items if is_board_relevant_asset(a, sku)]
+        return sku, filtered
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(asset_worker, sku): sku for sku in unique_skus}
+        for future in as_completed(futures):
+            sku, items = future.result()
+            all_assets_by_sku[sku] = items
+            log_message(f"Fetched all board PSAs for SKU {sku}: {len(items)}")
+
+    rows_by_color: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(build_board_row_from_prefetched_assets, session, sku, all_assets_by_sku.get(sku, []), collection_label, False): sku
+            for sku in unique_skus
+        }
+        for future in as_completed(futures):
+            row = future.result()
+            if not row:
+                continue
+            if compact_text(row.get("workflow")) != compact_text(PIO_WORKFLOW_VALUE):
+                continue
+            row["inactive"] = False
+            rows_by_color[string_value(row.get("product_color"))].append(row)
+
+    color_sections = []
+    latest_edit = None
+    statuses = set()
+    sync_states = set()
+    for color in sorted(rows_by_color.keys(), key=lambda c: (c or "").lower()):
+        section_rows = list(rows_by_color[color])
+        section_rows.sort(key=lambda r: (natural_sort_key(r.get("sku") or ""), (r.get("product_name") or "").lower()))
+        color_sections.append({"color": color, "rows": section_rows, "photo_available_count": 0})
+        for row in section_rows:
+            statuses.add(string_value(row.get("workflow_status")))
+            sync_states.add(string_value(row.get("sync_to_site")))
+            dt = parse_datetime(row.get("date_newest"))
+            if dt and (latest_edit is None or dt > latest_edit):
+                latest_edit = dt
+
+    board = {
+        "collection": collection_option,
+        "collection_label": collection_label,
+        "loaded_at": datetime.now().isoformat(),
+        "color_sections": color_sections,
+        "workspace": WORKSPACE_PIO,
+        "is_onboarding": True,
+        "workflow_statuses": [s for s in sorted(statuses) if s],
+        "sync_states": [s for s in sorted(sync_states) if s],
+        "latest_edit": latest_edit.isoformat() if latest_edit else "",
+    }
+    refresh_row_component_links(board)
+    set_timed_cached_value(board_cache, cache_key, board)
+    return board
+
+def build_onboarding_board_from_created_rows(session: requests.Session, collection_option: Dict[str, str], created_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows_by_color: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    statuses = set()
+    sync_states = set()
+    latest_edit = None
+    for created in created_rows:
+        media = created.get("media") or {}
+        row = build_board_row_from_prefetched_assets(session, string_value(created.get("sku")), [media], collection_option.get("label") or "")
+        if not row:
+            continue
+        seed = created.get("seed_row") or {}
+        if not string_value(row.get("product_name")):
+            row["product_name"] = string_value(seed.get("product_name"))
+        if not string_value(row.get("product_color")):
+            row["product_color"] = string_value(seed.get("product_color"))
+        if not string_value(row.get("sales_channel")):
+            row["sales_channel"] = string_value(seed.get("sales_channel"))
+        if not string_value(row.get("dim_length")):
+            row["dim_length"] = string_value(seed.get("dim_length"))
+        if not string_value(row.get("dim_width")):
+            row["dim_width"] = string_value(seed.get("dim_width"))
+        if not string_value(row.get("dim_height")):
+            row["dim_height"] = string_value(seed.get("dim_height"))
+        if not row.get("component_groups") and seed.get("component_skus"):
+            row["component_groups"] = [{"sku": string_value(s), "count": 1} for s in (seed.get("component_skus") or []) if string_value(s)]
+        row["inactive"] = False
+        color = string_value(row.get("product_color"))
+        rows_by_color[color].append(row)
+        statuses.add(string_value(row.get("workflow_status")))
+        sync_states.add(string_value(row.get("sync_to_site")))
+        dt = parse_datetime(row.get("date_newest"))
+        if dt and (latest_edit is None or dt > latest_edit):
+            latest_edit = dt
+    color_sections = []
+    for color in sorted(rows_by_color.keys(), key=lambda c: (c or "").lower()):
+        section_rows = list(rows_by_color[color])
+        section_rows.sort(key=lambda r: (bool(r.get("inactive")), natural_sort_key(r.get("sku") or ""), (r.get("product_name") or "").lower()))
+        color_sections.append({
+            "color": color,
+            "rows": section_rows,
+            "photo_available_count": 0,
+        })
+    board = {
+        "collection": collection_option,
+        "collection_label": string_value(collection_option.get("label")),
+        "loaded_at": datetime.now().isoformat(),
+        "color_sections": color_sections,
+        "workspace": WORKSPACE_PIO,
+        "is_onboarding": True,
+        "workflow_statuses": [s for s in sorted(statuses) if s],
+        "sync_states": [s for s in sorted(sync_states) if s],
+        "latest_edit": latest_edit.isoformat() if latest_edit else "",
+    }
+    refresh_row_component_links(board)
+    return board
+
+
+def refresh_row_component_links(board: Dict[str, Any]) -> None:
+    if not board:
+        return
+    sku_index: Dict[str, Dict[str, Any]] = {}
+    for section in board.get("color_sections", []):
+        for row in section.get("rows", []):
+            sku_index[string_value(row.get("sku"))] = row
+    for section in board.get("color_sections", []):
+        for row in section.get("rows", []):
+            comp_groups = []
+            warnings = list(row.get("component_warnings") or [])
+            for group in row.get("component_groups") or []:
+                sku = string_value(group.get("sku"))
+                linked = sku_index.get(sku)
+                if not sku:
+                    continue
+                malformed = len(sku) != 9
+                if malformed:
+                    warnings.append(f"Component '{sku}' is malformed.")
+                if sku == string_value(row.get("sku")):
+                    warnings.append(f"Component '{sku}' matches the parent SKU.")
+                if linked is None:
+                    warnings.append(f"Component '{sku}' is not present on this board.")
+                comp_groups.append({
+                    "sku": sku,
+                    "count": int(group.get("count") or 1),
+                    "product_name": string_value((linked or {}).get("product_name")),
+                    "grid_thumb": first_grid_thumb((linked or {})),
+                })
+            row["component_display_groups"] = comp_groups
+            deduped = []
+            seen = set()
+            for w in warnings:
+                if w not in seen:
+                    seen.add(w)
+                    deduped.append(w)
+            row["component_warnings"] = deduped
+
+
+def first_grid_thumb(row: Dict[str, Any]) -> str:
+    if not row:
+        return ""
+    for asset in row.get("assets", []):
+        if string_value(asset.get("slot_key")) == GRID_SLOT and string_value(asset.get("lane")) == "grid":
+            return string_value(asset.get("transformBaseUrl"))
+    return ""
+
 # ============================================================
 # HELPERS - BYNDER SESSION AND REQUESTS
 # ============================================================
@@ -758,6 +1454,11 @@ def make_session(token: str) -> requests.Session:
         }
     )
     return session
+
+
+def get_session() -> requests.Session:
+    token = load_bynder_token(BYNDER_TOKEN_PATH)
+    return make_session(token)
 
 
 def request_with_retries(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
@@ -1043,6 +1744,18 @@ def fetch_metaproperties_map(session: requests.Session) -> Dict[str, Dict[str, A
     return mp_map
 
 
+def get_metaproperty_by_candidates(metaprops_by_dbname: Dict[str, Dict[str, Any]], *candidates: str) -> Optional[Dict[str, Any]]:
+    for candidate in candidates:
+        mp = metaprops_by_dbname.get(candidate)
+        if mp:
+            return mp
+    normalized_targets = {string_value(c).strip().lower() for c in candidates if string_value(c).strip()}
+    for key, mp in metaprops_by_dbname.items():
+        if string_value(key).strip().lower() in normalized_targets:
+            return mp
+    return None
+
+
 def get_media_download_url(session: requests.Session, media_id: str) -> str:
     url = f"{BYNDER_BASE_URL}/api/v4/media/{media_id}/download/"
     response = request_with_retries(session, "GET", url)
@@ -1200,6 +1913,8 @@ def parse_target_size(size_text: str) -> tuple[int, int]:
 
 def prep_mode_to_size(mode: str) -> tuple[int, int]:
     mode = string_value(mode)
+    if mode == "original":
+        return (0, 0)
     if mode == "crop_square":
         return (1000, 1000)
     if mode in {"crop_swatch", "pick_swatch"}:
@@ -1264,7 +1979,7 @@ def get_swatch_crop_bounds(
 
 
 def get_photo_prep_capability(mode: str, src_w: int, src_h: int) -> dict[str, Any]:
-    mode = string_value(mode) or "crop_1688"
+    mode = string_value(mode) or "original"
     src_w = int(src_w or 0)
     src_h = int(src_h or 0)
     result: dict[str, Any] = {
@@ -1295,6 +2010,16 @@ def get_photo_prep_capability(mode: str, src_w: int, src_h: int) -> dict[str, An
             "crop_box_height": int(crop_h or 0),
             "will_upscale": bool(will_upscale),
         }
+
+    if mode == "original":
+        result.update({
+            "kind": "notice",
+            "title": "Original size",
+            "detail": f"Source image: {src_w}x{src_h}. No crop or resize will be applied.",
+            "can_true_crop": False,
+            "will_upscale": False,
+        })
+        return result
 
     if mode == "crop_square":
         side = min(src_w, src_h)
@@ -1405,12 +2130,15 @@ def get_photo_prep_capability(mode: str, src_w: int, src_h: int) -> dict[str, An
 
 
 def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offset_y: int | float | None = None, offset_x: int | float | None = None) -> Image.Image:
-    mode = string_value(mode) or "crop_1688"
+    mode = string_value(mode) or "original"
     out_w, out_h = prep_mode_to_size(mode)
     im = image.convert("RGB")
     if flip:
         im = ImageOps.mirror(im)
     src_w, src_h = im.size
+
+    if mode == "original":
+        return im
 
     if mode == "crop_square":
         bounds = get_square_crop_bounds(src_w, src_h, offset_x)
@@ -1480,12 +2208,32 @@ def prepare_photo_result(image: Image.Image, mode: str, flip: bool = False, offs
 
 
 def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False, offset_y: int | float | None = None, offset_x: int | float | None = None, preview_max_w: int = 900, preview_max_h: int = 420) -> Image.Image:
-    mode = string_value(mode) or "crop_1688"
+    mode = string_value(mode) or "original"
     out_w, out_h = prep_mode_to_size(mode)
     im = image.convert("RGB")
+    canvas_outline = (48, 48, 52, 235)
+
+    def _frame_preview(preview_image: Image.Image, add_inner_canvas: bool = False) -> Image.Image:
+        framed = preview_image.convert("RGB")
+        pad = 10
+        bg = Image.new("RGB", (framed.width + (pad * 2), framed.height + (pad * 2)), (255, 255, 255))
+        bg.paste(framed, (pad, pad))
+        draw_bg = ImageDraw.Draw(bg, "RGBA")
+        draw_bg.rounded_rectangle((1, 1, bg.width - 2, bg.height - 2), radius=12, outline=(206, 198, 229, 255), width=2)
+        if add_inner_canvas:
+            draw_bg.rectangle((pad, pad, pad + framed.width - 1, pad + framed.height - 1), outline=canvas_outline, width=4)
+        return bg
     if flip:
         im = ImageOps.mirror(im)
     src_w, src_h = im.size
+
+    if mode == "original":
+        preview = im.copy()
+        if preview.size[0] > preview_max_w or preview.size[1] > preview_max_h:
+            scale = min(preview_max_w / preview.size[0], preview_max_h / preview.size[1], 1.0)
+            prev_size = (max(1, int(round(preview.size[0] * scale))), max(1, int(round(preview.size[1] * scale))))
+            preview = preview.resize(prev_size, Image.LANCZOS)
+        return _frame_preview(preview, add_inner_canvas=True)
 
     if mode == "crop_square":
         base = im.convert("RGBA")
@@ -1499,11 +2247,11 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
             haze_draw.rectangle((right, 0, src_w, src_h), fill=(115, 115, 115, 125))
         overlay = Image.alpha_composite(overlay, haze)
         draw = ImageDraw.Draw(overlay, "RGBA")
-        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=(255,255,255,235), width=4)
+        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=canvas_outline, width=4)
         scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
         prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
         preview = overlay.resize(prev_size, Image.LANCZOS)
-        return preview.convert("RGB")
+        return _frame_preview(preview.convert("RGB"), add_inner_canvas=False)
 
     if mode == "crop_swatch":
         base = im.convert("RGBA")
@@ -1517,11 +2265,11 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
             haze_draw.rectangle((right, 0, src_w, src_h), fill=(115, 115, 115, 125))
         overlay = Image.alpha_composite(overlay, haze)
         draw = ImageDraw.Draw(overlay, "RGBA")
-        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=(255,255,255,235), width=4)
+        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=canvas_outline, width=4)
         scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
         prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
         preview = overlay.resize(prev_size, Image.LANCZOS)
-        return preview.convert("RGB")
+        return _frame_preview(preview.convert("RGB"), add_inner_canvas=False)
 
     if mode == "pick_swatch":
         base = im.convert("RGBA")
@@ -1539,11 +2287,11 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
             haze_draw.rectangle((left, bottom, right, src_h), fill=(115, 115, 115, 125))
         overlay = Image.alpha_composite(overlay, haze)
         draw = ImageDraw.Draw(overlay, "RGBA")
-        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=(255,255,255,235), width=4)
+        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=canvas_outline, width=4)
         scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
         prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
         preview = overlay.resize(prev_size, Image.LANCZOS)
-        return preview.convert("RGB")
+        return _frame_preview(preview.convert("RGB"), add_inner_canvas=False)
 
     if mode in ("crop_1688", "crop_2200"):
         scaled_h = int(round(src_h * (out_w / src_w)))
@@ -1563,19 +2311,19 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
 
         overlay = Image.alpha_composite(overlay, haze)
         draw = ImageDraw.Draw(overlay, "RGBA")
-        draw.rectangle((2, off + 2, out_w - 3, bottom - 3), outline=(255,255,255,235), width=4)
+        draw.rectangle((2, off + 2, out_w - 3, bottom - 3), outline=canvas_outline, width=4)
 
         scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
         prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
         preview = overlay.resize(prev_size, Image.LANCZOS)
-        return preview.convert("RGB")
+        return _frame_preview(preview.convert("RGB"), add_inner_canvas=False)
 
     if mode == "crop_remove_sides_1688":
         if not src_w or not src_h:
             fallback = im.resize((out_w, out_h), Image.LANCZOS)
             scale = min(preview_max_w / fallback.size[0], preview_max_h / fallback.size[1], 1.0)
             prev_size = (max(1, int(round(fallback.size[0] * scale))), max(1, int(round(fallback.size[1] * scale))))
-            return fallback.resize(prev_size, Image.LANCZOS).convert("RGB")
+            return _frame_preview(fallback.resize(prev_size, Image.LANCZOS).convert("RGB"), add_inner_canvas=True)
         scaled_w = int(round(src_w * (out_h / src_h)))
         if scaled_w >= out_w:
             scaled = im.resize((max(1, scaled_w), out_h), Image.LANCZOS).convert("RGBA")
@@ -1590,11 +2338,11 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
                 haze_draw.rectangle((right, 0, scaled.size[0], out_h), fill=(115, 115, 115, 125))
             overlay = Image.alpha_composite(overlay, haze)
             draw = ImageDraw.Draw(overlay, "RGBA")
-            draw.rectangle((left + 2, 2, right - 3, out_h - 3), outline=(255,255,255,235), width=4)
+            draw.rectangle((left + 2, 2, right - 3, out_h - 3), outline=canvas_outline, width=4)
             scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
             prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
             preview = overlay.resize(prev_size, Image.LANCZOS)
-            return preview.convert("RGB")
+            return _frame_preview(preview.convert("RGB"), add_inner_canvas=False)
         cover_scale = max(out_w / src_w, out_h / src_h)
         cover_w = max(1, int(round(src_w * cover_scale)))
         cover_h = max(1, int(round(src_h * cover_scale)))
@@ -1616,16 +2364,16 @@ def render_photo_preview_image(image: Image.Image, mode: str, flip: bool = False
             haze_draw.rectangle((left, bottom, right, cover_h), fill=(115, 115, 115, 95))
         overlay = Image.alpha_composite(overlay, haze)
         draw = ImageDraw.Draw(overlay, "RGBA")
-        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=(255,255,255,235), width=4)
+        draw.rectangle((left + 2, top + 2, right - 3, bottom - 3), outline=canvas_outline, width=4)
         scale = min(preview_max_w / overlay.size[0], preview_max_h / overlay.size[1], 1.0)
         prev_size = (max(1, int(round(overlay.size[0] * scale))), max(1, int(round(overlay.size[1] * scale))))
         preview = overlay.resize(prev_size, Image.LANCZOS)
-        return preview.convert("RGB")
+        return _frame_preview(preview.convert("RGB"), add_inner_canvas=False)
 
     final_img = prepare_photo_result(im, mode, False, offset_y, offset_x)
     scale = min(preview_max_w / final_img.size[0], preview_max_h / final_img.size[1], 1.0)
     prev_size = (max(1, int(round(final_img.size[0] * scale))), max(1, int(round(final_img.size[1] * scale))))
-    return final_img.resize(prev_size, Image.LANCZOS)
+    return _frame_preview(final_img.resize(prev_size, Image.LANCZOS), add_inner_canvas=True)
 
 
 def get_photography_asset_status(asset: Dict[str, Any]) -> str:
@@ -2367,7 +3115,7 @@ def apply_prepared_file_to_slot(
                 target_asset["property_" + PSA_IMAGE_TYPE_DBNAME] = psa_image_type_override
             return {"message": "Prepared image was updated. Reload to see it!", "kind": "updated"}
 
-        profile = resolve_new_asset_profile(row, target_lane, target_slot, prepared_name)
+        profile = resolve_new_asset_profile(row, target_lane, target_slot, prepared_name, compact_text(string_value(board.get('workspace'))) == compact_text(WORKSPACE_PIO))
         exemplar = profile.get("exemplar")
         if not exemplar:
             raise RuntimeError("Could not find a source asset in this row to borrow metadata from for the upload.")
@@ -2409,6 +3157,15 @@ def apply_prepared_media_to_slot(
     psa_image_type_override: str = "",
 ) -> Dict[str, Any]:
     psa_image_type_override = effective_psa_image_type_for_target(target_lane, target_slot, psa_image_type_override)
+    if string_value(prep_mode) == 'original' and not bool(flip):
+        temp_path, td = download_source_media_to_tempfile(session, media_id, f"prepared_original_{media_id}.jpg")
+        try:
+            return apply_prepared_file_to_slot(session, board, row_id, target_lane, target_slot, temp_path, psa_image_type_override)
+        finally:
+            try:
+                td.cleanup()
+            except Exception:
+                pass
     img = open_image_from_media(session, media_id)
     result = prepare_photo_result(img, prep_mode, flip, offset_y, offset_x)
     out_w, out_h = result.size
@@ -2591,16 +3348,16 @@ def lane_has_non_deleted_assets(row: Dict[str, Any], lane: str) -> bool:
     return False
 
 
-def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot: str, uploaded_original_name: str) -> Dict[str, Any]:
+def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot: str, uploaded_original_name: str, is_pio: bool = False) -> Dict[str, Any]:
     sku = string_value(row.get("sku") or "").strip()
     if target_lane == "grid":
         exemplar = pick_last_carousel_lane_asset(row) or pick_any_asset_for_sku(row)
-        forced_stem = f"{sku}_grid_CRU" if sku else "SKU_grid_CRU"
+        forced_stem = pio_target_asset_name(sku, 'SKU_grid') if is_pio else force_jpg_filename(f"{sku}_grid_CRU" if sku else "SKU_grid_CRU", f"{sku}_grid_CRU" if sku else "SKU_grid_CRU")
         return {
             "exemplar": exemplar,
             "target_slot": GRID_SLOT,
             "deliverable_override": "Product_Grid_Image",
-            "target_name": force_jpg_filename(forced_stem, forced_stem),
+            "target_name": forced_stem,
         }
 
     if target_lane == "special" and target_slot in {"SKU_dimension", "SKU_swatch", "SKU_square"}:
@@ -2611,6 +3368,8 @@ def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot
             "SKU_square": ("MetaCarouselSquare", f"{sku}_square_CRU" if sku else "SKU_square_CRU"),
         }
         deliverable_override, forced_stem = special_map[target_slot]
+        if is_pio:
+            forced_stem = pio_target_asset_name(sku, target_slot)
         return {
             "exemplar": exemplar,
             "target_slot": target_slot,
@@ -2621,22 +3380,22 @@ def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot
                 else SQUARE_PSA_IMAGE_TYPE_LABEL if target_slot == "SKU_square"
                 else ""
             ),
-            "target_name": force_jpg_filename(forced_stem, forced_stem),
+            "target_name": forced_stem if is_pio else force_jpg_filename(forced_stem, forced_stem),
         }
 
     if target_lane == "core" and not lane_has_non_deleted_assets(row, "core"):
         exemplar = pick_any_asset_for_sku(row)
-        forced_stem = f"{sku}_carousel_CRU" if sku else "SKU_carousel_CRU"
+        forced_stem = pio_target_asset_name(sku, 'SKU_100') if is_pio else f"{sku}_carousel_CRU" if sku else "SKU_carousel_CRU"
         return {
             "exemplar": exemplar,
             "target_slot": "SKU_100",
             "deliverable_override": "Product_Image_Carousel",
-            "target_name": force_jpg_filename(forced_stem, forced_stem),
+            "target_name": forced_stem if is_pio else force_jpg_filename(forced_stem, forced_stem),
         }
 
     if target_lane == "swatch_detail" and not lane_has_non_deleted_assets(row, "swatch_detail"):
         exemplar = pick_any_asset_for_sku(row)
-        forced_stem = f"{sku}_swatchDetail_CRU" if sku else "SKU_swatchDetail_CRU"
+        forced_stem = pio_target_asset_name(sku, 'SKU_5000') if is_pio else f"{sku}_swatchDetail_CRU" if sku else "SKU_swatchDetail_CRU"
         return {
             "exemplar": exemplar,
             "target_slot": "SKU_5000",
@@ -2645,7 +3404,7 @@ def resolve_new_asset_profile(row: Dict[str, Any], target_lane: str, target_slot
         }
 
     exemplar = pick_left_exemplar_asset(row, target_lane, target_slot) or pick_lane_exemplar_asset(row, target_lane) or pick_any_asset_for_sku(row)
-    target_name = derive_cru_filename(row, target_lane, exemplar, uploaded_original_name) if exemplar else force_jpg_filename(uploaded_original_name or "prepared_image", "prepared_image")
+    target_name = pio_target_asset_name(sku, target_slot) if is_pio else derive_cru_filename(row, target_lane, exemplar, uploaded_original_name) if exemplar else force_jpg_filename(uploaded_original_name or "prepared_image", "prepared_image")
     return {
         "exemplar": exemplar,
         "target_slot": target_slot,
@@ -2784,7 +3543,7 @@ def apply_uploaded_file_to_slot(session: requests.Session, board: Dict[str, Any]
             mark_asset_uploaded_notice(target_asset, 'new_version', 'New version uploaded to this slot. Reload to view.')
             return {"message": "Asset was updated. Reload to see it!", "kind": "updated"}
 
-        profile = resolve_new_asset_profile(row, target_lane, target_slot, original_name)
+        profile = resolve_new_asset_profile(row, target_lane, target_slot, original_name, compact_text(string_value(board.get('workspace'))) == compact_text(WORKSPACE_PIO))
         exemplar = profile.get("exemplar")
         if not exemplar:
             raise RuntimeError("Could not find a source asset in this row to borrow metadata from for the upload.")
@@ -3148,10 +3907,19 @@ def asset_is_cleanup_total_fill_candidate(asset: Dict[str, Any], row: Optional[D
             string_value((row or {}).get("sku") or asset.get("sku") or ""),
         )
     )
-    if slot_key not in {"SKU_grid", "SKU_100", "SKU_200"}:
+    if slot_key in {"SKU_grid", "SKU_100"}:
+        return True
+    if slot_key != "SKU_200":
         return False
     sales_channel = row.get("sales_channel") if isinstance(row, dict) else asset.get("sales_channel")
     return sales_channel_has_full_line(sales_channel)
+
+
+def row_counts_as_active(row: Optional[Dict[str, Any]]) -> bool:
+    status = string_value((row or {}).get("product_status")).strip().lower()
+    if not status:
+        return True
+    return status == "active"
 
 
 def expected_dimensions_for_slot(slot_key: str) -> Tuple[int, int]:
@@ -3306,6 +4074,34 @@ def parse_photo_tags(asset: Dict[str, Any]) -> List[str]:
             out.append(m)
     return out
 
+def parse_all_photo_tags(asset: Dict[str, Any]) -> List[str]:
+    raw = asset.get("tags")
+    parts: List[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            value = string_value(item)
+            if value:
+                parts.append(value)
+    else:
+        value = string_value(raw)
+        if value:
+            parts.append(value)
+    extra = string_value(asset.get("property_tags") or asset.get("property_Tags"))
+    if extra:
+        for part in re.split(r"[,;]", extra):
+            value = string_value(part)
+            if value:
+                parts.append(value)
+    out: List[str] = []
+    seen = set()
+    for part in parts:
+        for token in re.split(r"[\s,;]+", string_value(part)):
+            token = string_value(token)
+            if token and token not in seen:
+                seen.add(token)
+                out.append(token)
+    return out
+
 def get_reviewed_for_site_values(asset: Dict[str, Any]) -> List[str]:
     raw = asset.get(f"property_{REVIEWED_FOR_SITE_DBNAME}")
     values: List[str] = []
@@ -3345,6 +4141,7 @@ def photo_asset_to_client_model(asset: Dict[str, Any], matching_skus: List[str])
     name = string_value(asset.get("name"))
     file_name = filename_from_original(original, name)
     tags = parse_photo_tags(asset)
+    all_tags = parse_all_photo_tags(asset)
     matching = [t for t in tags if t in set(matching_skus)]
     fp = asset.get("activeOriginalFocusPoint") or {}
     reviewed_values = get_reviewed_for_site_values(asset)
@@ -3365,6 +4162,8 @@ def photo_asset_to_client_model(asset: Dict[str, Any], matching_skus: List[str])
         "reviewed_for_site": photo_asset_is_reviewed_for_site(asset),
         "reviewed_for_site_values": reviewed_values,
         "tags": tags,
+        "sku_tags": tags,
+        "all_tags": all_tags,
         "matching_skus": matching,
         "focus_x": int(fp.get("x") or 0) if fp else 0,
         "focus_y": int(fp.get("y") or 0) if fp else 0,
@@ -3504,7 +4303,12 @@ def build_board_row_from_prefetched_assets(
             newest_dt = dt
 
     client_assets = [asset_to_client_model(a, sku) for a in filtered_assets]
-    component_skus = get_component_skus_for_grid_asset_cached(session, newest_grid)
+    component_raw = prop(newest_grid or anchor, "Component_SKUs", "Component_SKUs")
+    if component_raw:
+        component_skus, component_warnings = parse_component_sku_value(component_raw)
+    else:
+        component_skus = get_component_skus_for_grid_asset_cached(session, newest_grid)
+        component_warnings = []
     row = {
         "row_id": sku,
         "sku": sku,
@@ -3515,11 +4319,22 @@ def build_board_row_from_prefetched_assets(
         "product_url": prop(anchor, "Product_URL", "Product_URL"),
         "mattress_size": prop(anchor, "Mattress_Size", "Mattress_Size"),
         "component_skus": component_skus,
-        "product_collection": prop(anchor, "Product_Collection", "Product_Collection") or collection_label,
+        "components_raw": component_raw,
+        "component_groups": group_component_counts(component_skus),
+        "component_warnings": component_warnings,
+        "component_display_groups": [],
+        "product_collection": prop(anchor, "Product_Collection", "product_collection") or collection_label,
         "product_subcategory": prop(anchor, "Product_Sub-Category", "Product_Sub-Category"),
         "dropped": prop(anchor, "Dropped", "Dropped"),
         "visible_on_website": prop(anchor, "Visible_on_Website", "Visible_on_Website"),
         "step_path": prop(anchor, "STEP_Path", "STEP_Path"),
+        "dim_width": prop(anchor, "dim_Width", "dim_Width"),
+        "dim_length": prop(anchor, "dim_Length", "dim_Length"),
+        "dim_height": prop(anchor, "dim_Height", "dim_Height"),
+        "features": prop(anchor, "Features", "Features"),
+        "workflow": prop(anchor, "Workflow", "Workflow"),
+        "workflow_status": prop(anchor, "Workflow_Status", "Workflow_Status"),
+        "sync_to_site": prop(anchor, "Sync_to_Site", "Sync_to_Site"),
         "date_oldest": oldest_dt.isoformat() if oldest_dt else "",
         "date_newest": newest_dt.isoformat() if newest_dt else "",
         "inactive": status != "Active",
@@ -3629,7 +4444,7 @@ def build_board_for_collection(session: requests.Session, product_collection_opt
             if sku:
                 grid_assets_by_sku[sku].append(asset)
 
-        unique_skus = sorted(grid_assets_by_sku.keys())
+        unique_skus = sorted(grid_assets_by_sku.keys(), key=natural_sort_key)
         log_message(f"Grid anchor SKU count for {collection_label}: {len(unique_skus)}")
 
         all_assets_by_sku: Dict[str, List[Dict[str, Any]]] = {}
@@ -3685,7 +4500,7 @@ def build_board_for_collection(session: requests.Session, product_collection_opt
     color_sections = []
     for color in sorted(rows_by_color.keys(), key=lambda c: (c or "").lower()):
         section_rows = list(rows_by_color[color])
-        section_rows.sort(key=lambda r: (bool(r.get("inactive")), (r.get("product_name") or "").lower(), r.get("sku") or ""))
+        section_rows.sort(key=lambda r: (bool(r.get("inactive")), natural_sort_key(r.get("sku") or ""), (r.get("product_name") or "").lower()))
         color_sections.append({
             "color": color,
             "rows": section_rows,
@@ -3829,6 +4644,8 @@ def bucket_assets(row: Dict[str, Any]) -> Dict[str, Dict[str, List[Dict[str, Any
         "off_pattern": {"off_pattern": []},
     }
     for asset in row.get("assets", []):
+        if asset.get("is_empty_slot"):
+            continue
         lane = asset.get("lane")
         position = asset.get("slot_key") or normalize_position_for_row(asset.get("last_nontrash_position") or asset.get("current_position"), row.get("sku"))
         if lane == "grid":
@@ -4022,7 +4839,7 @@ def apply_move(board: Dict[str, Any], row_id: str, asset_id: str, target_lane: s
         if not source_asset:
             raise ValueError(f"Asset {asset_id} not found in source row")
         original_name = string_value(source_asset.get("file_name") or source_asset.get("name") or "copied_asset.jpg")
-        profile = resolve_new_asset_profile(target_row, target_lane, target_slot or "", original_name)
+        profile = resolve_new_asset_profile(target_row, target_lane, target_slot or "", original_name, compact_text(string_value(board.get('workspace'))) == compact_text(WORKSPACE_PIO))
         asset = make_pending_copy_asset(source_asset, target_row.get("sku", ""), profile)
         target_slot = string_value(profile.get("target_slot") or target_slot)
         if sanitize_copy_warning(target_lane):
@@ -4271,9 +5088,16 @@ def commit_changes(board: Dict[str, Any], session: requests.Session) -> Dict[str
             if job.get("job_type") == "new_asset":
                 staged_path = Path(job.get("staged_file_path") or "")
                 source_media = fetch_media_by_id(session, job["source_media_id"])
-                target_name = os.path.splitext(job["asset_name"])[0]
+                target_pos = normalize_position_for_row(job.get("target_position") or '', job.get('sku') or '')
+                if compact_text((get_row_by_id(board, job.get('row_id') or '') or {}).get('workflow')) == compact_text(PIO_WORKFLOW_VALUE):
+                    target_name = Path(pio_target_asset_name(job.get('sku') or '', target_pos or 'SKU_100')).stem
+                else:
+                    target_name = os.path.splitext(job["asset_name"])[0]
                 new_media_id = upload_new_asset_group_upload(session, staged_path, target_name)
                 fields = build_metadata_copy_fields(session, source_media, metaprops_by_dbname, job["sku"], job["target_position"], target_name, job.get("deliverable_override") or "", job.get("psa_image_type_override") or "")
+                row = get_row_by_id(board, job.get("row_id") or "")
+                if compact_text((row or {}).get("workflow")) == compact_text(PIO_WORKFLOW_VALUE):
+                    append_pio_board_fields(session, fields, metaprops_by_dbname, row or {}, job.get("target_position") or "")
                 post_media_fields(session, new_media_id, fields)
                 cleanup_staged_file(str(staged_path))
                 response = {"new_media_id": new_media_id}
@@ -4390,7 +5214,7 @@ def row_needs_make_square(row: Dict[str, Any]) -> bool:
         return False
     if not sales_channel_has_full_line(row.get("sales_channel")):
         return False
-    live_assets = [a for a in (row.get("assets") or []) if not a.get("is_marked_for_deletion")]
+    live_assets = [a for a in (row.get("assets") or []) if not a.get("is_marked_for_deletion") and not a.get("is_empty_slot")]
     has_room_shot_carousel = any(
         string_value(a.get("lane")) == "core" and compact_text(a.get("psa_image_type")) == "roomshot"
         for a in live_assets
@@ -4438,7 +5262,7 @@ def candidate_sort_key(candidate: Dict[str, Any]) -> Tuple[int, float]:
 
 
 def compute_row_issue_summary(row: Dict[str, Any], include_missing_dims: bool = True) -> Dict[str, int]:
-    live_assets = [a for a in (row.get("assets") or []) if not a.get("is_marked_for_deletion")]
+    live_assets = [a for a in (row.get("assets") or []) if not a.get("is_marked_for_deletion") and not a.get("is_empty_slot")]
     dup_counts: Dict[str, int] = {}
     size_issue_count = 0
     for asset in live_assets:
@@ -4484,7 +5308,7 @@ def compute_board_issue_summary(board: Dict[str, Any], include_missing_dims: boo
     }
     for section in board.get("color_sections", []):
         for row in section.get("rows", []):
-            if string_value(row.get("product_status")).lower() != "active":
+            if not row_counts_as_active(row):
                 continue
             row_summary = compute_row_issue_summary(row, include_missing_dims=include_missing_dims)
             if row_summary["total"]:
@@ -4541,7 +5365,7 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
         for sku, sku_assets in sku_map.items():
             grid_assets = [a for a in sku_assets if normalize_position_for_row(get_asset_position(a), sku) == GRID_SLOT]
             anchor = max(grid_assets or sku_assets, key=lambda a: parse_datetime(a.get("dateCreated")) or datetime.min)
-            if string_value(get_status_from_grid_asset(anchor)).lower() != "active":
+            if not row_counts_as_active({"product_status": get_status_from_grid_asset(anchor)}):
                 continue
             step_path = prop(anchor, "STEP_Path", "STEP_Path")
             lane = _lane_presence_from_assets_for_sku(sku_assets, sku)
@@ -4599,11 +5423,15 @@ def scan_collection_for_game_candidates(session: requests.Session, collection_op
     return candidates
 
 
-def _scan_game_queue_candidates(sync: bool = False, stop_after_first: bool = False) -> None:
+def _scan_game_queue_candidates(sync: bool = False, stop_after_first: bool = False, target_count: Optional[int] = None) -> None:
     game = STATE["game"]
+    if target_count is None:
+        with game["lock"]:
+            target_count = GAME_QUEUE_TARGET if bool(game.get("active")) else GAME_QUEUE_PRELOAD_TARGET
+    target_count = max(0, int(target_count or 0))
     try:
         collections = ensure_collections_loaded()
-        if not collections:
+        if not collections or target_count <= 0:
             return
         token = load_bynder_token(BYNDER_TOKEN_PATH)
         session = make_session(token)
@@ -4614,7 +5442,7 @@ def _scan_game_queue_candidates(sync: bool = False, stop_after_first: bool = Fal
             with game["lock"]:
                 existing_keys = {string_value(c.get("key")) for c in (game.get("queue") or [])}
                 current_key = string_value((game.get("current") or {}).get("key"))
-                if len(game.get("queue") or []) >= GAME_QUEUE_TARGET:
+                if len(game.get("queue") or []) >= target_count:
                     break
             if scanned >= GAME_SCAN_BATCH:
                 break
@@ -4624,7 +5452,7 @@ def _scan_game_queue_candidates(sync: bool = False, stop_after_first: bool = Fal
                 for candidate in scan_collection_for_game_candidates(session, collection_option):
                     key = string_value(candidate.get("key"))
                     with game["lock"]:
-                        if key and key != current_key and key not in existing_keys and len(game.get("queue") or []) < GAME_QUEUE_TARGET:
+                        if key and key != current_key and key not in existing_keys and len(game.get("queue") or []) < target_count:
                             game.setdefault("queue", []).append(candidate)
                             game["queue"].sort(key=candidate_sort_key)
                             existing_keys.add(key)
@@ -4635,13 +5463,15 @@ def _scan_game_queue_candidates(sync: bool = False, stop_after_first: bool = Fal
             except Exception as exc:
                 log_message(f"Game queue scan skipped {collection_option.get('label')}: {exc}")
     finally:
-        if not sync:
-            with game["lock"]:
-                game["scanner_running"] = False
+        with game["lock"]:
+            game["scanner_running"] = False
 
 
-def ensure_game_queue_ready(min_ready: int = 1, timeout_seconds: float = 10.0) -> bool:
+def ensure_game_queue_ready(min_ready: int = 1, timeout_seconds: float = 10.0, target_count: Optional[int] = None) -> bool:
     game = STATE["game"]
+    if target_count is None:
+        with game["lock"]:
+            target_count = GAME_QUEUE_TARGET if bool(game.get("active")) else GAME_QUEUE_PRELOAD_TARGET
     with game["lock"]:
         ready_count = len(game.get("queue") or [])
         scanner_running = bool(game.get("scanner_running"))
@@ -4651,7 +5481,7 @@ def ensure_game_queue_ready(min_ready: int = 1, timeout_seconds: float = 10.0) -
         with game["lock"]:
             game["scanner_running"] = True
             game["last_scan_at"] = time.time()
-        _scan_game_queue_candidates(sync=True, stop_after_first=(min_ready <= 1))
+        _scan_game_queue_candidates(sync=True, stop_after_first=(min_ready <= 1), target_count=target_count)
     start = time.time()
     while time.time() - start < timeout_seconds:
         with game["lock"]:
@@ -4662,7 +5492,7 @@ def ensure_game_queue_ready(min_ready: int = 1, timeout_seconds: float = 10.0) -
             with game["lock"]:
                 game["scanner_running"] = True
                 game["last_scan_at"] = time.time()
-            _scan_game_queue_candidates(sync=True, stop_after_first=(min_ready <= 1))
+            _scan_game_queue_candidates(sync=True, stop_after_first=(min_ready <= 1), target_count=target_count)
             with game["lock"]:
                 if len(game.get("queue") or []) >= min_ready:
                     return True
@@ -4671,12 +5501,16 @@ def ensure_game_queue_ready(min_ready: int = 1, timeout_seconds: float = 10.0) -
         return len(game.get("queue") or []) >= min_ready
 
 
-def maybe_start_game_queue_fill(force: bool = False) -> None:
+def maybe_start_game_queue_fill(force: bool = False, target_count: Optional[int] = None) -> None:
     game = STATE["game"]
     with game["lock"]:
+        ready_count = len(game.get("queue") or [])
+        active = bool(game.get("active"))
+        if target_count is None:
+            target_count = GAME_QUEUE_TARGET if active else GAME_QUEUE_PRELOAD_TARGET
         if game.get("scanner_running"):
             return
-        if not force and len(game.get("queue") or []) >= GAME_QUEUE_TARGET:
+        if not force and ready_count >= target_count:
             return
         if not force and (time.time() - float(game.get("last_scan_at") or 0)) < GAME_SCAN_MIN_GAP_SECONDS:
             return
@@ -4684,7 +5518,7 @@ def maybe_start_game_queue_fill(force: bool = False) -> None:
         game["last_scan_at"] = time.time()
 
     def _worker() -> None:
-        _scan_game_queue_candidates(sync=False, stop_after_first=False)
+        _scan_game_queue_candidates(sync=False, stop_after_first=False, target_count=target_count)
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -4698,9 +5532,10 @@ def start_server_side_game_queue_worker() -> None:
     def _loop() -> None:
         while True:
             try:
-                # Keep a lightweight candidate bank topped up on the server side so
-                # browser timer throttling or idle gating on macOS cannot starve the queue.
-                maybe_start_game_queue_fill(force=False)
+                with game["lock"]:
+                    should_fill = bool(game.get("active")) and len(game.get("queue") or []) < GAME_QUEUE_TARGET and not game.get("scanner_running")
+                if should_fill:
+                    maybe_start_game_queue_fill(force=True, target_count=GAME_QUEUE_TARGET)
             except Exception as exc:
                 log_message(f"Server-side game queue worker error: {exc}")
             time.sleep(GAME_SERVER_QUEUE_WORKER_INTERVAL_SECONDS)
@@ -4755,13 +5590,7 @@ def get_next_hydrated_game_board(force_fill: bool = True, max_attempts: int = 24
         force_fill = False
         if candidate is None:
             if not had_candidates:
-                maybe_start_game_queue_fill(force=True)
-                start = time.time()
-                while time.time() - start < 2.0:
-                    with game["lock"]:
-                        if game.get("queue"):
-                            break
-                    time.sleep(0.15)
+                ensure_game_queue_ready(min_ready=1, timeout_seconds=12.0, target_count=max(1, GAME_QUEUE_TARGET))
                 candidate = pop_next_game_candidate(force_fill=False)
             if candidate is None:
                 break
@@ -4823,6 +5652,74 @@ def api_collections() -> Response:
                 log_message(f"Loaded {len(collections)} Product Collection options from Bynder.")
         return jsonify({"collections": STATE["collections"], "source": source})
     except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+def fetch_all_bynder_collections_cached(session: requests.Session, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    cache = STATE.setdefault("bynder_collection_cache", {})
+    key = "all"
+    if force_refresh:
+        cache.pop(key, None)
+    else:
+        cached = get_fresh_cached_value(cache, key, BYNDER_COLLECTION_CACHE_MAX_AGE_SECONDS, cache_label="Bynder collection")
+        if cached is not None:
+            return cached
+    url = f"{BYNDER_BASE_URL}/api/v4/collections"
+    page = 1
+    limit = 100
+    out: List[Dict[str, Any]] = []
+    while True:
+        resp = request_with_retries(session, "GET", url, params={"page": page, "limit": limit})
+        payload = resp.json()
+        items = payload if isinstance(payload, list) else payload.get("items") or payload.get("results") or payload.get("collections") or []
+        if not items:
+            break
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            out.append({
+                "id": string_value(item.get("id")),
+                "name": string_value(item.get("name") or item.get("label") or item.get("title")),
+                "description": string_value(item.get("description")),
+                "assetCount": int(item.get("assetCount") or item.get("asset_count") or item.get("count") or 0),
+            })
+        if len(items) < limit:
+            break
+        page += 1
+    out = [x for x in out if x.get("id") and x.get("name")]
+    out.sort(key=lambda x: x["name"].lower())
+    set_timed_cached_value(cache, key, out)
+    return out
+
+
+def fetch_all_media_for_bynder_collection(session: requests.Session, collection_id: str, limit: int = PAGE_LIMIT) -> List[Dict[str, Any]]:
+    url = f"{BYNDER_BASE_URL}/api/v4/media/"
+    resp = request_with_retries(session, "GET", url, params={"collectionId": collection_id, "limit": 1, "total": 1})
+    payload = resp.json()
+    expected_count = int(payload.get("total", {}).get("count", 0))
+    if expected_count <= 0:
+        return []
+    total_pages = math.ceil(expected_count / limit)
+    items: List[Dict[str, Any]] = []
+    for page in range(1, total_pages + 1):
+        r = request_with_retries(session, "GET", url, params={"collectionId": collection_id, "limit": limit, "page": page})
+        items.extend(extract_media_items(r.json()))
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        media_id = string_value(item.get("id"))
+        if media_id:
+            deduped[media_id] = item
+    return list(deduped.values())
+
+
+@app.route('/api/bynder/collections', methods=['GET'])
+def api_bynder_collections() -> Response:
+    try:
+        session = get_session()
+        collections = fetch_all_bynder_collections_cached(session, force_refresh=False)
+        return jsonify({"collections": collections})
+    except Exception as exc:
+        log_message(f"Bynder collection listing failed: {exc}")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -4965,6 +5862,16 @@ def api_load_collection() -> Response:
 @app.route("/api/game/status")
 def api_game_status() -> Response:
     try:
+        game = STATE["game"]
+        with game["lock"]:
+            active = bool(game.get("active"))
+            ready_count = len(game.get("queue") or [])
+        if active:
+            if ready_count < GAME_QUEUE_TARGET:
+                maybe_start_game_queue_fill(force=False, target_count=GAME_QUEUE_TARGET)
+        else:
+            if ready_count < GAME_QUEUE_PRELOAD_TARGET:
+                maybe_start_game_queue_fill(force=False, target_count=GAME_QUEUE_PRELOAD_TARGET)
         return jsonify(game_status_payload())
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -4973,7 +5880,14 @@ def api_game_status() -> Response:
 @app.route("/api/game/ensure_queue", methods=["POST"])
 def api_game_ensure_queue() -> Response:
     try:
-        maybe_start_game_queue_fill(force=False)
+        game = STATE['game']
+        with game['lock']:
+            ready_count = len(game.get('queue') or [])
+            active = bool(game.get('active'))
+        if active and ready_count < GAME_QUEUE_TARGET:
+            maybe_start_game_queue_fill(force=False, target_count=GAME_QUEUE_TARGET)
+        elif (not active) and ready_count < GAME_QUEUE_PRELOAD_TARGET:
+            maybe_start_game_queue_fill(force=False, target_count=GAME_QUEUE_PRELOAD_TARGET)
         return jsonify(game_status_payload())
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -4999,7 +5913,7 @@ def api_game_launch() -> Response:
         STATE["board"] = deepcopy(board)
         STATE["baseline_board"] = deepcopy(board)
         STATE["last_load"] = datetime.now().isoformat()
-        maybe_start_game_queue_fill(force=False)
+        maybe_start_game_queue_fill(force=False, target_count=GAME_QUEUE_TARGET)
         return jsonify({"board": STATE["board"], "summary": compute_change_summary(STATE["board"]), "game": game_status_payload()})
     except Exception as exc:
         log_message(f"Game launch failed: {exc}")
@@ -5015,8 +5929,8 @@ def api_game_next() -> Response:
             STATE["game"]["active"] = False
             STATE["game"]["current"] = None
             return jsonify({"ok": True, "game": game_status_payload()})
-        maybe_start_game_queue_fill(force=False)
-        board, had_candidates = get_next_hydrated_game_board(force_fill=True, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
+        maybe_start_game_queue_fill(force=False, target_count=GAME_QUEUE_TARGET)
+        board, had_candidates = get_next_hydrated_game_board(force_fill=False, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
         if board is None:
             ensure_game_queue_ready(min_ready=1, timeout_seconds=10.0)
             board, had_candidates = get_next_hydrated_game_board(force_fill=False, max_attempts=max(24, GAME_QUEUE_TARGET * 3))
@@ -5030,7 +5944,7 @@ def api_game_next() -> Response:
         STATE["board"] = deepcopy(board)
         STATE["baseline_board"] = deepcopy(board)
         STATE["last_load"] = datetime.now().isoformat()
-        maybe_start_game_queue_fill(force=False)
+        maybe_start_game_queue_fill(force=True, target_count=GAME_QUEUE_TARGET)
         return jsonify({"board": STATE["board"], "summary": compute_change_summary(STATE["board"]), "game": game_status_payload(), "action": action})
     except Exception as exc:
         log_message(f"Game next failed: {exc}")
@@ -5117,11 +6031,28 @@ def api_load_photography() -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+
+@app.route('/api/onboarding/load_collection_photography', methods=['POST'])
+def api_onboarding_load_collection_photography() -> Response:
+    try:
+        session = get_session()
+        payload = request.get_json(force=True) or {}
+        collection_id = string_value(payload.get('collection_id'))
+        collection_name = string_value(payload.get('collection_name'))
+        if not collection_id:
+            return jsonify({'error':'Missing Bynder collection id.'}), 400
+        raw_assets = fetch_all_media_for_bynder_collection(session, collection_id)
+        items = [photo_asset_to_client_model(asset, []) for asset in sorted(raw_assets, key=lambda a: string_value(a.get('dateCreated')), reverse=True)]
+        return jsonify({'collection_label': collection_name or '', 'items': items})
+    except Exception as exc:
+        log_message(f'Onboarding collection photography load failed: {exc}')
+        return jsonify({'error': str(exc)}), 500
+
 @app.route("/api/mark_photo_reviewed", methods=["POST"])
 def api_mark_photo_reviewed() -> Response:
     try:
         payload = request.get_json(force=True)
-        media_id = string_value(payload.get("media_id"))
+        media_id = string_value(payload.get("media_id") or payload.get("source_media_id"))
         if not media_id:
             return jsonify({"error": "media_id is required"}), 400
 
@@ -5247,7 +6178,7 @@ def api_load_non_collection_sku() -> Response:
 def api_photo_prep_preview() -> Response:
     try:
         payload = request.get_json(force=True)
-        media_id = string_value(payload.get("media_id"))
+        media_id = string_value(payload.get("media_id") or payload.get("source_media_id"))
         if not media_id:
             return jsonify({"error": "media_id is required"}), 400
         mode = string_value(payload.get("mode") or "crop_1688")
@@ -5281,7 +6212,7 @@ def api_photo_prep_download() -> Response:
         session = make_session(token)
         if len(items) == 1:
             item = items[0]
-            media_id = string_value(item.get("media_id"))
+            media_id = string_value(item.get("media_id") or item.get("source_media_id"))
             name = string_value(item.get("name")) or media_id
             offset_y = item.get("offset_y")
             offset_x = item.get("offset_x")
@@ -5292,7 +6223,7 @@ def api_photo_prep_download() -> Response:
         bio = BytesIO()
         with ZipFile(bio, 'w', ZIP_DEFLATED) as zf:
             for item in items:
-                media_id = string_value(item.get("media_id"))
+                media_id = string_value(item.get("media_id") or item.get("source_media_id"))
                 name = string_value(item.get("name")) or media_id
                 offset_y = item.get("offset_y")
                 offset_x = item.get("offset_x")
@@ -5314,10 +6245,14 @@ def build_set_dim_canvas_for_row(session: requests.Session, row: Dict[str, Any],
         raise RuntimeError("No compiled set-dim components are available for this SKU.")
     images: List[Image.Image] = []
     subcats: List[str] = []
-    for comp in components[:SET_DIM_MAX_COMPONENTS]:
+    comps = components[:SET_DIM_MAX_COMPONENTS]
+    def _load_comp(comp: Dict[str, Any]) -> tuple[Image.Image, str]:
         img = open_image_from_media(session, string_value(comp.get("dim_media_id")))
-        images.append(trim_whitespace(img, 0).convert("RGB"))
-        subcats.append(string_value(comp.get("component_subcat")))
+        return trim_whitespace(img, 0).convert("RGB"), string_value(comp.get("component_subcat"))
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(comps)))) as executor:
+        for img, subcat in executor.map(_load_comp, comps):
+            images.append(img)
+            subcats.append(subcat)
     manual_slots = None
     if slot_assignments:
         manual_slots = [max(0, min(len(images) - 1, int(x))) for x in slot_assignments[:len(images)]]
@@ -5484,7 +6419,7 @@ def api_apply_wall_art_sizing_guide() -> Response:
             return jsonify({"error": "Target row not found."}), 404
         if not row_requires_wall_art_sizing(row):
             return jsonify({"error": "This SKU does not require the wall art sizing guide."}), 400
-        live_assets = [a for a in (row.get("assets") or []) if not a.get("is_marked_for_deletion")]
+        live_assets = [a for a in (row.get("assets") or []) if not a.get("is_marked_for_deletion") and not a.get("is_empty_slot")]
         has_8000 = any(string_value(a.get("slot_key")) == "SKU_8000" or string_value(a.get("current_position")).endswith("_8000") for a in live_assets)
         if has_8000:
             return jsonify({"error": "This SKU already has a wall art sizing guide in SKU_8000."}), 400
@@ -5531,6 +6466,50 @@ def api_apply_wall_art_sizing_guide() -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+def _fixed_asset_refresh_ready(row: Optional[Dict[str, Any]], media_id: str, fix_type: str) -> bool:
+    if not row:
+        return False
+    asset = None
+    for candidate in row.get("assets", []):
+        if string_value(candidate.get("id")) == string_value(media_id):
+            asset = candidate
+            break
+    if not asset:
+        return False
+    warning_text = string_value(asset.get("size_warning"))
+    width = int(asset.get("width") or 0)
+    height = int(asset.get("height") or 0)
+    if fix_type == "swatch":
+        return width == 163 and height == 163 and not warning_text
+    if fix_type == "grid":
+        return width == 3000 and height == 2200 and not is_total_fill_warning_text(warning_text)
+    if fix_type in {"dim", "silo"}:
+        return width == 3000 and height == 1688 and not is_total_fill_warning_text(warning_text)
+    return bool(width and height)
+
+
+def poll_for_fixed_asset_row(
+    session: requests.Session,
+    board: Dict[str, Any],
+    row_id: str,
+    media_id: str,
+    collection_label: str,
+    fix_type: str,
+    timeout_seconds: float = 12.0,
+    sleep_seconds: float = 1.5,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    started = time.time()
+    latest_row = get_row_by_id(board, row_id)
+    while (time.time() - started) < timeout_seconds:
+        refreshed_row = build_board_row_for_sku(session, string_value((latest_row or {}).get("sku") or row_id), collection_label)
+        if refreshed_row:
+            latest_row = refreshed_row
+            if _fixed_asset_refresh_ready(refreshed_row, media_id, fix_type):
+                return refreshed_row, True
+        time.sleep(sleep_seconds)
+    return latest_row, False
+
+
 @app.route("/api/fix_asset_version", methods=["POST"])
 def api_fix_asset_version() -> Response:
     try:
@@ -5543,7 +6522,7 @@ def api_fix_asset_version() -> Response:
         if mode != "assets":
             return jsonify({"error": "Asset fixes are only available in Update assets mode."}), 400
 
-        media_id = string_value(payload.get("media_id"))
+        media_id = string_value(payload.get("media_id") or payload.get("source_media_id"))
         fix_type = string_value(payload.get("fix_type"))
         if not media_id or not fix_type:
             return jsonify({"error": "media_id and fix_type are required."}), 400
@@ -5581,16 +6560,31 @@ def api_fix_asset_version() -> Response:
         mark_asset_uploaded_notice(asset, "new_version", "New version uploaded to this slot. Reload to view.")
         dirty_row_ids: List[str] = []
         target_row = get_row_containing_asset(board, media_id)
+        refresh_resolved = False
         if target_row:
-            dirty_row_ids.append(string_value(target_row.get("row_id") or target_row.get("sku")))
+            row_id = string_value(target_row.get("row_id") or target_row.get("sku"))
+            dirty_row_ids.append(row_id)
+            refreshed_row, refresh_resolved = poll_for_fixed_asset_row(
+                session,
+                board,
+                row_id,
+                media_id,
+                string_value(board.get("collection", {}).get("label")),
+                fix_type,
+            )
+            if refreshed_row:
+                replace_row_in_board(board, row_id, refreshed_row)
+                baseline = STATE.get("baseline_board")
+                if baseline is not None:
+                    replace_row_in_board(baseline, row_id, deepcopy(refreshed_row))
 
         notice_html = f'{success_text} <button type="button" class="inline-link" data-reload-board>Reload</button> to see it!'
         return jsonify({
             "board": board,
             "summary": compute_change_summary(board),
             "notice": {"kind": "success", "text": success_text, "html": notice_html},
-            "asset_mode_refresh_pending": True,
-            "dirty_row_ids": dirty_row_ids,
+            "asset_mode_refresh_pending": (not refresh_resolved),
+            "dirty_row_ids": [] if refresh_resolved else dirty_row_ids,
         })
     except Exception as exc:
         log_message(f"Fix asset version failed: {exc}")
@@ -5712,7 +6706,7 @@ def api_prepared_add_as_new_version() -> Response:
         mode = string_value(payload.get("mode"))
         if mode != "assets":
             return jsonify({"error": "Prepared version updates are only available in Update assets mode."}), 400
-        media_id = string_value(payload.get("media_id"))
+        media_id = string_value(payload.get("media_id") or payload.get("source_media_id"))
         prep_mode = string_value(payload.get("prep_mode") or "crop_1688")
         flip = bool(payload.get("flip"))
         offset_y = payload.get("offset_y")
@@ -5767,8 +6761,12 @@ def api_prepared_drop_upload() -> Response:
         row_id = string_value(payload.get("row_id"))
         target_lane = string_value(payload.get("target_lane"))
         target_slot = string_value(payload.get("target_slot"))
-        media_id = string_value(payload.get("media_id"))
-        prep_mode = string_value(payload.get("prep_mode") or "crop_1688")
+        media_id = string_value(payload.get("media_id") or payload.get("source_media_id") or payload.get("asset_id") or ((payload.get("item") or {}).get("media_id" if isinstance(payload.get("item"), dict) else "") if False else ""))
+        if not media_id:
+            item = payload.get("item")
+            if isinstance(item, dict):
+                media_id = string_value(item.get("media_id") or item.get("source_media_id"))
+        prep_mode = string_value(payload.get("prep_mode") or "original")
         flip = bool(payload.get("flip"))
         offset_y = payload.get("offset_y")
         offset_x = payload.get("offset_x")
@@ -5922,6 +6920,227 @@ def api_commit() -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+
+@app.route("/api/onboarding/boards")
+def api_onboarding_boards() -> Response:
+    try:
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        summaries = build_onboarding_collection_summaries(session)
+        return jsonify({"boards": summaries})
+    except Exception as exc:
+        log_message(f"Onboarding board listing failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/onboarding/create_board", methods=["POST"])
+def api_onboarding_create_board() -> Response:
+    try:
+        payload = request.get_json(force=True)
+        collection_option_id = string_value(payload.get("collection_option_id"))
+        collection_label = string_value(payload.get("collection_label"))
+        pasted_rows = string_value(payload.get("pasted_rows"))
+        sales_channel_map = payload.get("sales_channel_map") if isinstance(payload.get("sales_channel_map"), dict) else {}
+        if not collection_option_id and not collection_label:
+            return jsonify({"error": "collection_label is required"}), 400
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        collections = load_collection_options(session)
+        collection_option = None
+        if collection_option_id:
+            collection_option = next((c for c in collections if string_value(c.get("id")) == collection_option_id), None)
+        if collection_option is None and collection_label:
+            target = collection_label.strip().lower()
+            collection_option = next((c for c in collections if string_value(c.get("label")).strip().lower() == target), None)
+        if not collection_option and collection_label:
+            created_option = ensure_metaproperty_option(session, PRODUCT_COLLECTION_METAPROPERTY_ID, collection_label)
+            collections = load_collection_options(session, force_refresh=True)
+            collection_option = next((c for c in collections if string_value(c.get("id")) == string_value(created_option.get("id"))), None)
+            if not collection_option:
+                collection_option = {"id": string_value(created_option.get("id")), "label": string_value(created_option.get("label") or collection_label)}
+            log_message(f"Created Product Collection option for Product Imagery Onboarding: {collection_option.get('label')}")
+        if not collection_option:
+            return jsonify({"error": f'Could not create or map Product Collection value "{collection_label or collection_option_id}" in Bynder.'}), 400
+        rows, warnings = parse_onboarding_paste_rows(pasted_rows, sales_channel_map=sales_channel_map)
+        created = []
+        existing_skus = []
+        for row in rows:
+            sku = string_value(row.get("sku"))
+            existing_assets = [a for a in fetch_assets_for_product_sku(session, "Product_SKU", sku) if is_board_relevant_asset(a, sku)]
+            if existing_assets:
+                existing_skus.append(sku)
+                workflow_fields = []
+                for asset in existing_assets:
+                    media_id = string_value(asset.get("id"))
+                    if not media_id:
+                        continue
+                    fields = []
+                    append_pio_board_fields(session, fields, fetch_metaproperties_map(session), row, string_value(prop(asset, "Product_SKU_Position", "Product_SKU_Position")))
+                    # keep slot metadata from asset, but refresh dims/workflow/sync
+                    if fields:
+                        post_media_fields(session, media_id, fields)
+                continue
+            media_id = create_pio_placeholder_grid_asset(session, collection_option, row)
+            created.append({"sku": row.get("sku"), "media_id": media_id, "seed_row": row})
+        time.sleep(0.75)
+        if created:
+            def _fetch_created_media(entry: Dict[str, Any]) -> Dict[str, Any]:
+                media = fetch_media_by_id(session, string_value(entry.get("media_id")))
+                entry["media"] = media
+                return entry
+            with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(created)))) as executor:
+                created = list(executor.map(_fetch_created_media, created))
+        invalidate_collection_caches(string_value(collection_option.get("id")))
+        board = build_onboarding_board_for_collection(session, collection_option, force_refresh=True)
+        STATE["board"] = board
+        STATE["baseline_board"] = deepcopy(board)
+        STATE["last_load"] = datetime.now().isoformat()
+        STATE["workspace"] = WORKSPACE_PIO
+        log_message(f"Created Product Imagery Onboarding board for {collection_option['label']}: {len(created)} placeholder grids. Existing Product Site Assets were loaded for any matching SKUs already in Bynder.")
+        return jsonify({
+            "board": board,
+            "summary": compute_change_summary(board),
+            "warnings": warnings,
+            "workspace": WORKSPACE_PIO,
+            "collection_option_id": string_value(collection_option.get("id")),
+        })
+    except Exception as exc:
+        log_message(f"Onboarding board creation failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/onboarding/load_board", methods=["POST"])
+def api_onboarding_load_board() -> Response:
+    try:
+        payload = request.get_json(force=True)
+        collection_option_id = string_value(payload.get("collection_option_id"))
+        collection_label = string_value(payload.get("collection_label"))
+        force_refresh = bool(payload.get("force_refresh"))
+        if not collection_option_id and not collection_label:
+            return jsonify({"error": "collection_label or collection_option_id is required"}), 400
+        if not collection_label:
+            collection_label = collection_option_id
+        collection_option = {"id": collection_option_id or collection_label, "label": collection_label}
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        board = build_onboarding_board_for_collection(session, collection_option, force_refresh=force_refresh)
+        if not board.get("color_sections"):
+            for _ in range(4):
+                time.sleep(2.0)
+                board = build_onboarding_board_for_collection(session, collection_option, force_refresh=True)
+                if board.get("color_sections"):
+                    break
+        STATE["board"] = board
+        STATE["baseline_board"] = deepcopy(board)
+        STATE["last_load"] = datetime.now().isoformat()
+        STATE["workspace"] = WORKSPACE_PIO
+        recent_warning = ""
+        latest_edit = parse_datetime(board.get("latest_edit"))
+        if latest_edit:
+            now_dt = datetime.now(latest_edit.tzinfo) if latest_edit.tzinfo else datetime.now()
+            if (now_dt - latest_edit).total_seconds() < 15 * 60:
+                recent_warning = "Someone may have edited this board recently."
+        return jsonify({
+            "board": board,
+            "summary": compute_change_summary(board),
+            "workspace": WORKSPACE_PIO,
+            "recent_warning": recent_warning,
+        })
+    except Exception as exc:
+        log_message(f"Onboarding board load failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/onboarding/update_workflow_state", methods=["POST"])
+def api_onboarding_update_workflow_state() -> Response:
+    try:
+        board = STATE.get("board")
+        if board is None:
+            return jsonify({"error": "No board is loaded."}), 400
+        payload = request.get_json(force=True)
+        workflow_status = string_value(payload.get("workflow_status"))
+        sync_to_site = string_value(payload.get("sync_to_site"))
+        if not workflow_status or not sync_to_site:
+            return jsonify({"error": "workflow_status and sync_to_site are required."}), 400
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        metaprops = fetch_metaproperties_map(session)
+        status_mp = metaprops.get("Workflow_Status")
+        sync_mp = metaprops.get("Sync_to_Site")
+        workflow_mp = metaprops.get("Workflow")
+        if not status_mp or not sync_mp or not workflow_mp:
+            return jsonify({"error": "Could not resolve workflow metaproperties."}), 500
+        status_value = get_metaproperty_option_value(session, string_value(status_mp.get("id")), workflow_status)
+        sync_value = get_metaproperty_option_value(session, string_value(sync_mp.get("id")), sync_to_site)
+        workflow_value = get_metaproperty_option_value(session, string_value(workflow_mp.get("id")), PIO_WORKFLOW_VALUE)
+        if not status_value or not sync_value or not workflow_value:
+            return jsonify({"error": "Could not resolve workflow option values."}), 500
+        updated_media_ids = set()
+        for section in board.get("color_sections", []):
+            for row in section.get("rows", []):
+                if compact_text(row.get("workflow")) != compact_text(PIO_WORKFLOW_VALUE):
+                    continue
+                row["workflow_status"] = workflow_status
+                row["sync_to_site"] = sync_to_site
+                for asset in row.get("assets", []):
+                    media_id = string_value(asset.get("id"))
+                    if not media_id or media_id.startswith("empty::") or media_id in updated_media_ids:
+                        continue
+                    fields=[(f"metaproperty.{string_value(status_mp.get('id'))}", status_value),(f"metaproperty.{string_value(sync_mp.get('id'))}", sync_value)]
+                    post_media_fields(session, media_id, fields)
+                    updated_media_ids.add(media_id)
+        board["workflow_statuses"] = [workflow_status]
+        board["sync_states"] = [sync_to_site]
+        STATE["board"] = board
+        STATE["baseline_board"] = deepcopy(board)
+        return jsonify({"board": board, "summary": compute_change_summary(board)})
+    except Exception as exc:
+        log_message(f"Onboarding workflow state update failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/onboarding/go_live", methods=["POST"])
+def api_onboarding_go_live() -> Response:
+    try:
+        if STATE.get("board") is None:
+            return jsonify({"error": "No board is loaded."}), 400
+        board = STATE["board"]
+        token = load_bynder_token(BYNDER_TOKEN_PATH)
+        session = make_session(token)
+        metaprops = fetch_metaproperties_map(session)
+        sync_mp = metaprops.get("Sync_to_Site")
+        status_mp = metaprops.get("Workflow_Status")
+        if not sync_mp or not status_mp:
+            return jsonify({"error": "Required metaproperties for go live were not found."}), 500
+        sync_mp_id = string_value(sync_mp.get("id"))
+        status_mp_id = string_value(status_mp.get("id"))
+        sync_value = get_metaproperty_option_value(session, sync_mp_id, PIO_SYNC_DO)
+        status_value = get_metaproperty_option_value(session, status_mp_id, PIO_STATUS_LIVE)
+        changed_ids = []
+        seen = set()
+        for section in board.get("color_sections", []):
+            for row in section.get("rows", []):
+                for asset in row.get("assets", []):
+                    media_id = string_value(asset.get("copy_source_media_id") or asset.get("id"))
+                    if not media_id or media_id in seen:
+                        continue
+                    seen.add(media_id)
+                    post_media_fields(session, media_id, [
+                        (f"metaproperty.{sync_mp_id}", sync_value),
+                        (f"metaproperty.{status_mp_id}", status_value),
+                    ])
+                    changed_ids.append(media_id)
+        collection_option = board.get("collection") or {}
+        option_id = string_value(collection_option.get("id"))
+        invalidate_collection_caches(option_id)
+        refreshed = build_onboarding_board_for_collection(session, collection_option, force_refresh=True)
+        STATE["board"] = refreshed
+        STATE["baseline_board"] = deepcopy(refreshed)
+        return jsonify({"board": refreshed, "summary": compute_change_summary(refreshed), "updated_count": len(changed_ids)})
+    except Exception as exc:
+        log_message(f"Onboarding go-live failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
 # ============================================================
 # HTML / CSS / JS
 # ============================================================
@@ -5986,6 +7205,63 @@ INDEX_HTML = r'''
     line-height: 1.25;
     max-width: 170px;
   }
+.workspace-switch-row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .workspace-select { width:auto; min-width: 170px; padding:6px 10px; border-radius:10px; border:1px solid rgba(255,255,255,.35); background: rgba(255,255,255,.16); color:#fff; }
+  .workspace-select option { color:#1f2937; }
+  .workspace-menu-btn { width:34px; height:34px; border-radius:10px; border:1px solid rgba(255,255,255,.35); background:rgba(255,255,255,.16); color:#fff; font-size:18px; line-height:1; cursor:pointer; }
+  .workspace-menu { position:absolute; top:40px; right:0; background:#fff; border:1px solid var(--rf-border); border-radius:12px; padding:6px; min-width:220px; box-shadow:0 10px 24px rgba(29,19,48,.16); z-index:40; color:var(--rf-purple); }
+  .workspace-menu-item { width:100%; text-align:left; padding:10px 12px; border:0; background:transparent; border-radius:10px; color:var(--rf-purple) !important; font-weight:700; cursor:pointer; opacity:1 !important; text-shadow:none !important; }
+  .workspace-menu-item:hover { background:#f4edf9; color:var(--rf-purple) !important; }
+  .workspace-menu-item.active { background:#f4edf9; color:var(--rf-purple) !important; }
+  .pio-modal-overlay { position:fixed; inset:0; background:rgba(21,11,34,.38); display:flex; align-items:center; justify-content:center; z-index:2600; padding:20px; }
+  .pio-modal-card { width:min(760px, 100%); background:#fff; border:1px solid var(--rf-border); border-radius:18px; box-shadow:0 18px 48px rgba(28,16,45,.24); padding:18px; display:grid; gap:14px; }
+  .pio-modal-title { font-size:22px; font-weight:900; color:var(--rf-purple); }
+  .pio-map-table { display:grid; grid-template-columns:minmax(180px, 1fr) minmax(220px, 1fr); gap:8px 12px; align-items:center; }
+  .pio-map-head { font-size:12px; font-weight:900; color:var(--rf-purple); text-transform:uppercase; letter-spacing:.03em; }
+  .pio-map-cell { font-size:14px; color:var(--rf-text); }
+  .pio-map-cell select { width:100%; }
+  .pio-modal-actions { display:flex; justify-content:flex-end; gap:10px; }
+  .pio-meta-grid { display:grid; grid-template-columns: repeat(2, minmax(140px, 1fr)); gap:8px; margin-top:8px; }
+  .component-tree { position:relative; margin-top:8px; }
+  .component-tree summary { cursor:pointer; font-weight:700; font-size:12px; color:var(--rf-navy); display:flex; align-items:center; justify-content:space-between; gap:8px; padding:4px 8px; border:1px solid var(--rf-border); border-radius:10px; background:#faf7ff; list-style:none; user-select:none; }
+  .component-tree summary::-webkit-details-marker { display:none; }
+  .component-tree .summary-caret { font-size:11px; color:#6c5b84; }
+  .component-tree[open] .summary-caret { transform:rotate(180deg); }
+  
+  .photo-prep-details { border:1px solid var(--rf-border); border-radius:12px; background:#fff; padding:0; }
+  .photo-prep-details > summary { cursor:pointer; list-style:none; padding:8px 10px; font-weight:700; color:var(--rf-purple); }
+  .photo-prep-details > summary::-webkit-details-marker { display:none; }
+  .photo-prep-details[open] > summary { border-bottom:1px solid var(--rf-border); }
+  .photo-prep-details .photo-prep-options, .photo-prep-details .photo-prep-focusbox { margin:10px; }
+  .meta-measure-boxes { display:flex; gap:4px; flex-wrap:nowrap; align-items:center; justify-content:space-between; }
+  .measure-chip { flex:1 1 0; min-width:0; text-align:center; border:1px solid var(--rf-border); border-radius:8px; padding:4px 4px; font-size:10.5px; font-weight:700; background:#fff; white-space:nowrap; }
+  .component-flyout { position:absolute; top:0; left:calc(100% + 10px); min-width:340px; max-width:520px; z-index:14; border:1px solid var(--rf-border); border-radius:14px; background:#fff; box-shadow:0 12px 28px rgba(29,19,48,.16); padding:10px; }
+  .component-chip-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .component-chip { border:1px solid var(--rf-border); border-radius:999px; background:#fff; padding:4px 8px; font-size:12px; }
+  .component-visual-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap:10px; margin-top:0; }
+  .component-visual-card { border:1px solid var(--rf-border); border-radius:12px; background:#fff; padding:8px; font-size:12px; }
+  .component-visual-card img { width:100%; height:86px; object-fit:contain; background:#f5f7fa; border-radius:8px; display:block; }
+  .component-warning-list { margin-top:8px; display:grid; gap:6px; }
+  .component-warning-chip { font-size:12px; color:var(--rf-red); background:var(--rf-red-soft); border:1px solid #f0b8b3; border-radius:999px; padding:4px 8px; display:inline-flex; }
+  .collection-status-select { width:100%; min-width:220px; height:42px; border:1px solid #c6d8cf; border-radius:14px; background:#d8e4dd; color:#2f6b41; font-size:13px; line-height:1.25; font-weight:700; padding:10px 40px 10px 12px; box-shadow: inset 0 1px 0 rgba(255,255,255,.45); }
+  .collection-status-select.pio-header-select { min-width:300px; width:300px; }
+  .collection-status-select option { color:#203229; background:#fff; }
+  .btn-preflight { background:#2f9e44; color:#fff; border:1px solid #25863a; box-shadow: 0 8px 18px rgba(47,158,68,.18); }
+  .btn-preflight:hover { filter: brightness(1.02); }
+
+  .pio-top-actions { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; min-width:0; }
+  .pio-top-actions .collection-status-mount { width:auto; flex:0 0 auto; min-width:300px; }
+  .pio-top-actions .btn-preflight { flex:0 0 auto; white-space:nowrap; }
+  .pio-header-select-compact { min-width: 300px; width: 300px; max-width: min(52vw, 300px); }
+  .sku-inline-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:4px; }
+  .sku-inline-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .sku-inline-top .sku-text { font-weight:700; }
+  .sku-inline-top .photo-mini-btn { padding:3px 8px; min-height:24px; line-height:1.1; }
+  .photo-pio-row.filters { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; }
+  .photo-pio-row.filters select { min-width: 150px; max-width: 180px; }
+  .photo-tag-cloud { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .photo-tag-chip { border:1px solid var(--rf-border); border-radius:999px; background:#fff; padding:3px 7px; font-size:11px; color:var(--rf-text); }
+
   .panel {
     background: var(--rf-card);
     border: 1px solid var(--rf-border);
@@ -6005,6 +7281,7 @@ INDEX_HTML = r'''
   }
   .side .panel { max-height: calc(100vh - 20px); overflow: auto; }
   .color-body.collapsed { display: none; }
+  .color-body { overflow-x: auto; }
    .color-toggle {
     white-space: nowrap;
  border: 0; background: transparent; color: var(--rf-navy); font-weight: 800; cursor: pointer; }
@@ -6208,6 +7485,14 @@ INDEX_HTML = r'''
     overflow: auto;
     min-width: 0;
   }
+
+  .upload-target-pending {
+    box-shadow: inset 0 0 0 3px #2d8f52, 0 0 0 2px rgba(45,143,82,.18) !important;
+    background: linear-gradient(180deg, rgba(45,143,82,.08), rgba(45,143,82,.02)) !important;
+  }
+  .board-wrap, .board-main, #boardHost { width: 100%; min-width: 0; }
+  .photo-empty.filter-none-strong { border:2px dashed #b98cd9; background:#fbf7fe; color:#5a2d86; font-weight:700; }
+
   .photo-shell {
     position: relative;
     max-height: calc(100vh - var(--top-shell-height, 74px) - 10px);
@@ -6308,7 +7593,16 @@ INDEX_HTML = r'''
   .photo-prep-preview-badge { position:absolute; top:10px; left:10px; z-index:2; display:inline-flex; align-items:center; gap:6px; padding:7px 10px; border-radius:999px; background:rgba(49,80,55,.94); color:#fff; font-size:11px; font-weight:900; letter-spacing:.01em; box-shadow:0 8px 18px rgba(49,80,55,.18); }
   .photo-prep-preview.warn .photo-prep-preview-badge { background:rgba(168,78,42,.96); }
   .photo-prep-preview.notice .photo-prep-preview-badge { background:rgba(90,70,132,.96); }
-  .photo-prep-preview img { width:100%; height:auto; display:block; max-height:220px; object-fit:contain; }
+  .photo-prep-preview-canvas { width:100%; display:flex; align-items:center; justify-content:center; padding:12px; border:2px solid rgba(96,74,143,.72); border-radius:12px; background:linear-gradient(180deg,#ffffff,#fbf9ff); box-shadow:0 0 0 2px rgba(96,74,143,.14), inset 0 0 0 1px rgba(96,74,143,.12); position:relative; }
+  .photo-prep-preview-canvas::after { content:''; position:absolute; inset:6px; border:1px dashed rgba(96,74,143,.34); border-radius:8px; pointer-events:none; }
+  .photo-prep-preview img { width:100%; height:auto; display:block; max-height:220px; object-fit:contain; border:3px solid rgba(96,74,143,.88); border-radius:10px; background:#fff; box-shadow:0 0 0 1px rgba(96,74,143,.18); position:relative; z-index:1; }
+  .bulk-fix-pill { display:inline-flex; align-items:center; justify-content:center; padding:2px 9px; border-radius:999px; background:#e7f6ea; color:#1f7a34; font-size:11px; font-weight:800; line-height:1.1; text-decoration:none; border:1px solid #b9e2c1; cursor:pointer; }
+  .bulk-fix-pill.is-active { background:#d9eefc; border-color:#8cc2ee; color:#1e5f9d; }
+  .photo-prep-details > summary { list-style:none; display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer; }
+  .photo-prep-details > summary::-webkit-details-marker { display:none; }
+  .photo-prep-summary-caret { font-size:14px; line-height:1; color:#6f5888; transition:transform .18s ease; }
+  .photo-prep-details[open] .photo-prep-summary-caret { transform:rotate(180deg); }
+  .asset-card.bulk-fix-target { box-shadow:0 0 0 3px rgba(69,132,255,.92), 0 0 0 6px rgba(69,132,255,.18); border-color:rgba(69,132,255,.92); }
   .photo-prep-preview-drag { width:100%; display:flex; align-items:center; justify-content:center; cursor:grab; }
   .photo-prep-preview-drag.dragging { cursor:grabbing; opacity:.96; }
   .photo-prep-filmstrip { display:none; }
@@ -6460,9 +7754,12 @@ INDEX_HTML = r'''
   }
    .row-layout {
     display: grid;
-    grid-template-columns: 126px minmax(0, 1fr);
+    grid-template-columns: 168px minmax(0, 1fr);
     gap: 14px;
     align-items: start;
+  }
+  .row-layout > div:last-child {
+    min-width: 0;
   }
   .meta-grid {
     display: grid;
@@ -6475,9 +7772,9 @@ INDEX_HTML = r'''
     border: 1px solid #e1e8f0;
     border-radius: 12px;
     padding: 7px 9px;
-    width: 118px;
-    min-width: 118px;
-    max-width: 118px;
+    width: 160px;
+    min-width: 160px;
+    max-width: 160px;
   }
   .meta-cell .k {
     font-size: 11px;
@@ -6494,7 +7791,7 @@ INDEX_HTML = r'''
   }
   .top-slot-layout {
     display: grid;
-    grid-template-columns: auto auto minmax(220px, 1fr);
+    grid-template-columns: max-content max-content minmax(220px, 1fr);
     gap: 12px;
     align-items: start;
   }
@@ -6724,6 +8021,8 @@ INDEX_HTML = r'''
     gap: 8px;
     min-height: 24px;
     margin: 0;
+    cursor:pointer;
+    user-select:none;
   }
   .summary-header h3 {
     margin: 0;
@@ -6732,6 +8031,7 @@ INDEX_HTML = r'''
     line-height: 1.1;
     color: var(--rf-navy);
   }
+  .summary-header .summary-caret { font-size:11px; color:#6c5b84; }
   .summary-body {
     padding: 10px 14px 14px;
     display: none;
@@ -7098,34 +8398,7 @@ INDEX_HTML = r'''
       </div>
     </div>
 
-    <div class="panel launcher" id="launcherPanel">
-      <div class="select-wrap">
-        <div class="inline-launch-group">
-          <div class="launch-field">
-            <label class="small">Search Product Collection</label>
-            <input type="text" id="collectionFilter" placeholder="Type any part of the collection name" />
-          </div>
-          <div class="launch-field">
-            <label class="small">Product Collection</label>
-            <select id="collectionSelect" size="1"></select>
-          </div>
-          <div class="launch-button-col">
-            <div class="launch-button-stack">
-              <button type="button" class="btn btn-primary" id="launchBtn">Launch Collection</button>
-            </div>
-          </div>
-        </div>
-        <div class="launcher-lower-row">
-          <div class="launcher-checkbox-row">
-            <label class="mode-option" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="hideInactiveToggle" /> Hide inactive SKUs</label>
-          </div>
-          <div class="collection-status-mount" id="collectionStatusMount"></div>
-          <div class="launcher-random-row">
-            <button type="button" class="btn btn-secondary btn-compact" id="launchRandomBtn">Launch Random Collection</button>
-          </div>
-        </div>
-      </div>
-    </div>
+    <div class="panel launcher" id="launcherPanel"><div id="launcherPanelMount"></div></div>
 
     <div class="panel mode-panel" id="modePanel">
       <div class="panel-title">Mode</div>
@@ -7147,14 +8420,14 @@ INDEX_HTML = r'''
 
       <div class="side">
         <div class="panel">
-        <div class="summary-header">
+        <div class="summary-header" data-toggle-target="summary">
           <h3>Queued changes</h3>
-          <button type="button" class="btn btn-secondary" id="toggleSummaryBtn">Expand</button>
+          <span class="summary-caret" id="toggleSummaryBtn" aria-hidden="true">▾</span>
         </div>
         <div class="summary-body" id="summaryBody"></div>
-        <div class="summary-header" style="margin-top:0;">
+        <div class="summary-header" style="margin-top:0;" data-toggle-target="log">
           <h3>Server log</h3>
-          <button type="button" class="btn btn-secondary" id="toggleLogBtn">Expand</button>
+          <span class="summary-caret" id="toggleLogBtn" aria-hidden="true">▾</span>
         </div>
         <div class="server-log" id="serverLog" style="display:none;"></div>
         <div class="summary-header" style="margin-top:0;">
@@ -7206,6 +8479,11 @@ INDEX_HTML = r'''
           </div>
           <div class="controls">
             <div id="challengeIssuePill" class="challenge-issue-pill" style="display:none;"></div>
+            <div id="bulkFixSiloWrap" style="display:none; align-items:center; gap:8px;">
+              <button type="button" class="bulk-fix-pill" id="bulkFixSiloBtn">Bulk fix silo</button>
+              <button type="button" class="btn btn-primary btn-reload-flashing" id="bulkFixSiloGoBtn" style="display:none;">Proceed</button>
+            </div>
+            <button type="button" class="btn btn-secondary btn-compact" id="pioClearBoardBtn" ${state.workspace === 'product_imagery_onboarding' && state.board ? '' : 'disabled'} title="Removes this board from your screen only. The Bynder assets stay exactly where they are.">Remove Board</button>
             <label class="small" style="margin:0;">
               Thumbnail size
               <input type="range" id="thumbSize" min="70" max="170" value="84" />
@@ -7254,6 +8532,58 @@ INDEX_HTML = r'''
   </div>
 
 <script>
+
+const APP_UI_STATE_KEY = 'content_refresher_ui_state_v1';
+function saveUIState() {
+  try {
+    const payload = {
+      workspace: state.workspace,
+      loadedCollectionOptionId: state.loadedCollectionOptionId || '',
+      onboardingCurrentBoardId: (state.onboarding && state.onboarding.currentBoardId) || '',
+      mode: state.mode,
+      hideInactive: !!state.hideInactive,
+      photographyExpanded: !!(state.photography && state.photography.expanded),
+      photographyWidth: Number((state.photography && state.photography.width) || 520),
+      pioEditorCollapsed: !!(state.onboarding && state.onboarding.editorCollapsed),
+    };
+    localStorage.setItem(APP_UI_STATE_KEY, JSON.stringify(payload));
+  } catch (err) {}
+}
+function loadSavedUIState() {
+  try {
+    const raw = localStorage.getItem(APP_UI_STATE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) { return null; }
+}
+async function restoreUIStateIfPossible() {
+  const saved = loadSavedUIState();
+  if (!saved) return;
+  try {
+    if (saved.mode) state.mode = saved.mode;
+    state.hideInactive = !!saved.hideInactive;
+    state.photography.expanded = !!saved.photographyExpanded;
+    if (saved.photographyWidth) state.photography.width = Number(saved.photographyWidth) || state.photography.width;
+    if (typeof saved.pioEditorCollapsed === 'boolean') state.onboarding.editorCollapsed = !!saved.pioEditorCollapsed;
+    renderModeUI();
+    if (saved.workspace === 'product_imagery_onboarding') {
+      state.workspace = 'product_imagery_onboarding';
+      state.onboarding.currentBoardId = '';
+      state.board = null;
+      state.summary = null;
+      renderBrandPanel();
+      renderLauncherPanel();
+      renderBoard();
+      await loadOnboardingBoards();
+      ensureBynderCollectionsLoaded(false);
+      state.collectionNotice = {kind:'notice', text:''};
+  state.preflightNotices = [];
+      renderCollectionStatus();
+    } else if (saved.loadedCollectionOptionId) {
+      launchCollection(saved.loadedCollectionOptionId, {flashReload:false, scrollTopAfter:false});
+    }
+  } catch (err) { console.warn(err); }
+}
+
 window.PHOTO_TO_PSA_IMAGE_TYPE_MAP = {"Detail":"Detail","Lifestyle":"Room_shot","Silo":"Silo","Styled_Silo":"Silo","Swatch":"Swatch_detail","Video_Shoot_Still":"Room_shot"};
 
 const state = {
@@ -7280,15 +8610,23 @@ const state = {
     activeSkuSet: [],
     selectedIds: [],
     activeId: '',
-    prep: { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} },
+    prep: { flip: false, mode: 'original', offsetYOverrides: {}, offsetXOverrides: {}, optionsOpen: true, addingVersion: false },
+    collectionLoading: false,
+    collectionLoadNoticeId: '',
     previewUrl: '',
     hideFpo: false,
     hideReviewed: false,
     reviewingIds: {},
+    collectionSearch: '',
+    collectionOptionId: '',
+    imageTypeFilter: '',
+    skuFilter: '',
   },
   photoSkuOpen: {},
   photoDragId: null,
   preparedPreviewDrag: null,
+  bulkFixSiloMode: false,
+  bulkFixSiloRunning: false,
   setDim: {
     activeRowId: '',
     slotAssignments: [],
@@ -7305,6 +8643,8 @@ const state = {
   collectionNotice: {kind:'notice', text:'Loading Product Collection options...'},
   launchLoadingTicker: null,
   collectionSource: '',
+  bynderCollections: [],
+  bynderCollectionsLoading: false,
   notesOpen: false,
   notes: [
     {id:'note-1', text:''},
@@ -7339,7 +8679,33 @@ const state = {
     modalOpen: false,
   },
 
-  commitInFlight: false,};
+  commitInFlight: false,
+  workspace: 'content_refresher',
+  onboarding: {
+    boards: [],
+    creating: false,
+    currentBoardId: '',
+    pastedRows: '',
+    collectionLabel: '',
+    entryMode: 'start',
+    recentWarning: '',
+    openingBoard: false,
+    busyText: '',
+    editorCollapsed: false,
+    busyTimer: null,
+    busyStepIndex: 0,
+  },
+};
+
+const PIO_STEP_HEADER_ROW = 'SKU\tProduct Name\tComponents\tProduct Color\tLength\tWidth\tHeight\tSales Channel\tFeatures';
+const PIO_REQUIRED_HEADERS = ['SKU','Product Name'];
+const PIO_EXPECTED_HEADERS = ['SKU','Product Name','Components','Product Color','Length','Width','Height','Sales Channel','Features'];
+const PIO_WORKFLOW_STATE_OPTIONS = [
+  {status:'App_Launched', sync:'Do_not_sync_to_site', label:'Board started / Do not sync to site'},
+  {status:'App_Staged', sync:'Do_not_sync_to_site', label:'Staging / Do not sync to site'},
+  {status:'App_Live', sync:'Do_sync_to_site', label:'Live / Do sync to site'}
+];
+const PIO_BYNDER_SALES_CHANNEL_VALUES = ['Full_line','Online_only','Outlet__stocked_','Outlet__online_only_'];
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -7428,11 +8794,509 @@ function ensureNotesCapacity() {
 function renderCollectionStatus() {
   const host = document.getElementById('collectionStatusMount');
   if (!host) return;
+  if (state.workspace === 'product_imagery_onboarding') {
+    if (state.board && ((state.board.workflow_statuses || []).length || (state.board.sync_states || []).length)) {
+      const currentStatus = String(((state.board.workflow_statuses || [])[0] || 'App_Staged'));
+      const currentSync = String(((state.board.sync_states || [])[0] || 'Do_not_sync_to_site'));
+      const currentKey = `${currentStatus}||${currentSync}`;
+      host.innerHTML = `<select id="pioWorkflowStateSelect" title="Workflow status and sync state for this onboarding board" class="collection-status-select pio-header-select pio-header-select-compact">${PIO_WORKFLOW_STATE_OPTIONS.map(opt => `<option value="${escapeHtml(opt.status)}||${escapeHtml(opt.sync)}" ${currentKey === `${opt.status}||${opt.sync}` ? 'selected' : ''}>${escapeHtml(opt.label)}</option>`).join('')}</select>`;
+      const sel = document.getElementById('pioWorkflowStateSelect');
+      if (sel) sel.addEventListener('change', updatePIOWorkflowState);
+      return;
+    }
+    host.innerHTML = `<button type="button" class="collection-status-select pio-header-select pio-header-select-compact" disabled title="Workflow status control becomes active after a board is opened or created." style="cursor:default; opacity:1;">Staged -&gt; Live</button>`;
+    return;
+  }
   if (!state.collectionNotice || !state.collectionNotice.text) {
     host.innerHTML = '';
     return;
   }
   host.innerHTML = `<div class="collection-status-pill ${escapeHtml(state.collectionNotice.kind || 'notice')}">${escapeHtml(state.collectionNotice.text)}</div>`;
+}
+
+
+function pioWorkflowBadgeText() {
+  if (!state.board || state.workspace !== 'product_imagery_onboarding') return 'Staged -> Live';
+  const status = ((state.board.workflow_statuses || [])[0] || '').replaceAll('_', ' ');
+  const sync = ((state.board.sync_states || [])[0] || '').replaceAll('_', ' ');
+  return `${status || 'Draft'} / ${sync || 'Do not sync'}`;
+}
+
+function ensurePIOHeaderTemplate() {
+  if (!String(state.onboarding.pastedRows || '').trim()) {
+    state.onboarding.pastedRows = PIO_STEP_HEADER_ROW + '\n';
+  }
+}
+
+function parsePIOPastedRows(rawText) {
+  const text = String(rawText || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+$/g, '');
+  const lines = text.split('\n');
+  if (!lines.length || !String(lines[0] || '').trim()) {
+    throw new Error('Paste the STEP rows first.');
+  }
+  const headers = lines[0].split('\t').map(h => String(h || '').trim());
+  const headerIndex = {};
+  headers.forEach((h, i) => { if (h) headerIndex[h] = i; });
+  for (const req of PIO_REQUIRED_HEADERS) {
+    if (!(req in headerIndex)) throw new Error(`Missing required STEP Form column: ${req}`);
+  }
+  const salesIdx = headerIndex['Sales Channel'];
+  const rows = [];
+  const uniqueSales = [];
+  const seenSales = new Set();
+  for (let i = 1; i < lines.length; i += 1) {
+    const parts = lines[i].split('\t');
+    if (!parts.some(v => String(v || '').trim())) continue;
+    const salesValue = salesIdx >= 0 && salesIdx < parts.length ? String(parts[salesIdx] || '').trim() : '';
+    if (salesValue && !seenSales.has(salesValue.toLowerCase())) {
+      seenSales.add(salesValue.toLowerCase());
+      uniqueSales.push(salesValue);
+    }
+    rows.push(parts);
+  }
+  return {headers, rows, uniqueSales};
+}
+
+async function promptPIOSalesChannelMapping(uniqueValues) {
+  const values = (uniqueValues || []).filter(v => String(v || '').trim());
+  if (!values.length) return {};
+  return new Promise((resolve, reject) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'pio-modal-overlay';
+    overlay.innerHTML = `
+      <div class="pio-modal-card">
+        <div class="pio-modal-title">Map Sales Channel values</div>
+        <div class="muted" style="font-size:13px; margin-bottom:12px;">Before we commit onboarding metadata to Bynder, map each unique Sales Channel value from the pasted STEP rows to a real Bynder value.</div>
+        <div class="pio-map-table">
+          <div class="pio-map-head">Your value</div>
+          <div class="pio-map-head">Bynder value</div>
+          ${values.map((value, idx) => {
+            const exact = PIO_BYNDER_SALES_CHANNEL_VALUES.find(v => v.toLowerCase() === String(value).trim().toLowerCase()) || '';
+            return `
+              <div class="pio-map-cell">${escapeHtml(value)}</div>
+              <div class="pio-map-cell">
+                <select class="pio-sales-map-select" data-source-value="${escapeHtml(value)}">
+                  <option value="">Pick a Bynder value</option>
+                  ${PIO_BYNDER_SALES_CHANNEL_VALUES.map(opt => `<option value="${escapeHtml(opt)}" ${exact === opt ? 'selected' : ''}>${escapeHtml(opt)}</option>`).join('')}
+                </select>
+              </div>
+            `;
+          }).join('')}
+        </div>
+        <div class="pio-modal-actions">
+          <button type="button" class="btn btn-secondary" id="pioSalesMapCancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="pioSalesMapApply">Apply mapping</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = () => { if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+    overlay.querySelector('#pioSalesMapCancel').addEventListener('click', () => { close(); reject(new Error('Sales Channel mapping cancelled.')); });
+    overlay.addEventListener('click', (ev) => { if (ev.target === overlay) { close(); reject(new Error('Sales Channel mapping cancelled.')); } });
+    overlay.querySelector('#pioSalesMapApply').addEventListener('click', () => {
+      const mapping = {};
+      let missing = '';
+      overlay.querySelectorAll('.pio-sales-map-select').forEach(sel => {
+        const source = String(sel.getAttribute('data-source-value') || '').trim();
+        const target = String(sel.value || '').trim();
+        if (!target && !missing) missing = source;
+        if (source && target) mapping[source] = target;
+      });
+      if (missing) {
+        alert(`Pick a Bynder Sales Channel value for: ${missing}`);
+        return;
+      }
+      close();
+      resolve(mapping);
+    });
+  });
+}
+
+
+async function updatePIOWorkflowState(event) {
+  const value = String((event && event.target && event.target.value) || '').trim();
+  if (!value || !state.board) return;
+  const [workflow_status, sync_to_site] = value.split('||');
+  const isGoingLive = workflow_status === 'App_Live' && sync_to_site === 'Do_sync_to_site';
+  if (isGoingLive) {
+    const okay = confirm('Are you sure you want to switch this board to App Live / Do sync to site? This means these assets will be available to be synced to the website once selected there.');
+    if (!okay) { renderCollectionStatus(); return; }
+  }
+  try {
+    const resp = await fetch('/api/onboarding/update_workflow_state', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({workflow_status, sync_to_site})});
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not update workflow state');
+    applyBoardResponse(data, {keepPhotography:true, keepNotices:true});
+    addAppNotice(isGoingLive ? 'This onboarding board is now marked App Live / Do sync to site.' : 'Workflow state updated for this onboarding board.', 'success');
+  } catch (err) {
+    alert(err.message || String(err));
+    renderCollectionStatus();
+  }
+}
+
+
+function rowCountsAsActive(row) {
+  const status = String((row && row.product_status) || '').trim().toLowerCase();
+  if (!status) return state.workspace === 'product_imagery_onboarding';
+  return status === 'active';
+}
+
+
+function buildPIOPreflightNotices() {
+  if (!state.board) return [];
+  let firstMissingGrid = null;
+  let firstMissing100 = null;
+  let firstMissingSwatch = null;
+  let firstMissingDimension = null;
+  let firstCompilableSetDim = null;
+  let firstMakeSquare = null;
+  for (const section of state.board.color_sections || []) {
+    for (const row of section.rows || []) {
+      const actualAssets = (row.assets || []).filter(a => a && !a.is_marked_for_deletion && !a.is_empty_slot && !String(a.id || '').startsWith('empty::'));
+      const hasGrid = actualAssets.some(a => String(a.slot_key || '') === 'SKU_grid' || String(a.current_position || '').endsWith('_grid'));
+      const has100 = actualAssets.some(a => String(a.slot_key || '') === 'SKU_100' || String(a.current_position || '').endsWith('_100'));
+      const hasSwatch = actualAssets.some(a => String(a.slot_key || '') === 'SKU_swatch' || String(a.current_position || '').endsWith('_swatch'));
+      const hasDimension = actualAssets.some(a => String(a.slot_key || '') === 'SKU_dimension' || String(a.current_position || '').endsWith('_dimension'));
+      if (!hasGrid && !firstMissingGrid) firstMissingGrid = {rowId: row.row_id, color: section.color, slot: 'SKU_grid'};
+      if (!has100 && !firstMissing100) firstMissing100 = {rowId: row.row_id, color: section.color, slot: 'SKU_100'};
+      if (!hasSwatch && !firstMissingSwatch) firstMissingSwatch = {rowId: row.row_id, color: section.color, slot: 'SKU_swatch'};
+      if (!hasDimension && !firstMissingDimension) firstMissingDimension = {rowId: row.row_id, color: section.color, slot: 'SKU_dimension'};
+      if (!hasDimension && row.set_dim_compile_ready && !firstCompilableSetDim) firstCompilableSetDim = {rowId: row.row_id, color: section.color, slot: 'SKU_dimension'};
+      if (row.square_make_recommended && !firstMakeSquare) firstMakeSquare = {rowId: row.row_id, color: section.color, slot: 'SKU_square'};
+    }
+  }
+  const notices = [];
+  if (firstMissingGrid) notices.push({id:'preflight-missing-grid', kind:'error', text:'Missing grid: Jump to the first SKU missing a grid image.', rowId:firstMissingGrid.rowId, color:firstMissingGrid.color, slot:firstMissingGrid.slot});
+  if (firstMissing100) notices.push({id:'preflight-missing-100', kind:'error', text:'Missing SKU_100: Jump to the first SKU missing its primary carousel image.', rowId:firstMissing100.rowId, color:firstMissing100.color, slot:firstMissing100.slot});
+  if (firstMissingSwatch) notices.push({id:'preflight-missing-swatch', kind:'warning', text:'Missing swatch: Jump to the first SKU missing a swatch asset.', rowId:firstMissingSwatch.rowId, color:firstMissingSwatch.color, slot:firstMissingSwatch.slot});
+  if (firstMissingDimension) notices.push({id:'preflight-missing-dimension', kind:'warning', text:'Missing dimensions: Jump to the first SKU missing a dimensions asset.', rowId:firstMissingDimension.rowId, color:firstMissingDimension.color, slot:firstMissingDimension.slot});
+  if (firstCompilableSetDim) notices.push({id:'preflight-missing-set-dim', kind:'notice', text:'Set dim jumper opportunity: Jump to the first SKU where a set dim could be compiled.', rowId:firstCompilableSetDim.rowId, color:firstCompilableSetDim.color, slot:firstCompilableSetDim.slot});
+  if (firstMakeSquare) notices.push({id:'preflight-make-square', kind:'notice', text:'Make square opportunity: Jump to the first SKU where a square room-shot image could probably be made.', rowId:firstMakeSquare.rowId, color:firstMakeSquare.color, slot:firstMakeSquare.slot});
+  return notices;
+}
+
+function runPIOPreflightCheck() {
+  if (!state.board) return;
+  const notices = buildPIOPreflightNotices();
+  state.preflightNotices = notices;
+  if (notices.length) {
+    const labels = notices.map(n => String(n.text || '').split(':')[0].trim().toLowerCase());
+    addAppNotice(`Preflight check complete. ${notices.length} issue${notices.length === 1 ? '' : 's'} need attention. Review the jump notices for: ${labels.join(', ')}.`, 'warning');
+  } else {
+    addAppNotice('Preflight check complete. No missing critical assets or recommended square/set-dim fixes were found on this board.', 'success');
+  }
+  renderNotifications();
+}
+
+
+function clearPIOBoardView() {
+  state.board = null;
+  state.summary = null;
+  state.loadedCollectionOptionId = '';
+  state.onboarding.currentBoardId = '';
+  state.onboarding.recentWarning = '';
+  state.collectionNotice = {kind:'notice', text:''};
+  renderLauncherPanel();
+  renderBoard();
+  renderCollectionStatus();
+  saveUIState();
+}
+
+function renderLauncherPanel() {
+  const host = document.getElementById('launcherPanelMount');
+  if (!host) return;
+  if (state.workspace === 'product_imagery_onboarding') {
+    ensurePIOHeaderTemplate();
+    const collectionOptions = (state.filteredCollections || state.collections || []).map(c => `<option value="${escapeHtml(c.label)}"></option>`).join('');
+    const boardOptions = ['<option value=>Choose a board</option>'].concat((state.onboarding.boards || []).map(b => `<option value="${escapeHtml(b.label)}">${escapeHtml(b.label_display || b.label)} (${Number(b.row_count || 0)} SKUs)</option>`)).join('');
+    const entryMode = state.onboarding.entryMode || 'start';
+    const editorCollapsed = !!state.onboarding.editorCollapsed;
+    host.innerHTML = `
+      <div class="select-wrap" style="display:grid; gap:14px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+          <div class="pio-top-actions">
+            <div class="pio-mode-tabs" style="display:inline-flex; gap:0; flex-wrap:nowrap; border:1px solid var(--rf-border); border-radius:14px; overflow:hidden; background:#f6f0fb; box-shadow: inset 0 0 0 1px rgba(255,255,255,.45);">
+              <button type="button" class="btn ${entryMode === 'start' ? 'btn-primary' : 'btn-secondary'}" id="pioStartModeBtn" style="border-radius:0; min-width:132px; box-shadow:none; ${entryMode === 'start' ? '' : 'background:#f6f0fb; color:var(--rf-purple);'}">Create Placeholders</button>
+              <button type="button" class="btn ${entryMode === 'open' ? 'btn-primary' : 'btn-secondary'}" id="pioOpenModeBtn" style="border-radius:0; min-width:164px; box-shadow:none; border-left:1px solid var(--rf-border); ${entryMode === 'open' ? '' : 'background:#f6f0fb; color:var(--rf-purple);'}">Open Product Imagery Board</button>
+            </div>
+            <div class="collection-status-mount" id="collectionStatusMount" aria-label="Workflow status control"></div>
+          </div>
+        </div>
+        ${entryMode === 'start' ? `
+          <div style="display:grid; gap:12px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+              <div class="muted" style="font-size:13px; font-weight:700;">Board setup</div>
+              <button type="button" class="btn btn-secondary btn-compact" id="pioToggleEditorBtn">${editorCollapsed ? 'Expand setup' : 'Collapse setup'}</button>
+            </div>
+            ${editorCollapsed ? `<div class="muted" style="font-size:13px;">Board setup is collapsed to save space. Expand it to add SKUs to a Product Collection.</div>` : `
+            ${state.onboarding.creating ? `<div style="display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:14px; border:1px solid #cfe4d1; background:#eef8ef; color:#245b2f; font-weight:700; box-shadow:0 8px 18px rgba(36,91,47,.08);"><span class="spinner" style="width:18px; height:18px; border-width:2px; border-top-color:#2d8f52;"></span><span>${escapeHtml(state.onboarding.busyText || 'Working on your onboarding board...')}</span></div>` : ``}
+            <div class="muted" style="font-size:13px;">Step 1: enter the Product Collection value for the new board. You can type your own value or choose from existing suggestions.</div>
+            <div style="display:grid; grid-template-columns:minmax(260px, 1fr) auto; gap:12px; align-items:end;">
+              <div>
+                <label class="small">Product Collection</label>
+                <input type="text" id="pioCollectionInput" list="pioCollectionOptions" placeholder="Type Product Collection name" value="${escapeHtml(state.onboarding.collectionLabel || '')}" />
+                <datalist id="pioCollectionOptions">${collectionOptions}</datalist>
+              </div>
+              <div></div>
+            </div>
+            <div style="display:grid; gap:8px;">
+              <div class="muted" style="font-size:13px;">Step 2: copy the header row into a blank Google Sheet or Excel sheet, paste your STEP data underneath it, then copy the completed rows from the sheet and paste them back into this box. Required columns: <strong>SKU</strong> and <strong>Product Name</strong>. Optional columns: Product Color, Sales Channel, Components, Length, Width, Height, and Features.</div>
+              <textarea id="pioPasteInput" rows="8" style="width:100%; border:1px solid var(--rf-border); border-radius:12px; padding:10px 12px; resize:vertical; font-family:Consolas, monospace;" placeholder="Paste STEP Form rows here" ${state.onboarding.creating ? "disabled" : ""}>${escapeHtml(state.onboarding.pastedRows || '')}</textarea>
+            </div>
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+              <div class="muted" style="font-size:12px;">Blank rows are ignored. If your Product Collection value does not exist in Bynder yet, the app will create it for you.</div>
+              <button type="button" class="btn btn-primary" id="pioCreateBtn" ${state.onboarding.creating ? "disabled" : ""}>${state.onboarding.creating ? "Creating..." : "Create Placeholders"}</button>
+            </div>`}
+          </div>
+        ` : `
+          <div style="display:grid; gap:12px;">
+            <div class="muted" style="font-size:13px;">Open an existing Product Imagery Onboarding board from Bynder. Draft and live boards can both be reopened here.</div>
+            <div style="display:grid; grid-template-columns:minmax(280px, 1fr) auto auto; gap:12px; align-items:end;">
+              <div>
+                <label class="small">Existing Board</label>
+                <select id="pioBoardSelect" size="1">${boardOptions}</select>
+              </div>
+              <button type="button" class="btn btn-primary ${state.onboarding.openingBoard ? 'btn-reload-flashing' : ''}" id="pioOpenBtn" ${state.onboarding.openingBoard ? 'disabled' : ''}>${state.onboarding.openingBoard ? 'Opening...' : 'Open Board'}</button>
+              <button type="button" class="btn btn-preflight btn-compact" id="pioPreflightBtnTop" ${!state.board ? 'disabled' : ''}>Preflight Check</button>
+            </div>
+            <div class="muted" style="font-size:12px;">Use Preflight Check before marking a board live.</div>
+          </div>
+        `}
+      </div>
+    `;
+    const startBtn = document.getElementById('pioStartModeBtn');
+    const openModeBtn = document.getElementById('pioOpenModeBtn');
+    if (startBtn) startBtn.addEventListener('click', () => { state.onboarding.entryMode = 'start'; renderLauncherPanel(); });
+    if (openModeBtn) openModeBtn.addEventListener('click', () => { state.onboarding.entryMode = 'open'; renderLauncherPanel(); });
+    const toggleEditorBtn = document.getElementById('pioToggleEditorBtn');
+    if (toggleEditorBtn) toggleEditorBtn.addEventListener('click', () => { state.onboarding.editorCollapsed = !state.onboarding.editorCollapsed; renderLauncherPanel(); });
+    const collectionInput = document.getElementById('pioCollectionInput');
+    if (collectionInput) collectionInput.addEventListener('input', e => { state.onboarding.collectionLabel = e.target.value || ''; });
+    const pasteInput = document.getElementById('pioPasteInput');
+    if (pasteInput) pasteInput.addEventListener('input', e => { state.onboarding.pastedRows = e.target.value || ''; });
+    const createBtn = document.getElementById('pioCreateBtn');
+    if (createBtn) createBtn.addEventListener('click', createPIOBoard);
+    const openBtn = document.getElementById('pioOpenBtn');
+    if (openBtn) openBtn.addEventListener('click', openPIOBoard);
+    const preflightBtn = document.getElementById('pioPreflightBtn');
+    if (preflightBtn) preflightBtn.addEventListener('click', runPIOPreflightCheck);
+    const preflightBtnTop = document.getElementById('pioPreflightBtnTop');
+    if (preflightBtnTop) preflightBtnTop.addEventListener('click', runPIOPreflightCheck);
+    renderCollectionStatus();
+    return;
+  }
+
+  host.innerHTML = `
+    <div class="select-wrap">
+      <div class="inline-launch-group">
+        <div class="launch-field">
+          <label class="small">Search Product Collection</label>
+          <input type="text" id="collectionFilter" placeholder="Type any part of the collection name" />
+        </div>
+        <div class="launch-field">
+          <label class="small">Product Collection</label>
+          <select id="collectionSelect" size="1"></select>
+        </div>
+        <div class="launch-button-col">
+          <div class="launch-button-stack">
+            <button type="button" class="btn btn-primary" id="launchBtn">Launch Collection</button>
+          </div>
+        </div>
+      </div>
+      <div class="launcher-lower-row">
+        <div class="launcher-checkbox-row">
+          <label class="mode-option" style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="hideInactiveToggle" /> Hide inactive SKUs</label>
+        </div>
+        <div class="collection-status-mount" id="collectionStatusMount"></div>
+        <div class="launcher-random-row">
+          <button type="button" class="btn btn-secondary btn-compact" id="launchRandomBtn">Launch Random Collection</button>
+        </div>
+      </div>
+    </div>
+  `;
+  bindRegularLauncherEvents();
+  renderCollectionStatus();
+  renderCollectionSelect();
+}
+
+async function switchWorkspace(workspace) {
+  const nextWs = workspace === 'product_imagery_onboarding' ? 'product_imagery_onboarding' : 'content_refresher';
+  state.workspace = nextWs;
+  renderDocumentTitle();
+  state.board = null;
+  state.summary = null;
+  state.photography.items = [];
+  state.onboarding.recentWarning = '';
+  if (!state.onboarding.entryMode) state.onboarding.entryMode = 'start';
+  if (!String(state.onboarding.pastedRows || '').trim()) state.onboarding.pastedRows = PIO_STEP_HEADER_ROW + '\n';
+  renderBrandPanel();
+  renderLauncherPanel();
+  renderBoard();
+  if (nextWs === 'product_imagery_onboarding') {
+    state.onboarding.currentBoardId = '';
+    state.loadedCollectionOptionId = '';
+    await loadOnboardingBoards();
+    ensureBynderCollectionsLoaded(false);
+    state.collectionNotice = {kind:'notice', text:''};
+    renderCollectionStatus();
+  } else {
+    state.collectionNotice = {kind:'notice', text:(state.collections || []).length ? `${state.collections.length.toLocaleString()} Product Collection options loaded.` : 'Loading Product Collection options...'}
+    renderCollectionStatus();
+  }
+}
+
+async function loadOnboardingBoards() {
+  try {
+    const resp = await fetch('/api/onboarding/boards');
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not load onboarding boards');
+    state.onboarding.boards = data.boards || [];
+  } catch (err) {
+    state.onboarding.boards = [];
+    addAppNotice(err.message || String(err), 'error');
+  }
+  renderLauncherPanel();
+}
+
+function startPIOCreateBusySequence() {
+  const steps = [
+    'Checking your Product Collection value and STEP rows...',
+    'Mapping Sales Channel values to Bynder options...',
+    'Preparing your Product Collection in Bynder...',
+    'Creating placeholder grid anchors in Bynder...',
+    'Waiting for placeholder metadata to settle in Bynder...',
+    'Building your product imagery onboarding board...'
+  ];
+  clearPIOCreateBusySequence();
+  state.onboarding.busyStepIndex = 0;
+  state.onboarding.busyText = steps[0];
+  state.collectionNotice = {kind:'notice', text: steps[0]};
+  renderCollectionStatus();
+  renderLauncherPanel();
+  state.onboarding.busyTimer = window.setInterval(() => {
+    if (!state.onboarding.creating) return;
+    state.onboarding.busyStepIndex = Math.min((state.onboarding.busyStepIndex || 0) + 1, steps.length - 1);
+    const nextText = steps[state.onboarding.busyStepIndex] || steps[steps.length - 1];
+    state.onboarding.busyText = nextText;
+    state.collectionNotice = {kind:'notice', text: nextText};
+    renderCollectionStatus();
+    renderLauncherPanel();
+  }, 2200);
+}
+
+function clearPIOCreateBusySequence() {
+  if (state.onboarding.busyTimer) {
+    window.clearInterval(state.onboarding.busyTimer);
+    state.onboarding.busyTimer = null;
+  }
+}
+
+async function createPIOBoard() {
+  const input = document.getElementById('pioCollectionInput');
+  const collection_label = String((input ? input.value : state.onboarding.collectionLabel) || '').trim();
+  const pasted_rows = String(state.onboarding.pastedRows || '');
+  if (!collection_label) { alert('Enter a Product Collection value first.'); return; }
+  if (!String(pasted_rows || '').trim()) { alert('Paste the STEP rows first.'); return; }
+  try {
+    if (state.board) {
+      const okay = confirm('Launching a new board will remove the current board from your screen and replace it with the new one. Your Bynder assets will stay where they are. Continue?');
+      if (!okay) return;
+    }
+    const parsed = parsePIOPastedRows(pasted_rows);
+    if (!parsed.rows.length) { alert('Paste at least one STEP row under the headers.'); return; }
+    const sales_channel_map = await promptPIOSalesChannelMapping(parsed.uniqueSales);
+    state.onboarding.creating = true;
+    startPIOCreateBusySequence();
+    const resp = await fetch('/api/onboarding/create_board', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({collection_label, pasted_rows, sales_channel_map})});
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not create Product Imagery Onboarding board');
+    state.workspace = 'product_imagery_onboarding';
+    state.board = data.board || null;
+    state.loadedCollectionOptionId = data.collection_option_id || ((data.board && (data.board.collection || {}).id) || '');
+    state.onboarding.collectionLabel = collection_label;
+    state.summary = data.summary || null;
+    state.onboarding.currentBoardId = state.loadedCollectionOptionId || (((state.board || {}).collection || {}).id || '');
+    state.onboarding.recentWarning = '';
+    state.onboarding.editorCollapsed = true;
+    state.collectionNotice = {kind:'success', text:`Product Imagery Onboarding board created for ${(state.board && (state.board.collection_label || ((state.board.collection || {}).label))) || 'collection'}.`};
+    renderBrandPanel();
+    renderLauncherPanel();
+    renderBoard();
+    saveUIState();
+    if (Array.isArray(data.warnings) && data.warnings.length) addAppNotice(data.warnings[0], 'notice');
+    await loadOnboardingBoards();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    state.onboarding.creating = false;
+    clearPIOCreateBusySequence();
+    state.onboarding.busyText = '';
+    renderLauncherPanel();
+  }
+}
+
+async function openPIOBoardById(collection_label, force_refresh=false) {
+  if (!collection_label) { alert('Choose a Product Imagery Onboarding board to open.'); return; }
+  try {
+    state.onboarding.openingBoard = true;
+    const loadingText = force_refresh ? 'Reloading Product Imagery Onboarding board from Bynder...' : 'Opening Product Imagery Onboarding board from Bynder...';
+    state.collectionNotice = {kind:'notice', text:loadingText};
+    addAppNotice(loadingText, 'notice');
+    renderCollectionStatus();
+    renderLauncherPanel();
+    setReloadButtonFlashing(!!force_refresh);
+    const resp = await fetch('/api/onboarding/load_board', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({collection_label, force_refresh})});
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not open Product Imagery Onboarding board');
+    state.workspace = 'product_imagery_onboarding';
+    state.board = data.board || null;
+    state.loadedCollectionOptionId = collection_label;
+    state.summary = data.summary || null;
+    state.onboarding.currentBoardId = collection_label;
+    state.onboarding.recentWarning = data.recent_warning || '';
+    state.onboarding.editorCollapsed = true;
+    state.collectionNotice = {kind:'success', text:`Opened Product Imagery Onboarding board for ${(state.board && (state.board.collection_label || ((state.board.collection || {}).label))) || 'collection'}.`};
+    renderBrandPanel();
+    renderLauncherPanel();
+    renderBoard();
+    saveUIState();
+    if (state.onboarding.recentWarning) addAppNotice(state.onboarding.recentWarning, 'notice');
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    state.onboarding.openingBoard = false;
+    setReloadButtonFlashing(false);
+    renderLauncherPanel();
+  }
+}
+
+async function openPIOBoard() {
+  const select = document.getElementById('pioBoardSelect');
+  const collection_label = select ? select.value : '';
+  return openPIOBoardById(collection_label, false);
+}
+
+async function goLivePIOBoard() {
+  if (!state.board) return;
+  if (!confirm('Go live? This will change Sync to Site from Do not sync to site to Do sync to site and set Workflow Status to App_Live.')) return;
+  try {
+    state.collectionNotice = {kind:'notice', text:'Reviewing and promoting this onboarding board to live...'};
+    renderCollectionStatus();
+    const resp = await fetch('/api/onboarding/go_live', {method:'POST'});
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not promote board to live');
+    state.board = data.board || state.board;
+    state.summary = data.summary || null;
+    state.collectionNotice = {kind:'success', text:`Board is now live. Updated ${Number(data.updated_count || 0)} assets.`};
+    renderLauncherPanel();
+    renderBoard();
+    await loadOnboardingBoards();
+  } catch (err) {
+    alert(err.message || String(err));
+  } finally {
+    state.photography.prep.addingVersion = false;
+    renderPhotographyPanel();
+  }
 }
 
 function renderNotesPanel() {
@@ -7652,17 +9516,52 @@ function toggleGameLeaderboard() {
   renderBrandPanel();
 }
 
+
+function renderDocumentTitle() {
+  try {
+    const title = state.workspace === 'product_imagery_onboarding' ? 'Product Imagery Onboarding' : 'Content Refresher';
+    document.title = title;
+  } catch (err) {}
+}
+
 function renderBrandPanel() {
   const panel = document.getElementById('brandPanel');
   const host = document.getElementById('brandPanelMount');
   if (!panel || !host) return;
+  renderDocumentTitle();
   const g = state.game || {};
   if (!g.active) {
     panel.classList.remove('game-active');
+    const workspace = state.workspace || 'content_refresher';
+    const title = workspace === 'product_imagery_onboarding' ? 'Product Imagery Onboarding' : 'Content Refresher';
+    const sub = workspace === 'product_imagery_onboarding'
+      ? 'Draft and stage new Product Collection imagery using placeholder grid anchors and shared workflow metadata.'
+      : 'Live Bynder board for Product Collection image cleanup, slotting, and safe staged updates.';
     host.innerHTML = `
-      <h1>Content Refresher</h1>
-      <div class="sub">Live Bynder board for Product Collection image cleanup, slotting, and safe staged updates.</div>
+      <div class="workspace-switch-row" style="position:relative;">
+        <h1>${escapeHtml(title)}</h1>
+        <button type="button" class="workspace-menu-btn" id="workspaceMenuBtn" aria-label="Switch workspace">▾</button>
+        <div class="workspace-menu" id="workspaceMenu" style="display:none;">
+          <button type="button" class="workspace-menu-item ${workspace === 'content_refresher' ? 'active' : ''}" data-workspace="content_refresher" style="color:#5a2d86 !important; background:${workspace === 'content_refresher' ? '#f4edf9' : 'transparent'};">Content Refresher</button>
+          <button type="button" class="workspace-menu-item ${workspace === 'product_imagery_onboarding' ? 'active' : ''}" data-workspace="product_imagery_onboarding" style="color:#5a2d86 !important; background:${workspace === 'product_imagery_onboarding' ? '#f4edf9' : 'transparent'};">Product Imagery Onboarding</button>
+        </div>
+      </div>
+      <div class="sub">${escapeHtml(sub)}</div>
     `;
+    const menuBtn = document.getElementById('workspaceMenuBtn');
+    const menu = document.getElementById('workspaceMenu');
+    if (menuBtn && menu) {
+      menuBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        menu.style.display = menu.style.display === 'block' ? 'none' : 'block';
+      });
+      menu.querySelectorAll('[data-workspace]').forEach(btn => btn.addEventListener('click', (ev) => {
+        const next = ev.currentTarget.getAttribute('data-workspace') || 'content_refresher';
+        menu.style.display = 'none';
+        switchWorkspace(next);
+      }));
+      document.addEventListener('click', () => { if (menu) menu.style.display = 'none'; }, {once:true});
+    }
     return;
   }
   panel.classList.add('game-active');
@@ -7733,6 +9632,7 @@ function syncGameState(game) {
 function applyBoardResponse(data, options={}) {
   state.board = data.board;
   state.summary = data.summary;
+  if (data && data.workspace) state.workspace = data.workspace;
   state.collapsedColors = {};
   state.assetModeDirty = false;
   state.assetModeDirtyRows = {};
@@ -7746,6 +9646,7 @@ function applyBoardResponse(data, options={}) {
     state.photoSkuOpen = {};
   }
   if (!options.keepNotices) state.appNotices = [];
+  state.preflightNotices = [];
   if (data.game) syncGameState(data.game);
   renderBoard();
   if (!options.keepPhotography && data.photography_autoload) {
@@ -7773,10 +9674,16 @@ function showGameCelebration(title, text) {
 
 async function launchCleanupChallenge() {
   const g = state.game || {};
+  if (state.workspace === 'product_imagery_onboarding') {
+    await switchWorkspace('content_refresher');
+  }
   if (!g.active) {
     const okay = confirm('Launch Cleanup Challenge? You will leave the regular workspace and jump into a workshop-style board with real content issues to fix, live scoring, and fresh challenge boards queued in the background.');
     if (!okay) return;
   }
+  try {
+    await fetch('/api/game/ensure_queue', {method:'POST'}).then(r => r.json()).then(data => { if (!data.error) syncGameState(data); });
+  } catch (_) {}
   state.game.loading = true;
   renderGameModesPanel();
   renderBrandPanel();
@@ -7791,13 +9698,21 @@ async function launchCleanupChallenge() {
       }
     }
     const url = g.active ? '/api/game/next' : '/api/game/launch';
-    const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'launch'})});
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 45000);
+    const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'launch'}), signal: controller.signal});
+    window.clearTimeout(timeoutId);
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Could not launch Cleanup Challenge');
     applyBoardResponse(data);
     showGameCelebration('Cleanup Challenge', 'Fresh board loaded. Go score some fixes.');
     scheduleGameQueueEnsure();
-  } catch (err) { alert(err.message || String(err)); }
+  } catch (err) {
+    const msg = (err && err.name === 'AbortError')
+      ? 'Cleanup Challenge took too long to load. The queue may still be warming up, so please try again in a moment.'
+      : (err.message || String(err));
+    alert(msg);
+  }
   finally {
     state.game.loading = false;
     setWaitOverlay(false);
@@ -7844,15 +9759,22 @@ async function exitCleanupChallenge() {
   } catch (_) {}
 }
 
-function scheduleGameQueueEnsure() {
+function scheduleGameQueueEnsure(force=false) {
+  if (!(state.game)) return;
   if (state.commitInFlight) return;
   if (state.waitFlow && state.waitFlow.activeToken) return;
   const queuedCount = Object.values(state.changeSummary || {}).reduce((acc, value) => acc + Number(value || 0), 0);
-  if (queuedCount > 0) return;
+  if (!force && queuedCount > 0) return;
   const now = Date.now();
-  if ((now - Number(state.game.lastEnsureAt || 0)) < 7000) return;
+  const minGap = state.game.active ? 60000 : 12000;
+  const target = state.game.active ? 2 : 1;
+  if (!force && (now - Number(state.game.lastEnsureAt || 0)) < minGap) return;
+  if (!force && Number(state.game.queueLength || 0) >= target) return;
   state.game.lastEnsureAt = now;
-  fetch('/api/game/ensure_queue', {method:'POST'}).then(r => r.json()).then(data => { if (!data.error) syncGameState(data); }).catch(() => {});
+  fetch('/api/game/ensure_queue', {method:'POST'})
+    .then(r => r.json())
+    .then(data => { if (!data.error) syncGameState(data); })
+    .catch(() => {});
 }
 
 function renderModeUI() {
@@ -7883,28 +9805,65 @@ function renderModeUI() {
 }
 
 
+function rowRefreshFingerprint(row) {
+  if (!row) return '';
+  const assets = (row.assets || []).map(asset => ({
+    id: String(asset.id || ''),
+    slot: String(asset.slot_key || asset.current_position || ''),
+    width: Number(asset.width || 0),
+    height: Number(asset.height || 0),
+    modified: String(asset.dateModified || asset.dateCreated || ''),
+    thumb: String(asset.transformBaseUrl || ''),
+    pending: !!asset.pending_upload
+  })).sort((a,b) => `${a.slot}|${a.id}`.localeCompare(`${b.slot}|${b.id}`));
+  return JSON.stringify({
+    row: String(row.row_id || row.sku || ''),
+    assets
+  });
+}
+
 function markAssetModeDirtyRows(rowIds) {
   (rowIds || []).forEach(rowId => {
     const key = String(rowId || '').trim();
-    if (key) state.assetModeDirtyRows[key] = true;
+    if (!key) return;
+    const row = getRowById(key);
+    state.assetModeDirtyRows[key] = {
+      at: Date.now(),
+      fingerprint: rowRefreshFingerprint(row)
+    };
   });
 }
 
 async function refreshDirtyAssetRows() {
   const rowIds = Object.keys(state.assetModeDirtyRows || {}).filter(Boolean);
   if (!rowIds.length) return false;
-  const resp = await fetch('/api/refresh_rows', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({row_ids: rowIds})
+  const baseline = {};
+  rowIds.forEach(rowId => {
+    const entry = state.assetModeDirtyRows[rowId] || {};
+    baseline[rowId] = String(entry.fingerprint || rowRefreshFingerprint(getRowById(rowId)) || '');
   });
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(data.error || 'Row refresh failed');
-  state.board = data.board || state.board;
-  state.summary = data.summary || state.summary;
+  const startedAt = Date.now();
+  let attempts = 0;
+  let lastData = null;
+  while ((Date.now() - startedAt) < 15000) {
+    attempts += 1;
+    const resp = await fetch('/api/refresh_rows', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({row_ids: rowIds})
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Row refresh failed');
+    state.board = data.board || state.board;
+    state.summary = data.summary || state.summary;
+    lastData = data;
+    const changed = rowIds.some(rowId => rowRefreshFingerprint(getRowById(rowId)) !== String(baseline[rowId] || ''));
+    if (changed || attempts >= 6) break;
+    await new Promise(resolve => setTimeout(resolve, 1800));
+  }
   state.assetModeDirtyRows = {};
   state.assetModeDirty = false;
-  return true;
+  return !!lastData;
 }
 
 
@@ -7999,7 +9958,11 @@ function laneInfo(row, laneType) {
       if (num > maxVal) maxVal = num;
     }
     if (maxVal <= 0) {
-      slots.push('SKU_100');
+      if (state.workspace === 'product_imagery_onboarding') {
+        for (let n = 100; n <= 500; n += 100) slots.push(`SKU_${n}`);
+      } else {
+        slots.push('SKU_100');
+      }
     } else {
       const displayMax = Math.min(maxVal + 100, 4900);
       for (let n = 100; n <= displayMax; n += 100) slots.push(`SKU_${n}`);
@@ -8018,7 +9981,12 @@ function laneInfo(row, laneType) {
       if (Number.isFinite(num) && num > maxVal) maxVal = num;
     }
     if (maxVal <= 0) {
-      slots.push('SKU_5000');
+      if (state.workspace === 'product_imagery_onboarding') {
+        slots.push('SKU_5000');
+        slots.push('SKU_5100');
+      } else {
+        slots.push('SKU_5000');
+      }
     } else {
       const displayMax = Math.min(maxVal + 100, 5900);
       for (let n = 5000; n <= displayMax; n += 100) slots.push(`SKU_${n}`);
@@ -8034,6 +10002,7 @@ function changedAssetIds() {
   for (const section of state.board.color_sections || []) {
     for (const row of section.rows || []) {
       for (const asset of row.assets || []) {
+        if (asset.is_empty_slot) continue;
         const original = asset.original_state || {};
         if (asset.pending_upload || (asset.current_position || '') !== (original.position || '') || !!asset.is_marked_for_deletion !== !!original.is_marked_for_deletion || String(asset.deliverable_override || asset.deliverable || '') !== String(original.deliverable || asset.deliverable || '')) {
           changed.add(asset.id);
@@ -8057,6 +10026,7 @@ function bucketRow(row) {
   for (const slot of laneInfo(row, 'swatch_detail')) buckets.swatch_detail[slot] = [];
 
   for (const asset of row.assets || []) {
+    if (asset.is_empty_slot) continue;
     const lane = asset.lane;
     const pos = asset.slot_key || '';
     const rawPos = asset.last_nontrash_position || asset.current_position;
@@ -8074,9 +10044,10 @@ function bucketRow(row) {
 function assetThumbUrl(asset, forPanel=false) {
   if (!asset.transformBaseUrl) return '';
   const isSkuSwatch = (asset.slot_key || '') === 'SKU_swatch' || /_swatch$/i.test(asset.current_position || '');
-  if (isSkuSwatch) return asset.transformBaseUrl;
+  const cacheBust = encodeURIComponent(String(asset.dateModified || asset.dateCreated || `${asset.width || 0}x${asset.height || 0}` || ''));
+  if (isSkuSwatch) return `${asset.transformBaseUrl}${asset.transformBaseUrl.includes('?') ? '&' : '?'}cb=${cacheBust}`;
   const width = forPanel ? 700 : 500;
-  return `${asset.transformBaseUrl}?io=transform:scale,width:${width}&quality=80`;
+  return `${asset.transformBaseUrl}?io=transform:scale,width:${width}&quality=80&cb=${cacheBust}`;
 }
 
 function shortDate(text) {
@@ -8138,6 +10109,7 @@ function assetSharesSlot(asset) {
 }
 
 function renderAssetCard(asset, changed) {
+  if (asset && asset.is_empty_slot) return '';
   const thumb = assetThumbUrl(asset);
   const classes = ['asset-card'];
   const original = asset.original_state || {};
@@ -8148,6 +10120,7 @@ function renderAssetCard(asset, changed) {
   if (asset.pending_upload) classes.push('pending-copy');
   if (asset.asset_mode_uploaded) classes.push('asset-uploaded');
   if (asset.size_warning) classes.push('bad-dimensions');
+  if (assetIsBulkFixSiloTarget(asset)) classes.push('bulk-fix-target');
   const openLink = asset.original || asset.transformBaseUrl || '#';
   const downloadLink = asset.pending_upload ? `/api/download/${encodeURIComponent(asset.copy_source_media_id || asset.id || '')}` : `/api/download/${encodeURIComponent(asset.id || '')}`;
   let fixActions = [];
@@ -8198,7 +10171,7 @@ function renderAssetCard(asset, changed) {
 }
 
 function slotNeedsCriticalHighlight(row, slotName, items) {
-  if (!row || (row.product_status || '').toLowerCase() !== 'active') return false;
+  if (!row || !rowCountsAsActive(row)) return false;
   if (items && items.length) return false;
   return slotName === 'SKU_grid' || slotName === 'SKU_100';
 }
@@ -8452,11 +10425,20 @@ function renderRow(row, changedSet) {
       <div class="row-layout">
         <div class="meta-grid">
           <div class="meta-cell"><div class="k">Product Name</div><div class="v">${row.product_url ? `<a href="${escapeHtml(row.product_url)}" target="_blank" rel="noopener">${escapeHtml(row.product_name)}</a>` : escapeHtml(row.product_name)}</div></div>
-          <div class="meta-cell"><div class="k">Product SKU</div><div class="v">${escapeHtml(row.sku)}<div style="margin-top:4px;"><a href="https://www.bynder.raymourflanigan.com/media/?resetsearch=&field=metaproperty_Product_SKU&value=${encodeURIComponent(row.sku || '')}" target="_blank" rel="noopener">Open Product Site Assets in Bynder</a></div></div></div>
-          <div class="meta-cell ${row.inactive ? 'status-inactive' : ''}"><div class="k">Product Status</div><div class="v">${escapeHtml(row.product_status)}</div></div>
+          <div class="meta-cell"><div class="k">Product SKU</div><div class="v"><div class="sku-inline-top"><span class="sku-text">${escapeHtml(row.sku)}</span>${state.workspace === 'product_imagery_onboarding' ? `<button type="button" class="btn btn-secondary photo-mini-btn" onclick="focusPIOPhotographySku(event, '${escapeHtml(row.sku || '')}')">Filter</button>` : ''}</div><div class="sku-inline-actions"><a href="https://www.bynder.raymourflanigan.com/media/?resetsearch=&field=metaproperty_Product_SKU&value=${encodeURIComponent(row.sku || '')}" target="_blank" rel="noopener">Open in Bynder</a></div></div></div>
+          ${state.workspace === 'product_imagery_onboarding' ? '' : `<div class="meta-cell ${row.inactive ? 'status-inactive' : ''}"><div class="k">Product Status</div><div class="v">${escapeHtml(row.product_status)}</div></div>`}
           ${row.mattress_size ? `<div class="meta-cell"><div class="k">Mattress Size</div><div class="v">${escapeHtml(row.mattress_size)}</div></div>` : ''}
           <div class="meta-cell"><div class="k">Sales Channel</div><div class="v">${escapeHtml(row.sales_channel)}</div></div>
-          ${row.component_skus && row.component_skus.length ? `<div class="meta-cell components"><div class="k">Component SKUs</div><div class="v">${row.component_skus.map(sku => `<button type="button" class="component-sku-link" data-component-jump="${escapeHtml(sku)}" onclick="jumpToComponentSku(event, '${escapeHtml(sku)}')">${escapeHtml(sku)}</button>`).join(' ')}</div></div>` : ''}
+          ${row.features ? `<div class="meta-cell"><div class="k">Features</div><div class="v">${escapeHtml(row.features)}</div></div>` : ''}
+          ${row.dim_width || row.dim_length || row.dim_height ? `<div class="meta-cell meta-measure-boxes" style="grid-column:1 / -1;"><div class="measure-chip">L: ${escapeHtml(row.dim_length || '')}</div><div class="measure-chip">W: ${escapeHtml(row.dim_width || '')}</div><div class="measure-chip">H: ${escapeHtml(row.dim_height || '')}</div></div>` : ''}
+          ${(row.component_display_groups && row.component_display_groups.length) || (row.component_skus && row.component_skus.length) || (row.component_warnings && row.component_warnings.length) ? `
+            <div class="meta-cell components" style="grid-column:1 / -1;">
+              <div class="k">Components</div>
+              <div class="v component-chip-row">${(row.component_display_groups || []).map(group => group.product_name ? `<button type="button" class="component-sku-link component-chip" data-component-jump="${escapeHtml(group.sku)}" onclick="jumpToComponentSku(event, '${escapeHtml(group.sku)}')">${escapeHtml(group.sku)}${group.count > 1 ? ` x${group.count}` : ''} - ${escapeHtml(group.product_name)}</button>` : `<span class="component-chip">${escapeHtml(group.sku)}${group.count > 1 ? ` x${group.count}` : ''}</span>`).join('') || ((row.component_skus || []).map(sku => `<button type="button" class="component-sku-link" data-component-jump="${escapeHtml(sku)}" onclick="jumpToComponentSku(event, '${escapeHtml(sku)}')">${escapeHtml(sku)}</button>`).join(' '))}</div>
+              ${row.component_display_groups && row.component_display_groups.length ? `<details class="component-tree"><summary><span>Components</span><span class="summary-caret">▾</span></summary><div class="component-flyout"><div class="component-visual-grid">${row.component_display_groups.map(group => `<div class="component-visual-card">${group.grid_thumb ? `<img src="${escapeHtml(group.grid_thumb)}" alt="" />` : `<div style="height:86px; border-radius:8px; background:#f5f7fa;"></div>`}<div style="margin-top:6px; font-weight:700;">${escapeHtml(group.sku)}${group.count > 1 ? ` x${group.count}` : ''}</div><div>${escapeHtml(group.product_name || 'No matching SKU row on this board')}</div></div>`).join('')}</div></div></details>` : ''}
+              ${row.component_warnings && row.component_warnings.length ? `<div class="component-warning-list">${row.component_warnings.map(w => `<span class="component-warning-chip">${escapeHtml(w)}</span>`).join('')}</div>` : ''}
+            </div>` : ''}
+          ${state.workspace === 'product_imagery_onboarding' ? `<div class="meta-cell"><div class="k">Workflow Status</div><div class="v">${escapeHtml(String(row.workflow_status || '').replaceAll('_',' ').replace(/^App\s+/i,''))}</div></div>` : ''}
           <div class="meta-action-row">${renderAdditionalPhotoAction(row)}</div>
         </div>
 
@@ -8556,9 +10538,10 @@ function renderPhotoTile(asset) {
         </div>
       </div>
       <div class="photo-skus">
-        <button type="button" class="photo-skus-toggle" onclick="togglePhotoSkuDrawer('${escapeHtml(asset.id)}')">SKUs</button>
+        <button type="button" class="photo-skus-toggle" onclick="togglePhotoSkuDrawer('${escapeHtml(asset.id)}')">Tags</button>
         <div class="photo-skus-body ${isOpen ? 'open' : ''}">
-          ${asset.tags && asset.tags.length ? photoMatchingSkuButtons(asset) : '<div class="photo-line">No alphanumeric 9-character tags found.</div>'}
+          ${asset.sku_tags && asset.sku_tags.length ? photoMatchingSkuButtons(asset) : '<div class="photo-line">No alphanumeric 9-character tags found.</div>'}
+          ${asset.extra_tags && asset.extra_tags.length ? `<div class="photo-tag-cloud">${asset.extra_tags.map(tag => `<span class="photo-tag-chip">${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
         </div>
       </div>
     </div>
@@ -8573,6 +10556,12 @@ function getVisiblePhotographyItems() {
   let all = state.photography.items || [];
   if (state.photography.hideFpo) all = all.filter(x => !!x.is_final);
   if (state.photography.hideReviewed) all = all.filter(x => !x.reviewed_for_site);
+  if (state.workspace === 'product_imagery_onboarding' && state.photography.imageTypeFilter) {
+    all = all.filter(x => String(x.image_type || '') === String(state.photography.imageTypeFilter || ''));
+  }
+  if (state.workspace === 'product_imagery_onboarding' && state.photography.skuFilter) {
+    all = all.filter(x => Array.isArray(x.sku_tags || x.tags) && (x.sku_tags || x.tags).map(t => String(t || '')).includes(String(state.photography.skuFilter || '')));
+  }
   return all;
 }
 
@@ -8640,7 +10629,7 @@ function currentActivePhoto() {
 }
 
 function prepModeFromState() {
-  return state.photography.prep.mode || 'crop_1688';
+  return state.photography.prep.mode || 'original';
 }
 
 function activePhotoOffsetY(photoId) {
@@ -8691,6 +10680,7 @@ function prepModeOutputSize(mode, active=null) {
   const photo = active || currentActivePhoto();
   const srcW = Number(photo?.width || 0) || 0;
   const srcH = Number(photo?.height || 0) || 0;
+  if (m === 'original') return photo ? `${photo.width || ''}x${photo.height || ''}` : 'Original';
   if (m === 'crop_2200' || m === 'pad_tb_2200') return '3000x2200';
   if (m === 'crop_square') {
     const side = Math.min(srcW || 1000, srcH || 1000) || 1000;
@@ -8724,6 +10714,9 @@ function prepFeasibilityInfo(photo, mode) {
   const info = { kind:'good', title:'Ready', detail:'', badge:'Native crop', previewClass:'', icon:'OK' };
   if (!srcW || !srcH) {
     return { kind:'warn', title:'Source size unavailable', detail:'The image dimensions are missing, so crop reliability cannot be confirmed.', badge:'Check source', previewClass:'warn', icon:'!' };
+  }
+  if (mode === 'original') {
+    return { kind:'notice', title:'Original size', detail:`Source image: ${srcW}x${srcH}. No crop, resize, or padding will be applied.`, badge:`${srcW}x${srcH}`, previewClass:'notice', icon:'i' };
   }
   if (mode === 'crop_square') {
     const side = Math.min(srcW, srcH);
@@ -8779,7 +10772,7 @@ function renderPhotoPrepDrawer() {
   const mode = prepModeFromState();
   const prepStatus = renderPrepFeasibility(active, mode);
   const preview = state.photography.previewUrl
-    ? `<div class="photo-prep-preview-drag" draggable="${state.mode === 'assets' ? 'true' : 'false'}" ondragstart="startPreparedPreviewDrag(event)" ondragend="endPreparedPreviewDrag(event)">${prepStatus.badge}<img src="${escapeHtml(state.photography.previewUrl)}" alt="Preview" draggable="false" /></div>`
+    ? `<div class="photo-prep-preview-drag" draggable="${state.mode === 'assets' ? 'true' : 'false'}" ondragstart="startPreparedPreviewDrag(event)" ondragend="endPreparedPreviewDrag(event)">${prepStatus.badge}<div class="photo-prep-preview-canvas"><img src="${escapeHtml(state.photography.previewUrl)}" alt="Preview" draggable="false" /></div></div>`
     : `<div class="photo-empty">Preview loading...</div>`;
   const swatchControls = `
     <div class="photo-focus-pad photo-focus-pad-stack" aria-label="Swatch crop nudger">
@@ -8819,15 +10812,16 @@ function renderPhotoPrepDrawer() {
         <div class="photo-prep-actions">
           <button type="button" class="btn btn-secondary photo-mini-btn" onclick="clearPhotoSelection()">Clear selection</button>
           <button type="button" class="btn btn-primary photo-mini-btn" onclick="downloadPreparedPhotos(false)">Download modified image</button>
-          ${state.mode === 'assets' && active.from_board ? `<button type="button" class="btn btn-secondary photo-mini-btn" onclick="addPreparedAsNewVersion()">Add as new version</button>` : ''}
+          ${state.mode === 'assets' && active.from_board ? `<button type="button" class="btn btn-secondary photo-mini-btn ${state.photography.prep.addingVersion ? 'btn-reload-flashing' : ''}" ${state.photography.prep.addingVersion ? 'disabled' : ''} onclick="addPreparedAsNewVersion()">${state.photography.prep.addingVersion ? 'Adding...' : 'Add as new version'}</button>` : ''}
         </div>
       </div>
       <div class="photo-prep-controls">
         <div class="photo-prep-toolbar">
           <div class="photo-prep-note"><strong>Output size:</strong> ${escapeHtml(prepModeOutputSize(mode, active))}</div>
           <div class="photo-prep-left">
-            <div class="photo-prep-options">
+            <details class="photo-prep-details" ${state.photography.prep.optionsOpen !== false ? 'open' : ''} ontoggle="setPrepOptionsOpen(this.open)"><summary><span>Crop options</span><span class="photo-prep-summary-caret">▾</span></summary><div class="photo-prep-options">
               <label title="Mirrors the image left-to-right before any crop or padding is applied. Use this to reverse orientation while preserving scale and aspect ratio."><input type="checkbox" ${state.photography.prep.flip ? 'checked' : ''} onchange="setPrepFlip(this.checked)" /> Flip horizontally</label>
+              <label title="Keeps the original image exactly as-is with no crop, resize, or padding."><input type="radio" name="prepMode" value="original" ${mode==='original'?'checked':''} onchange="setPrepMode(this.value)" /> Original size</label>
               <label title="Scales the image to cover a 3000x1688 frame and crops away excess area. No white padding is added."><input type="radio" name="prepMode" value="crop_1688" ${mode==='crop_1688'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x1688</label>
               <label title="Scales the image to cover a 3000x2200 frame and crops away excess area. Good when you need a taller canvas with no padding."><input type="radio" name="prepMode" value="crop_2200" ${mode==='crop_2200'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x2200</label>
               <label title="Resizes proportionally to 1688 px tall, then trims equal amounts from the left and right to land at 3000 px wide."><input type="radio" name="prepMode" value="crop_remove_sides_1688" ${mode==='crop_remove_sides_1688'?'checked':''} onchange="setPrepMode(this.value)" /> Crop to 3000x1688 and remove sides</label>
@@ -8924,7 +10918,7 @@ function modifyBoardAsset(event, assetId) {
   state.photography.activeId = found.id;
   if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl);
   state.photography.previewUrl = '';
-  state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
+  state.photography.prep = { flip: false, mode: 'original', offsetYOverrides: {}, offsetXOverrides: {}, optionsOpen: true };
   renderPhotographyPanel();
   refreshPhotoPreview();
 }
@@ -8997,6 +10991,8 @@ async function addPreparedAsNewVersion() {
     alert('Add as new version is only available in Update assets mode.');
     return;
   }
+  state.photography.prep.addingVersion = true;
+  renderPhotographyPanel();
   try {
     const resp = await fetch('/api/prepared_add_as_new_version', {
       method:'POST',
@@ -9128,10 +11124,18 @@ function togglePhotoSelection(event, photoId) {
 function setActivePhoto(photoId) { state.photography.activeId = photoId; renderPhotographyPanel(); refreshPhotoPreview(); }
 function clearPhotoSelection() { state.photography.selectedIds=[]; state.photography.activeId=''; if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl); state.photography.previewUrl=''; renderPhotographyPanel(); }
 function setPrepFlip(v) { state.photography.prep.flip = !!v; refreshPhotoPreview(); }
+function setPrepOptionsOpen(isOpen) {
+  state.photography.prep.optionsOpen = !!isOpen;
+}
+function keepPrepOptionsOpen() {
+  state.photography.prep.optionsOpen = true;
+}
 function setPrepMode(v) {
-  state.photography.prep.mode = v || 'crop_1688';
+  state.photography.prep.mode = v || 'original';
   state.photography.prep.offsetYOverrides = state.photography.prep.offsetYOverrides || {};
   state.photography.prep.offsetXOverrides = state.photography.prep.offsetXOverrides || {};
+  state.photography.prep.optionsOpen = false;
+  renderPhotographyPanel();
   refreshPhotoPreview();
 }
 function cropStepYForActive() {
@@ -9142,11 +11146,11 @@ function cropStepYForActive() {
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return 50;
   if (mode === 'pick_swatch') {
-    return Math.max(5, Math.round(Math.max(0, srcH - Math.min(163, srcH)) * 0.04) || 12);
+    return Math.max(8, Math.round(Math.max(0, srcH - Math.min(163, srcH)) * 0.04) || 12);
   }
   const outH = mode === 'crop_2200' ? 2200 : 1688;
   const scaledH = Math.round(srcH * (3000 / srcW));
-  return Math.max(20, Math.round(Math.max(0, scaledH - outH) * 0.05) || 40);
+  return Math.max(10, Math.round(Math.max(0, scaledH - outH) * 0.025) || 14);
 }
 function nudgeCropY(direction) {
   const active = currentActivePhoto();
@@ -9161,7 +11165,9 @@ function nudgeCropY(direction) {
     const current = activePhotoOffsetY(active.id);
     const next = Math.max(0, Math.min(maxOff, current + (Number(direction || 0) * cropStepYForActive())));
     state.photography.prep.offsetYOverrides[active.id] = next;
-    refreshPhotoPreview();
+  keepPrepOptionsOpen();
+  renderPhotographyPanel();
+  refreshPhotoPreview();
     return;
   }
   if (!(mode === 'crop_1688' || mode === 'crop_2200')) return;
@@ -9171,12 +11177,14 @@ function nudgeCropY(direction) {
   const current = activePhotoOffsetY(active.id);
   const next = Math.max(0, Math.min(maxOff, current + (Number(direction || 0) * cropStepYForActive())));
   state.photography.prep.offsetYOverrides[active.id] = next;
+  keepPrepOptionsOpen();
+  renderPhotographyPanel();
   refreshPhotoPreview();
 }
-function setCropToTop() { const active = currentActivePhoto(); if (!active) return; state.photography.prep.offsetYOverrides[active.id] = 0; refreshPhotoPreview(); }
-function setCropToBottom() { const active = currentActivePhoto(); if (!active) return; const mode = prepModeFromState(); const srcW = Number(active.width || 0) || 0; const srcH = Number(active.height || 0) || 0; if (!srcW || !srcH) return; if (mode === 'pick_swatch') { state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); refreshPhotoPreview(); return; } const outH = mode === 'crop_2200' ? 2200 : 1688; const scaledH = Math.round(srcH * (3000 / srcW)); state.photography.prep.offsetYOverrides[active.id] = Math.max(0, scaledH - outH); refreshPhotoPreview(); }
-function setSwatchCropToTop() { const active = currentActivePhoto(); if (!active) return; state.photography.prep.offsetYOverrides[active.id] = 0; refreshPhotoPreview(); }
-function setSwatchCropToBottom() { const active = currentActivePhoto(); if (!active) return; const srcH = Number(active.height || 0) || 0; if (!srcH) return; state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); refreshPhotoPreview(); }
+function setCropToTop() { const active = currentActivePhoto(); if (!active) return; state.photography.prep.offsetYOverrides[active.id] = 0; keepPrepOptionsOpen(); renderPhotographyPanel(); refreshPhotoPreview(); }
+function setCropToBottom() { const active = currentActivePhoto(); if (!active) return; const mode = prepModeFromState(); const srcW = Number(active.width || 0) || 0; const srcH = Number(active.height || 0) || 0; if (!srcW || !srcH) return; if (mode === 'pick_swatch') { state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); keepPrepOptionsOpen(); renderPhotographyPanel(); refreshPhotoPreview(); return; } const outH = mode === 'crop_2200' ? 2200 : 1688; const scaledH = Math.round(srcH * (3000 / srcW)); state.photography.prep.offsetYOverrides[active.id] = Math.max(0, scaledH - outH); keepPrepOptionsOpen(); renderPhotographyPanel(); refreshPhotoPreview(); }
+function setSwatchCropToTop() { const active = currentActivePhoto(); if (!active) return; state.photography.prep.offsetYOverrides[active.id] = 0; keepPrepOptionsOpen(); renderPhotographyPanel(); refreshPhotoPreview(); }
+function setSwatchCropToBottom() { const active = currentActivePhoto(); if (!active) return; const srcH = Number(active.height || 0) || 0; if (!srcH) return; state.photography.prep.offsetYOverrides[active.id] = Math.max(0, srcH - Math.min(163, srcH)); keepPrepOptionsOpen(); renderPhotographyPanel(); refreshPhotoPreview(); }
 function cropStepXForActive() {
   const active = currentActivePhoto();
   if (!active) return 50;
@@ -9184,10 +11192,10 @@ function cropStepXForActive() {
   const srcH = Number(active.height || 0) || 0;
   if (!srcW || !srcH) return 50;
   if (prepModeFromState() === 'pick_swatch') {
-    return Math.max(5, Math.round(Math.max(0, srcW - Math.min(163, srcW)) * 0.04) || 12);
+    return Math.max(6, Math.round(Math.max(0, srcW - Math.min(163, srcW)) * 0.02) || 10);
   }
   const side = Math.min(srcW, srcH);
-  return Math.max(20, Math.round(Math.max(0, srcW - side) * 0.05) || 40);
+  return Math.max(10, Math.round(Math.max(0, srcW - side) * 0.025) || 14);
 }
 function nudgeCropX(direction) {
   const active = currentActivePhoto();
@@ -9203,12 +11211,16 @@ function nudgeCropX(direction) {
   const current = activePhotoOffsetX(active.id);
   const next = Math.max(0, Math.min(maxOff, current + (Number(direction || 0) * cropStepXForActive())));
   state.photography.prep.offsetXOverrides[active.id] = next;
+  keepPrepOptionsOpen();
+  renderPhotographyPanel();
   refreshPhotoPreview();
 }
 function setCropToLeft() {
   const active = currentActivePhoto();
   if (!active) return;
   state.photography.prep.offsetXOverrides[active.id] = 0;
+  keepPrepOptionsOpen();
+  renderPhotographyPanel();
   refreshPhotoPreview();
 }
 function setCropToRight() {
@@ -9256,6 +11268,7 @@ function currentPreparedPreviewPayload() {
   if (!active) return null;
   return {
     media_id: active.id,
+    source_media_id: active.id,
     prep_mode: prepModeFromState(),
     flip: !!state.photography.prep.flip,
     offset_y: activePhotoOffsetY(active.id),
@@ -9337,18 +11350,31 @@ function renderPhotographyPanel() {
   if (hideFpoToggle) hideFpoToggle.checked = !!photo.hideFpo;
   if (hideReviewedToggle) hideReviewedToggle.checked = !!photo.hideReviewed;
 
+  const isPIO = state.workspace === 'product_imagery_onboarding';
+  const collectionOptions = (state.bynderCollections || []).map(c => `<option value="${escapeHtml(c.name)}"></option>`).join('');
+  const loadedTypes = Array.from(new Set((photo.items || []).map(x => String(x.image_type || '').trim()).filter(Boolean))).sort((a,b)=>a.localeCompare(b));
+  const loadedSkuOptions = Array.from(new Set((photo.items || []).flatMap(x => (x.sku_tags || x.tags || []).map(t => String(t || '').trim()).filter(Boolean)))).sort((a,b)=>a.localeCompare(b));
+  const bynderCollectionInputDisabled = !!(state.bynderCollectionsLoading || !(state.bynderCollections || []).length);
+  const bynderCollectionPlaceholder = state.bynderCollectionsLoading ? 'Loading Bynder collection options...' : ((state.bynderCollections || []).length ? 'Search Bynder collection' : 'Loading Bynder collection options...');
+  const pioToolbar = isPIO ? `<div class="photo-pio-toolbar"><div class="photo-pio-row"><input type="text" id="pioPhotoCollectionInput" list="pioPhotoCollectionOptions" placeholder="${escapeHtml(bynderCollectionPlaceholder)}" value="${escapeHtml(photo.collectionSearch || '')}" ${bynderCollectionInputDisabled ? 'disabled' : ''} /><datalist id="pioPhotoCollectionOptions">${collectionOptions}</datalist><button type="button" id="pioLoadCollectionBtn" class="btn btn-secondary photo-mini-btn ${(photo.collectionLoading || state.bynderCollectionsLoading) ? 'btn-reload-flashing' : ''}" ${(photo.collectionLoading || state.bynderCollectionsLoading || bynderCollectionInputDisabled) ? 'disabled' : ''} onclick="loadPIOPhotographyCollection()">${(photo.collectionLoading || state.bynderCollectionsLoading) ? 'Loading Bynder collection...' : 'Load Bynder collection'}</button></div><div class="photo-pio-row filters"><label class="small-inline">Image Type</label><select id="pioPhotoImageTypeFilter" class="pio-filter-select" onchange="setPIOPhotoImageTypeFilter(this.value)"><option value="">All image types</option>${loadedTypes.map(v=>`<option value="${escapeHtml(v)}" ${String(photo.imageTypeFilter||'')===String(v)?'selected':''}>${escapeHtml(v)}</option>`).join('')}</select><label class="small-inline">SKU</label><select id="pioPhotoSkuFilter" class="pio-filter-select" onchange="setPIOPhotoSkuFilter(this.value)"><option value="">All tagged SKUs</option>${loadedSkuOptions.map(v=>`<option value="${escapeHtml(v)}" ${String(photo.skuFilter||'')===String(v)?'selected':''}>${escapeHtml(v)}</option>`).join('')}</select>${photo.skuFilter ? `<button type="button" class="btn btn-secondary photo-mini-btn" onclick="setPIOPhotoSkuFilter('')">Clear</button>` : ''}</div></div>` : '';
   if (!photo.items.length) {
-    sub.textContent = 'Reference panel for available product photography in the selected collection/color.';
+    sub.textContent = isPIO ? 'Search for a Bynder collection, load it, then filter its assets by Image Type or tagged SKU.' : 'Reference panel for available product photography in the selected collection/color.';
     const standaloneDrawer = renderSetDimDrawer();
-    body.innerHTML = `${standaloneDrawer || ''}${standaloneDrawer ? '' : `<div class="photo-empty">Pull available product photography from a color header to load this panel.</div>`}`;
+    body.innerHTML = `${pioToolbar}${standaloneDrawer || ''}${standaloneDrawer ? '' : `<div class="photo-empty">${isPIO ? 'Search for a Bynder collection and click Load collection.' : 'Pull available product photography from a color header to load this panel.'}</div>`}`;
     return;
   }
 
   const visibleItems = getVisiblePhotographyItems();
   if (!visibleItems.length) {
-    sub.textContent = `${photo.items.length} photography asset(s) for ${photo.color}.`;
+    const filterBits = [];
+    if (photo.imageTypeFilter) filterBits.push(`Image Type: ${photo.imageTypeFilter}`);
+    if (photo.skuFilter) filterBits.push(`SKU: ${photo.skuFilter}`);
+    if (photo.hideFpo) filterBits.push('Hide FPO');
+    if (photo.hideReviewed) filterBits.push('Hide reviewed');
+    const filterSummary = filterBits.length ? ` Active filters: ${filterBits.join(' | ')}.` : '';
+    sub.textContent = `${photo.items.length} photography asset(s) loaded. None match the active filters.${filterSummary}`;
     const standaloneDrawer = renderSetDimDrawer();
-    body.innerHTML = `${standaloneDrawer || ''}<div class="photo-empty">All loaded photography is currently hidden by the active Photography filters.</div>`;
+    body.innerHTML = `${pioToolbar}${standaloneDrawer || ''}<div class="photo-empty" style="border:2px dashed #c96b6b; background:#fff4f4; color:#7c2830; font-weight:700;">No loaded photography matches the current filter.${photo.skuFilter ? `<br><span style="font-weight:600;">Filtered SKU: ${escapeHtml(photo.skuFilter)}</span>` : ''}${filterBits.length ? `<br><span style="font-weight:500;">${escapeHtml(filterBits.join(' | '))}</span>` : ''}</div>`;
     return;
   }
 
@@ -9356,9 +11382,10 @@ function renderPhotographyPanel() {
   const activeFilters = [];
   if (photo.hideFpo) activeFilters.push('Hide FPO');
   if (photo.hideReviewed) activeFilters.push('Hide reviewed');
-  sub.textContent = hiddenCount ? `${visibleItems.length} photography asset(s) shown for ${photo.color}. ${hiddenCount} hidden by ${activeFilters.join(' and ')}.` : `${visibleItems.length} photography asset(s) for ${photo.color}.`;
+  const photoLabel = photo.color || photo.collectionSearch || 'loaded collection';
+  sub.textContent = hiddenCount ? `${visibleItems.length} photography asset(s) shown for ${photoLabel}. ${hiddenCount} hidden by ${activeFilters.join(' and ')}.` : `${visibleItems.length} photography asset(s) for ${photoLabel}.`;
   const prepDrawer = renderSetDimDrawer() || renderPhotoPrepDrawer();
-  body.innerHTML = `${prepDrawer || ''}<div class="photo-grid">${visibleItems.map(renderPhotoTile).join('')}</div>`;
+  body.innerHTML = `${pioToolbar}${prepDrawer || ''}<div class="photo-grid">${visibleItems.map(renderPhotoTile).join('')}</div>`;
   bindPhotographyDnD();
 }
 
@@ -9377,10 +11404,13 @@ function loadPhotographyPayloadToState(data, fallbackColor='') {
   state.photography.activeId = '';
   if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl);
   state.photography.previewUrl = '';
-  state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
+  state.photography.prep = { flip: false, mode: 'original', offsetYOverrides: {}, offsetXOverrides: {} };
   state.photography.hideFpo = false;
   state.photography.hideReviewed = false;
   state.photography.reviewingIds = {};
+  state.photography.imageTypeFilter = '';
+  state.photography.skuFilter = '';
+  state.photography.collectionSearch = (data && data.collection_label) || state.photography.collectionSearch || '';
   state.additionalPhotoAvailabilityBySku = {};
   state.additionalPhotoCheckInFlight = {};
   for (const section of state.board.color_sections || []) {
@@ -9426,13 +11456,100 @@ function clearPhotographyPanel() {
   if (state.photography.previewUrl && state.photography.previewUrl.startsWith('blob:')) URL.revokeObjectURL(state.photography.previewUrl);
   state.photography.previewUrl='';
   clearSetDimSelection();
-  state.photography.prep = { flip: false, mode: 'crop_1688', offsetYOverrides: {}, offsetXOverrides: {} };
+  state.photography.prep = { flip: false, mode: 'original', offsetYOverrides: {}, offsetXOverrides: {} };
   state.photography.hideFpo = false;
   state.photography.hideReviewed = false;
   state.photography.reviewingIds = {};
+  state.photography.imageTypeFilter = '';
+  state.photography.skuFilter = '';
   state.additionalPhotoAvailabilityBySku = {};
   state.additionalPhotoCheckInFlight = {};
   renderPhotographyPanel();
+}
+
+async function ensureBynderCollectionsLoaded(force=false) {
+  if (state.bynderCollectionsLoading) return;
+  if (!force && (state.bynderCollections || []).length) return;
+  state.bynderCollectionsLoading = true;
+  const noticeId = 'bynder-collection-options-loading';
+  upsertAppNotice(noticeId, 'Loading Bynder collection options...', 'notice', '', false);
+  renderPhotographyPanel();
+  try {
+    const resp = await fetch('/api/bynder/collections');
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not load Bynder collections');
+    state.bynderCollections = data.collections || [];
+    upsertAppNotice(noticeId, `Bynder collection options loaded. (${(state.bynderCollections || []).length} collections)`, 'success', '', true);
+  } catch (err) {
+    console.warn(err);
+    upsertAppNotice(noticeId, err.message || 'Could not load Bynder collection options.', 'error', '', true);
+  } finally {
+    state.bynderCollectionsLoading = false;
+    renderPhotographyPanel();
+  }
+}
+
+function setPIOPhotoImageTypeFilter(value) {
+  state.photography.imageTypeFilter = String(value || '');
+  refreshActivePhotoSelectionAfterFilter();
+  renderPhotographyPanel();
+}
+
+function setPIOPhotoSkuFilter(value) {
+  state.photography.skuFilter = String(value || '');
+  refreshActivePhotoSelectionAfterFilter();
+  renderPhotographyPanel();
+}
+
+function focusPIOPhotographySku(event, sku) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  const value = String(sku || '').trim();
+  if (!value) return;
+  state.photography.expanded = true;
+  state.photography.skuFilter = value;
+  refreshActivePhotoSelectionAfterFilter();
+  renderPhotographyPanel();
+}
+
+async function loadPIOPhotographyCollection() {
+  const input = document.getElementById('pioPhotoCollectionInput');
+  const label = String((input && input.value) || state.photography.collectionSearch || '').trim();
+  if (!label) { alert('Enter a Bynder collection name first.'); return; }
+  await ensureBynderCollectionsLoaded(false);
+  const options = state.bynderCollections || [];
+  let match = options.find(c => String(c.name || '').toLowerCase() === label.toLowerCase());
+  if (!match) {
+    const matching = options.filter(c => String(c.name || '').toLowerCase().includes(label.toLowerCase()));
+    if (matching.length === 1) match = matching[0];
+  }
+  if (!match) { alert('Could not find that Bynder collection. Choose one from the suggestions.'); return; }
+  state.photography.collectionSearch = match.name || label;
+  state.photography.collectionLoading = true;
+  const noticeId = state.photography.collectionLoadNoticeId || `pio-collection-load-${Date.now()}`;
+  state.photography.collectionLoadNoticeId = noticeId;
+  upsertAppNotice(noticeId, `Bynder collection photography is loading for ${match.name || label}...`, 'notice', '', false);
+  renderPhotographyPanel();
+  try {
+    const resp = await fetch('/api/onboarding/load_collection_photography', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ collection_id: match.id, collection_name: match.name })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Could not load collection assets');
+    loadPhotographyPayloadToState(data, match.name || label);
+    const itemCount = Array.isArray(data.items) ? data.items.length : 0;
+    upsertAppNotice(noticeId, `Bynder collection photography loaded for ${match.name || label}. (${itemCount} asset${itemCount === 1 ? '' : 's'})`, 'success', '', true);
+  } catch (err) {
+    upsertAppNotice(noticeId, err.message || String(err), 'error', '', true);
+    alert(err.message || String(err));
+  } finally {
+    state.photography.collectionLoading = false;
+    renderPhotographyPanel();
+  }
 }
 
 function bindPhotographyDnD() {
@@ -9506,6 +11623,7 @@ async function applyWallArtSizingGuide(event, rowId) {
 }
 
 function renderBoard() {
+  try { saveUIState(); } catch (err) {}
   const host = document.getElementById('boardHost');
   const laneScrolls = snapshotLaneScrolls();
   const changedSet = changedAssetIds();
@@ -9530,11 +11648,12 @@ function renderBoard() {
   renderModeUI();
   renderNotifications();
   renderPhotographyPanel();
+  updateBulkFixSiloControls();
   host.innerHTML = (state.board.color_sections || []).map(section => {
     const visibleRows = (section.rows || []).filter(row => !(state.hideInactive && row.inactive));
     if (!visibleRows.length) return '';
     const collapsed = !!state.collapsedColors[section.color];
-    const allInactive = (section.rows || []).length > 0 && (section.rows || []).every(r => r.inactive);
+    const allInactive = state.workspace === 'product_imagery_onboarding' ? false : ((section.rows || []).length > 0 && (section.rows || []).every(r => r.inactive));
     return `
     <div class="color-section" id="color-${escapeHtml(section.color).replace(/[^A-Za-z0-9_-]/g,'_')}">
       <div class="color-header" data-color-toggle="${escapeHtml(section.color)}">
@@ -9620,7 +11739,8 @@ function assetIsCleanupTotalFillCandidate(asset, row) {
   const warningText = String((asset && asset.size_warning) || '').trim();
   if (!/needs total fill/i.test(warningText)) return false;
   const slotKey = String((asset && (asset.slot_key || asset.current_position)) || '').trim();
-  if (!['SKU_grid', 'SKU_100', 'SKU_200'].includes(slotKey)) return false;
+  if (slotKey === 'SKU_grid' || slotKey === 'SKU_100') return true;
+  if (slotKey !== 'SKU_200') return false;
   const salesChannel = String(((row && row.sales_channel) || (asset && asset.sales_channel) || '')).trim().toLowerCase();
   return salesChannel === 'full_line';
 }
@@ -9630,8 +11750,8 @@ function computeClientChallengeIssueCount() {
   let total = 0;
   for (const section of state.board.color_sections || []) {
     for (const row of section.rows || []) {
-      if ((row.product_status || '').toLowerCase() !== 'active') continue;
-      const liveAssets = (row.assets || []).filter(a => !a.is_marked_for_deletion);
+      if (!rowCountsAsActive(row)) continue;
+      const liveAssets = (row.assets || []).filter(a => !a.is_marked_for_deletion && !a.is_empty_slot);
       const hasGrid = liveAssets.some(a => a.slot_key === 'SKU_grid' || String(a.current_position || '').endsWith('_grid'));
       const has100 = liveAssets.some(a => a.slot_key === 'SKU_100' || String(a.current_position || '').endsWith('_100'));
       const hasSwatch = liveAssets.some(a => a.slot_key === 'SKU_swatch' || String(a.current_position || '').endsWith('_swatch'));
@@ -9668,6 +11788,108 @@ function computeClientChallengeIssueCount() {
     }
   }
   return total;
+}
+
+
+function assetNeedsSiloFixForBulk(asset) {
+  if (!asset || asset.pending_upload || asset.is_marked_for_deletion) return false;
+  const psaType = String(asset.psa_image_type || '').trim().toLowerCase();
+  const slotKey = String(asset.slot_key || '').trim();
+  const lane = String(asset.lane || '').trim();
+  const isDimensionLike = psaType === 'dimensions_diagram_image' || slotKey === 'SKU_dimension' || lane === 'special';
+  const isSiloLike = psaType === 'silo' || isDimensionLike;
+  if (!isSiloLike) return false;
+  const warningText = String(asset.size_warning || '').trim();
+  if (!warningText || /needs total fill/i.test(warningText)) return false;
+  return slotKey === 'SKU_grid' || lane === 'core' || slotKey === 'SKU_dimension';
+}
+
+function assetIsBulkFixSiloTarget(asset) {
+  return !!state.bulkFixSiloMode && assetNeedsSiloFixForBulk(asset);
+}
+
+function getBulkFixSiloTargets() {
+  const targets = [];
+  if (!state.board || state.workspace !== 'product_imagery_onboarding') return targets;
+  for (const section of state.board.color_sections || []) {
+    for (const row of section.rows || []) {
+      for (const asset of row.assets || []) {
+        if (assetNeedsSiloFixForBulk(asset)) {
+          const slotKey = String(asset.slot_key || '');
+          targets.push({
+            media_id: String(asset.id || ''),
+            row_id: String(row.row_id || row.sku || ''),
+            fix_type: slotKey === 'SKU_grid' ? 'grid' : (slotKey === 'SKU_dimension' ? 'dim' : 'silo')
+          });
+        }
+      }
+    }
+  }
+  return targets.filter(t => t.media_id);
+}
+
+function updateBulkFixSiloControls() {
+  const wrap = document.getElementById('bulkFixSiloWrap');
+  const btn = document.getElementById('bulkFixSiloBtn');
+  const goBtn = document.getElementById('bulkFixSiloGoBtn');
+  if (!wrap || !btn || !goBtn) return;
+  const enabled = !!state.board && state.workspace === 'product_imagery_onboarding' && state.mode === 'assets';
+  const targets = getBulkFixSiloTargets();
+  wrap.style.display = enabled ? 'inline-flex' : 'none';
+  if (!enabled) return;
+  btn.textContent = state.bulkFixSiloMode ? `Bulk fix silo (${targets.length})` : 'Bulk fix silo';
+  btn.classList.toggle('is-active', !!state.bulkFixSiloMode);
+  goBtn.style.display = state.bulkFixSiloMode && targets.length ? 'inline-flex' : 'none';
+  goBtn.disabled = state.bulkFixSiloRunning || !targets.length;
+  goBtn.classList.toggle('btn-reload-flashing', !!state.bulkFixSiloRunning);
+  goBtn.textContent = state.bulkFixSiloRunning ? 'Proceeding...' : 'Proceed';
+  btn.disabled = state.bulkFixSiloRunning;
+}
+
+function toggleBulkFixSiloMode() {
+  state.bulkFixSiloMode = !state.bulkFixSiloMode;
+  renderBoard();
+}
+
+async function runBulkFixSilo() {
+  const targets = getBulkFixSiloTargets();
+  if (!targets.length) {
+    addAppNotice('No silo assets need bulk fixing on this board right now.', 'notice');
+    state.bulkFixSiloMode = false;
+    renderBoard();
+    return;
+  }
+  state.bulkFixSiloRunning = true;
+  updateBulkFixSiloControls();
+  const noticeId = upsertAppNotice('bulk-fix-silo', `Bulk silo fix is running for ${targets.length} asset${targets.length === 1 ? '' : 's'}...`, 'notice', '', false);
+  const dirtyRowIds = [];
+  let successCount = 0;
+  try {
+    for (const target of targets) {
+      const resp = await fetch('/api/fix_asset_version', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ mode: state.mode, media_id: target.media_id, fix_type: target.fix_type })
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || `Bulk silo fix failed for ${target.media_id}`);
+      state.board = data.board || state.board;
+      state.summary = data.summary || state.summary;
+      if (data.asset_mode_refresh_pending) state.assetModeDirty = true;
+      (data.dirty_row_ids || []).forEach(id => { if (id) dirtyRowIds.push(id); });
+      successCount += 1;
+      upsertAppNotice(noticeId, `Bulk silo fix is running... ${successCount}/${targets.length} complete.`, 'notice', '', false);
+    }
+    markAssetModeDirtyRows(dirtyRowIds);
+    state.bulkFixSiloMode = false;
+    upsertAppNotice(noticeId, `Bulk silo fix queued ${successCount} asset${successCount === 1 ? '' : 's'} for new versions.`, 'success', 'Click <button type="button" class="inline-link" data-reload-board>Reload</button> to see the updates.', true);
+    renderBoard();
+  } catch (err) {
+    upsertAppNotice(noticeId, err.message || String(err), 'error', '', true);
+  } finally {
+    state.bulkFixSiloRunning = false;
+    updateBulkFixSiloControls();
+  }
 }
 
 function launchIssueZeroBurst(fromEl) {
@@ -9767,9 +11989,9 @@ function computeMissingNotices() {
 
   for (const section of state.board.color_sections || []) {
     for (const row of section.rows || []) {
-      if ((row.product_status || '').toLowerCase() !== 'active') continue;
+      if (!rowCountsAsActive(row)) continue;
 
-      const liveAssets = (row.assets || []).filter(a => !a.is_marked_for_deletion);
+      const liveAssets = (row.assets || []).filter(a => !a.is_marked_for_deletion && !a.is_empty_slot);
       const hasGrid = liveAssets.some(a => a.slot_key === 'SKU_grid' || (a.current_position || '').endsWith('_grid'));
       const has100 = liveAssets.some(a => a.slot_key === 'SKU_100' || (a.current_position || '').endsWith('_100'));
       const hasSwatch = liveAssets.some(a => a.slot_key === 'SKU_swatch' || (a.current_position || '').endsWith('_swatch'));
@@ -9852,6 +12074,7 @@ function renderNotifications() {
   const clearBtn = document.getElementById('clearNotificationsBtn');
   renderCollectionStatus();
   const notices = [
+    ...((state.preflightNotices || []).slice()),
     ...computeMissingNotices(),
     ...((state.appNotices || []).slice().reverse())
   ];
@@ -9930,8 +12153,8 @@ function findFirstMissingCriticalSlot(slotKey) {
   if (!state.board) return null;
   for (const section of state.board.color_sections || []) {
     for (const row of section.rows || []) {
-      if ((row.product_status || '').toLowerCase() !== 'active') continue;
-      const liveAssets = (row.assets || []).filter(a => !a.is_marked_for_deletion);
+      if (!rowCountsAsActive(row)) continue;
+      const liveAssets = (row.assets || []).filter(a => !a.is_marked_for_deletion && !a.is_empty_slot);
       const hasSlot = slotKey === 'SKU_grid'
         ? liveAssets.some(a => a.slot_key === 'SKU_grid' || (a.current_position || '').endsWith('_grid'))
         : liveAssets.some(a => a.slot_key === slotKey || (a.current_position || '').endsWith(`_${slotKey.replace('SKU_', '')}`));
@@ -10065,6 +12288,7 @@ async function undoPendingCopy(event, assetId, targetPos, sourceMediaId='', targ
       body: JSON.stringify({
         asset_id: assetId || '',
         target_pos: targetPos || '',
+        media_id: sourceMediaId || '',
         source_media_id: sourceMediaId || '',
         target_sku: targetSku || ''
       })
@@ -10094,7 +12318,7 @@ function renderSummary() {
   const body = document.getElementById('summaryBody');
   const summary = state.summary || {'Position changes': [], 'Marked for deletion': [], 'Restored from deletion': []};
   body.classList.toggle('open', state.summaryOpen);
-  document.getElementById('toggleSummaryBtn').textContent = state.summaryOpen ? 'Collapse' : 'Expand';
+  document.getElementById('toggleSummaryBtn').textContent = state.summaryOpen ? '▴' : '▾';
   body.innerHTML = Object.entries(summary).map(([group, items]) => `
     <div class="summary-group">
       <h4>${escapeHtml(group)} (${items.length})</h4>
@@ -10125,6 +12349,21 @@ function renderSummary() {
 function addAppNotice(text, kind='success', html='') {
   const id = `notice-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
   state.appNotices = [{id, kind, text, html, dismissible:true}, ...(state.appNotices || [])].slice(0, 12);
+  renderNotifications();
+  return id;
+}
+
+function upsertAppNotice(id, text, kind='notice', html='', dismissible=false) {
+  const noticeId = String(id || `notice-${Date.now()}-${Math.random().toString(36).slice(2,8)}`);
+  const others = (state.appNotices || []).filter(n => String(n.id || '') !== noticeId);
+  state.appNotices = [{id: noticeId, kind, text, html, dismissible: !!dismissible}, ...others].slice(0, 12);
+  renderNotifications();
+  return noticeId;
+}
+
+function removeAppNotice(id) {
+  if (!id) return;
+  state.appNotices = (state.appNotices || []).filter(n => String(n.id || '') !== String(id || ''));
   renderNotifications();
 }
 
@@ -10216,6 +12455,7 @@ function bindBoardDnD() {
               ...preparedPayload
             })
           });
+          slot.classList.add('upload-target-pending');
           const data = await resp.json();
           if (!resp.ok) throw new Error(data.error || 'Prepared image upload failed');
           state.board = data.board;
@@ -10226,6 +12466,54 @@ function bindBoardDnD() {
           if (data.notice && (data.notice.text || data.notice.html)) addAppNotice(data.notice.text || '', data.notice.kind || 'success', data.notice.html || '');
         } catch (err) {
           alert(err.message || String(err));
+        } finally {
+          slot.classList.remove('upload-target-pending');
+        }
+        return;
+      }
+
+      const sourceId = e.dataTransfer.getData('text/plain') || state.photoDragId || (state.dragging && state.dragging.assetId);
+      const sourcePhoto = getPhotoById(sourceId);
+      if (sourcePhoto && state.mode !== 'assets') {
+        alert('Switch to Update assets mode before dragging photography onto the board.');
+        return;
+      }
+      if (sourcePhoto && state.mode === 'assets') {
+        let psaImageTypeOverride = resolvePreparedPhotoPsaImageType(sourcePhoto);
+        if (psaImageTypeOverride === null) return;
+        try {
+          const resp = await fetch('/api/prepared_drop_upload', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({
+              row_id: rowId || '',
+              target_lane: targetLane || '',
+              target_slot: targetSlot || '',
+              mode: state.mode,
+              media_id: sourcePhoto.id,
+              source_media_id: sourcePhoto.id,
+              source_file_name: sourcePhoto.file_name || sourcePhoto.name || 'asset.jpg',
+              prep_mode: 'original',
+              flip: !!state.photography.prep.flip,
+              offset_y: activePhotoOffsetY(sourcePhoto.id),
+              offset_x: activePhotoOffsetX(sourcePhoto.id),
+              source_is_board_asset: false,
+              psa_image_type_override: psaImageTypeOverride || ''
+            })
+          });
+          slot.classList.add('upload-target-pending');
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Prepared image upload failed');
+          state.board = data.board;
+          state.summary = data.summary;
+          if (data.asset_mode_refresh_pending) state.assetModeDirty = true;
+          markAssetModeDirtyRows(data.dirty_row_ids || [rowId]);
+          renderBoard();
+          if (data.notice && (data.notice.text || data.notice.html)) addAppNotice(data.notice.text || '', data.notice.kind || 'success', data.notice.html || '');
+        } catch (err) {
+          alert(err.message || String(err));
+        } finally {
+          slot.classList.remove('upload-target-pending');
         }
         return;
       }
@@ -10345,6 +12633,7 @@ async function loadCollections() {
     state.filteredCollections = [...state.collections];
     state.collectionSource = data.source || 'memory';
     renderCollectionSelect();
+    renderLauncherPanel();
     const sourceText = state.collectionSource === 'local_cache'
       ? 'from local cache'
       : (state.collectionSource === 'bynder' ? 'from Bynder' : '');
@@ -10366,7 +12655,9 @@ async function loadCollections() {
 
 function renderCollectionSelect() {
   const select = document.getElementById('collectionSelect');
-  select.innerHTML = state.filteredCollections.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)}</option>`).join('');
+  if (select) select.innerHTML = state.filteredCollections.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)}</option>`).join('');
+  const pioSelect = document.getElementById('pioCollectionSelect');
+  if (pioSelect) pioSelect.innerHTML = (state.filteredCollections || state.collections || []).map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)}</option>`).join('');
   if (state.collections.length) {
     const visible = state.filteredCollections.length;
     const sourceText = state.collectionSource === 'local_cache'
@@ -10383,7 +12674,8 @@ function renderCollectionSelect() {
 }
 
 function filterCollections() {
-  const q = document.getElementById('collectionFilter').value.trim().toLowerCase();
+  const input = document.getElementById('collectionFilter');
+  const q = input ? input.value.trim().toLowerCase() : '';
   state.filteredCollections = !q ? [...state.collections] : state.collections.filter(c => c.label.toLowerCase().includes(q));
   renderCollectionSelect();
 }
@@ -10768,10 +13060,29 @@ async function refreshMessages() {
   } catch (_) {}
 }
 
+
+function bindRegularLauncherEvents() {
+  const collectionFilter = document.getElementById('collectionFilter');
+  if (collectionFilter) {
+    collectionFilter.value = collectionFilter.value || '';
+    collectionFilter.addEventListener('input', filterCollections);
+  }
+  const launchBtn = document.getElementById('launchBtn');
+  if (launchBtn) launchBtn.addEventListener('click', () => launchCollection());
+  const launchRandomBtn = document.getElementById('launchRandomBtn');
+  if (launchRandomBtn) launchRandomBtn.addEventListener('click', () => launchRandomCollection());
+  const hideInactiveToggle = document.getElementById('hideInactiveToggle');
+  if (hideInactiveToggle) {
+    hideInactiveToggle.checked = !!state.hideInactive;
+    hideInactiveToggle.addEventListener('change', () => {
+      state.hideInactive = !!hideInactiveToggle.checked;
+      renderBoard();
+    });
+  }
+}
+
 function bindStaticUI() {
-  document.getElementById('collectionFilter').addEventListener('input', filterCollections);
-  document.getElementById('launchBtn').addEventListener('click', () => launchCollection());
-  document.getElementById('launchRandomBtn').addEventListener('click', () => launchRandomCollection());
+  renderLauncherPanel();
   document.getElementById('reloadBtn').addEventListener('click', async () => {
     const queuedCount = changedAssetIds().size;
     if (queuedCount > 0) {
@@ -10801,6 +13112,12 @@ function bindStaticUI() {
       }
       return;
     }
+    if (state.workspace === 'product_imagery_onboarding' && state.onboarding.currentBoardId) {
+      saveUIState();
+      addAppNotice('Reloading Product Imagery Onboarding board from Bynder...', 'notice');
+      openPIOBoardById(state.onboarding.currentBoardId, true);
+      return;
+    }
     launchCollection(state.loadedCollectionOptionId, {flashReload:true, scrollTopAfter:true});
   });
   document.getElementById('discardBtn').addEventListener('click', discardChanges);
@@ -10808,14 +13125,25 @@ function bindStaticUI() {
   document.querySelectorAll('input[name="appMode"]').forEach(el => {
     el.addEventListener('change', () => switchMode(el.value));
   });
-  const hideInactiveToggle = document.getElementById('hideInactiveToggle');
-  if (hideInactiveToggle) {
-    hideInactiveToggle.addEventListener('change', () => {
-      state.hideInactive = !!hideInactiveToggle.checked;
-      renderBoard();
+  document.getElementById('thumbSize').addEventListener('input', renderBoard);
+  const bulkFixBtn = document.getElementById('bulkFixSiloBtn');
+  if (bulkFixBtn) bulkFixBtn.addEventListener('click', () => toggleBulkFixSiloMode());
+  const bulkFixGoBtn = document.getElementById('bulkFixSiloGoBtn');
+  if (bulkFixGoBtn) bulkFixGoBtn.addEventListener('click', () => runBulkFixSilo());
+  const pioClearBoardBtn = document.getElementById('pioClearBoardBtn');
+  if (pioClearBoardBtn) {
+    pioClearBoardBtn.addEventListener('click', async () => {
+      if (state.workspace !== 'product_imagery_onboarding' || !state.board) return;
+      const queuedCount = changedAssetIds().size;
+      if (queuedCount > 0) {
+        const shouldCommit = confirm(`You have ${queuedCount} queued change(s). Press OK to commit them to Bynder and then remove this board from the screen. Press Cancel to keep working on the board.`);
+        if (!shouldCommit) return;
+        const success = await commitChanges(true);
+        if (!success) return;
+      }
+      clearPIOBoardView();
     });
   }
-  document.getElementById('thumbSize').addEventListener('input', renderBoard);
   document.getElementById('photoThumbSize').addEventListener('input', (e) => {
     state.photography.thumb = Number(e.target.value || 170);
     const minimum = Math.max(420, Math.round((Math.max(190, Math.round(state.photography.thumb * 1.02)) * 2) + 34));
@@ -10853,14 +13181,14 @@ function bindStaticUI() {
   renderModeUI();
   document.getElementById('toggleSummaryBtn').addEventListener('click', () => {
     state.summaryOpen = !state.summaryOpen;
-    document.getElementById('toggleSummaryBtn').textContent = state.summaryOpen ? 'Collapse' : 'Expand';
+    document.getElementById('toggleSummaryBtn').textContent = state.summaryOpen ? '▴' : '▾';
     renderSummary();
   });
 
   document.getElementById('toggleLogBtn').addEventListener('click', () => {
     state.logOpen = !state.logOpen;
     document.getElementById('serverLog').style.display = state.logOpen ? 'block' : 'none';
-    document.getElementById('toggleLogBtn').textContent = state.logOpen ? 'Collapse' : 'Expand';
+    document.getElementById('toggleLogBtn').textContent = state.logOpen ? '▴' : '▾';
     if (state.logOpen) startMessagePolling();
     else stopMessagePolling();
   });
@@ -10879,11 +13207,15 @@ bindStaticUI();
 bindIdleActivityWatchers();
 refreshGameStatus();
 renderGameModesPanel();
-setInterval(() => { if ((Date.now() - Number(state.idle.lastActivityAt || 0)) > 12000) scheduleGameQueueEnsure(); }, 10000);
+setInterval(() => {
+  refreshGameStatus();
+  if (state.game && (Date.now() - Number(state.idle.lastActivityAt || 0)) > 12000) scheduleGameQueueEnsure(false);
+}, 10000);
 window.addEventListener('resize', updateStickyOffsets);
 document.addEventListener('keydown', handlePhotoPrepArrowKeys);
 window.addEventListener('load', updateStickyOffsets);
-loadCollections();
+window.addEventListener('beforeunload', saveUIState);
+loadCollections().then(()=>restoreUIStateIfPossible());
 setTimeout(updateStickyOffsets, 50);
 setTimeout(updateStickyOffsets, 300);
 </script>
@@ -10913,5 +13245,6 @@ if __name__ == "__main__":
     else:
         log_message(f"Google scoreboard disabled: credentials file not found at {get_google_scoreboard_credentials_path()}")
     start_server_side_game_queue_worker()
+    maybe_start_game_queue_fill(force=True, target_count=GAME_QUEUE_PRELOAD_TARGET)
     open_browser_later()
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
